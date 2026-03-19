@@ -1,13 +1,18 @@
 //! # mod-js
 //!
-//! NOVA Mod for JavaScript execution. Handles the `ExecJavaScript` capability.
+//! NOVA Mod for JavaScript execution via QuickJS. Handles the `ExecJavaScript`
+//! capability.
 //!
-//! This is a **placeholder** — the actual QuickJS integration will come in a
-//! later phase. For now, it logs the script source and returns `JsValue::Undefined`.
+//! Uses `rquickjs` to create a QuickJS runtime and evaluate scripts. Each
+//! `handle()` call gets a fresh context (no persistent state across scripts
+//! in this initial implementation).
+//!
+//! A minimal `console.log` is installed that routes output to `tracing::info!`.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rquickjs::{Context, Function, Runtime};
 use semver::Version;
 use tracing::{debug, info, warn};
 
@@ -22,10 +27,11 @@ use nova_mod_api::{
     CoreApi, NovaMod,
 };
 
-/// The JavaScript engine mod (placeholder).
+/// The JavaScript engine mod (QuickJS-backed).
 pub struct JsMod {
     manifest: ModManifest,
     core: Option<Arc<dyn CoreApi>>,
+    runtime: Option<Runtime>,
 }
 
 impl JsMod {
@@ -35,7 +41,7 @@ impl JsMod {
             id: ModId::new("org.nova.js"),
             name: "NOVA JavaScript Engine".into(),
             version: Version::new(0, 1, 0),
-            description: "JavaScript execution engine (placeholder for QuickJS)".into(),
+            description: "JavaScript execution engine (QuickJS)".into(),
             capabilities: vec![CapabilityType::ExecJavaScript],
             permissions: vec![],
             dependencies: vec![],
@@ -51,6 +57,7 @@ impl JsMod {
         Self {
             manifest,
             core: None,
+            runtime: None,
         }
     }
 }
@@ -61,6 +68,49 @@ impl Default for JsMod {
     }
 }
 
+/// Convert a QuickJS value to our `JsValue` type.
+fn quickjs_to_jsvalue(ctx: &rquickjs::Ctx<'_>, val: rquickjs::Value<'_>) -> JsValue {
+    if val.is_undefined() {
+        JsValue::Undefined
+    } else if val.is_null() {
+        JsValue::Null
+    } else if let Some(b) = val.as_bool() {
+        JsValue::Boolean(b)
+    } else if let Some(n) = val.as_int() {
+        JsValue::Number(n as f64)
+    } else if let Some(n) = val.as_float() {
+        JsValue::Number(n)
+    } else if let Some(s) = val.clone().into_string() {
+        JsValue::String(s.to_string().unwrap_or_default())
+    } else if val.is_array() {
+        if let Some(arr) = val.into_array() {
+            let items: Vec<JsValue> = arr
+                .iter::<rquickjs::Value<'_>>()
+                .filter_map(|r| r.ok())
+                .map(|v| quickjs_to_jsvalue(ctx, v))
+                .collect();
+            JsValue::Array(items)
+        } else {
+            JsValue::Undefined
+        }
+    } else if val.is_object() {
+        if let Some(obj) = val.into_object() {
+            let mut entries = Vec::new();
+            let props = obj.props::<String, rquickjs::Value<'_>>();
+            for result in props {
+                if let Ok((key, value)) = result {
+                    entries.push((key, quickjs_to_jsvalue(ctx, value)));
+                }
+            }
+            JsValue::Object(entries)
+        } else {
+            JsValue::Undefined
+        }
+    } else {
+        JsValue::Undefined
+    }
+}
+
 #[async_trait]
 impl NovaMod for JsMod {
     fn manifest(&self) -> &ModManifest {
@@ -68,8 +118,15 @@ impl NovaMod for JsMod {
     }
 
     async fn init(&mut self, core: Arc<dyn CoreApi>) -> Result<(), NovaError> {
-        info!(mod_id = %self.manifest.id, "js mod initializing (placeholder)");
+        info!(mod_id = %self.manifest.id, "js mod initializing (QuickJS)");
         self.core = Some(core);
+
+        // Create the QuickJS runtime once during init.
+        let runtime = Runtime::new().map_err(|e| {
+            NovaError::Internal(format!("failed to create QuickJS runtime: {e}"))
+        })?;
+        self.runtime = Some(runtime);
+
         Ok(())
     }
 
@@ -79,16 +136,79 @@ impl NovaMod for JsMod {
                 debug!(
                     len = source.len(),
                     context_id = ?context_id,
-                    "received script for execution"
+                    "executing script via QuickJS"
                 );
-                warn!("JS execution is a placeholder — returning undefined");
 
-                // Log a snippet of the script for debugging.
-                let preview: String = source.chars().take(100).collect();
-                debug!(preview = %preview, "script preview");
+                let runtime = self.runtime.as_ref().ok_or_else(|| {
+                    NovaError::Internal("QuickJS runtime not initialized".into())
+                })?;
 
-                // TODO: Integrate QuickJS here.
-                Ok(TypedData::JsResult(JsValue::Undefined))
+                // Create a fresh context per execution.
+                let context = Context::full(runtime).map_err(|e| {
+                    NovaError::Internal(format!("failed to create QuickJS context: {e}"))
+                })?;
+
+                let result = context.with(|ctx| {
+                    // Install console.log → tracing::info!
+                    let globals = ctx.globals();
+
+                    let console = rquickjs::Object::new(ctx.clone())
+                        .map_err(|e| NovaError::Internal(format!("failed to create console object: {e}")))?;
+
+                    let log_fn = Function::new(ctx.clone(), |args: rquickjs::function::Rest<rquickjs::Value>| {
+                        let parts: Vec<String> = args
+                            .0
+                            .iter()
+                            .map(|v| {
+                                if let Some(s) = v.as_string() {
+                                    s.to_string().unwrap_or_else(|_| format!("{v:?}"))
+                                } else if let Some(n) = v.as_int() {
+                                    n.to_string()
+                                } else if let Some(n) = v.as_float() {
+                                    n.to_string()
+                                } else if v.is_bool() {
+                                    format!("{}", v.as_bool().unwrap_or(false))
+                                } else if v.is_null() {
+                                    "null".to_string()
+                                } else if v.is_undefined() {
+                                    "undefined".to_string()
+                                } else {
+                                    format!("{v:?}")
+                                }
+                            })
+                            .collect();
+                        info!(target: "nova::js::console", "{}", parts.join(" "));
+                    })
+                    .map_err(|e| NovaError::Internal(format!("failed to create console.log: {e}")))?;
+
+                    console.set("log", log_fn.clone())
+                        .map_err(|e| NovaError::Internal(format!("failed to set console.log: {e}")))?;
+                    console.set("warn", log_fn.clone())
+                        .map_err(|e| NovaError::Internal(format!("failed to set console.warn: {e}")))?;
+                    console.set("error", log_fn)
+                        .map_err(|e| NovaError::Internal(format!("failed to set console.error: {e}")))?;
+
+                    globals.set("console", console)
+                        .map_err(|e| NovaError::Internal(format!("failed to set console global: {e}")))?;
+
+                    // Evaluate the script.
+                    let eval_result: Result<rquickjs::Value, _> = ctx.eval(source.as_bytes());
+                    match eval_result {
+                        Ok(val) => {
+                            let js_value = quickjs_to_jsvalue(&ctx, val);
+                            debug!(result = ?js_value, "script execution succeeded");
+                            Ok(TypedData::JsResult(js_value))
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "script execution error");
+                            Ok(TypedData::JsResult(JsValue::String(format!(
+                                "Error: {e}"
+                            ))))
+                        }
+                    }
+                });
+
+                result
             }
             other => Err(NovaError::UnsupportedContent(format!(
                 "js mod cannot handle request: {other:?}"
@@ -113,16 +233,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_returns_undefined() {
-        let m = JsMod::new();
+    async fn exec_basic_expression() {
+        let mut m = JsMod::new();
+        // Manually init the runtime for testing (no core needed).
+        m.runtime = Some(Runtime::new().unwrap());
+
         let req = ContentRequest::ExecScript {
-            source: "console.log('hello')".into(),
+            source: "1 + 2".into(),
             context_id: None,
         };
         let result = m.handle(req).await.unwrap();
         match result {
-            TypedData::JsResult(JsValue::Undefined) => {}
-            _ => panic!("expected JsResult(Undefined)"),
+            TypedData::JsResult(JsValue::Number(n)) => {
+                assert!((n - 3.0).abs() < f64::EPSILON, "expected 3, got {n}");
+            }
+            other => panic!("expected JsResult(Number(3)), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_string_result() {
+        let mut m = JsMod::new();
+        m.runtime = Some(Runtime::new().unwrap());
+
+        let req = ContentRequest::ExecScript {
+            source: "'hello' + ' ' + 'world'".into(),
+            context_id: None,
+        };
+        let result = m.handle(req).await.unwrap();
+        match result {
+            TypedData::JsResult(JsValue::String(s)) => {
+                assert_eq!(s, "hello world");
+            }
+            other => panic!("expected JsResult(String), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_console_log_no_crash() {
+        let mut m = JsMod::new();
+        m.runtime = Some(Runtime::new().unwrap());
+
+        let req = ContentRequest::ExecScript {
+            source: "console.log('hello from QuickJS')".into(),
+            context_id: None,
+        };
+        // Should succeed without panic.
+        let result = m.handle(req).await.unwrap();
+        assert!(matches!(result, TypedData::JsResult(_)));
+    }
+
+    #[tokio::test]
+    async fn exec_syntax_error_returns_error_string() {
+        let mut m = JsMod::new();
+        m.runtime = Some(Runtime::new().unwrap());
+
+        let req = ContentRequest::ExecScript {
+            source: "function {{{".into(),
+            context_id: None,
+        };
+        let result = m.handle(req).await.unwrap();
+        match result {
+            TypedData::JsResult(JsValue::String(s)) => {
+                assert!(s.contains("Error"), "expected error message, got: {s}");
+            }
+            other => panic!("expected JsResult(String) with error, got {other:?}"),
         }
     }
 }

@@ -12,6 +12,8 @@ use async_trait::async_trait;
 use semver::Version;
 use tracing::{debug, info};
 
+use std::collections::HashMap;
+
 use nova_mod_api::{
     capability::CapabilityType,
     content::{ContentRequest, LayoutBox, LayoutContent, StyleValue, TypedData},
@@ -71,7 +73,7 @@ impl NovaMod for PainterMod {
 
     async fn handle(&self, request: ContentRequest) -> Result<TypedData, NovaError> {
         match request {
-            ContentRequest::Paint { layout_tree } => {
+            ContentRequest::Paint { layout_tree, images } => {
                 let root = match *layout_tree {
                     TypedData::LayoutTree(tree) => tree,
                     _ => {
@@ -83,8 +85,11 @@ impl NovaMod for PainterMod {
 
                 debug!("painting layout tree into render commands");
 
+                // Build a lookup map from src URL to decoded RGBA bytes.
+                let images_map: HashMap<String, Vec<u8>> = images.into_iter().collect();
+
                 let mut ops = Vec::new();
-                paint_box(&root, &mut ops);
+                paint_box(&root, &mut ops, &images_map);
 
                 debug!(op_count = ops.len(), "painting complete");
                 Ok(TypedData::RenderCommands(RenderCommands { ops }))
@@ -102,7 +107,7 @@ impl NovaMod for PainterMod {
 }
 
 /// Recursively paint a layout box into render operations.
-fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>) {
+fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<String, Vec<u8>>) {
     // Skip zero-sized boxes (display: none, comments, etc.).
     if layout_box.width <= 0.0 && layout_box.height <= 0.0 {
         return;
@@ -147,33 +152,49 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>) {
         }
     }
 
-    // Paint image placeholder.
+    // Paint image content.
     if let LayoutContent::Image { ref src } = layout_box.content {
-        // Light gray background for the placeholder.
-        ops.push(RenderOp::FillRect {
-            x: layout_box.x,
-            y: layout_box.y,
-            width: layout_box.width.max(150.0),
-            height: layout_box.height.max(80.0),
-            color: Color::rgb(0.85, 0.85, 0.85),
-        });
-        // Show the filename (or full src if short) as label text.
-        let label = src
-            .rsplit('/')
-            .next()
-            .unwrap_or(src);
-        let label = if label.len() > 40 {
-            format!("{}...", &label[..37])
+        if let Some(decoded) = images.get(src) {
+            // Decoded format: [width_u32_le][height_u32_le][RGBA pixels...]
+            if decoded.len() >= 8 {
+                let img_width =
+                    u32::from_le_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]);
+                let img_height =
+                    u32::from_le_bytes([decoded[4], decoded[5], decoded[6], decoded[7]]);
+                let pixels = decoded[8..].to_vec();
+                ops.push(RenderOp::DrawImage {
+                    x: layout_box.x,
+                    y: layout_box.y,
+                    width: layout_box.width,
+                    height: layout_box.height,
+                    img_width,
+                    img_height,
+                    pixels,
+                });
+            }
         } else {
-            label.to_string()
-        };
-        ops.push(RenderOp::DrawText {
-            x: layout_box.x + 4.0,
-            y: layout_box.y + 16.0,
-            text: format!("[img: {label}]"),
-            font_size: 12.0,
-            color: Color::rgb(0.4, 0.4, 0.4),
-        });
+            // Fallback: gray placeholder when image data is not available.
+            ops.push(RenderOp::FillRect {
+                x: layout_box.x,
+                y: layout_box.y,
+                width: layout_box.width.max(150.0),
+                height: layout_box.height.max(80.0),
+                color: Color::rgb(0.85, 0.85, 0.85),
+            });
+            let label = src.rsplit('/').next().unwrap_or(src);
+            let label = if label.len() > 40 {
+                format!("{}...", &label[..37])
+            } else {
+                label.to_string()
+            };
+            ops.push(RenderOp::DrawText {
+                x: layout_box.x + 4.0,
+                y: layout_box.y + 16.0,
+                text: format!("[img: {label}]"),
+                font_size: 12.0,
+                color: Color::rgb(0.4, 0.4, 0.4),
+            });
+        }
     }
 
     // Emit a Link op if this box has an href (i.e., it is an <a> element).
@@ -191,7 +212,7 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>) {
 
     // Recurse into children.
     for child in &layout_box.children {
-        paint_box(child, ops);
+        paint_box(child, ops, images);
     }
 }
 
@@ -361,8 +382,9 @@ mod tests {
             children: vec![],
         };
 
+        let images = HashMap::new();
         let mut ops = Vec::new();
-        paint_box(&layout, &mut ops);
+        paint_box(&layout, &mut ops, &images);
 
         assert!(
             ops.iter().any(|op| matches!(op, RenderOp::DrawText { .. })),
@@ -382,8 +404,66 @@ mod tests {
             children: vec![],
         };
 
+        let images = HashMap::new();
         let mut ops = Vec::new();
-        paint_box(&layout, &mut ops);
+        paint_box(&layout, &mut ops, &images);
         assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn paint_image_with_data() {
+        // Create a 1x1 red pixel decoded image.
+        let mut decoded = Vec::new();
+        decoded.extend_from_slice(&1u32.to_le_bytes()); // width
+        decoded.extend_from_slice(&1u32.to_le_bytes()); // height
+        decoded.extend_from_slice(&[255, 0, 0, 255]);   // RGBA
+
+        let layout = LayoutBox {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 50.0,
+            content: LayoutContent::Image {
+                src: "https://example.com/img.png".into(),
+            },
+            style: StyleMap::default(),
+            children: vec![],
+        };
+
+        let mut images = HashMap::new();
+        images.insert("https://example.com/img.png".to_string(), decoded);
+
+        let mut ops = Vec::new();
+        paint_box(&layout, &mut ops, &images);
+
+        assert!(
+            ops.iter().any(|op| matches!(op, RenderOp::DrawImage { .. })),
+            "should generate a DrawImage op"
+        );
+    }
+
+    #[test]
+    fn paint_image_without_data_shows_placeholder() {
+        let layout = LayoutBox {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 50.0,
+            content: LayoutContent::Image {
+                src: "https://example.com/missing.png".into(),
+            },
+            style: StyleMap::default(),
+            children: vec![],
+        };
+
+        let images = HashMap::new();
+        let mut ops = Vec::new();
+        paint_box(&layout, &mut ops, &images);
+
+        // Should fall back to placeholder (FillRect + DrawText).
+        assert!(
+            ops.iter().any(|op| matches!(op, RenderOp::FillRect { .. })),
+            "should generate a placeholder FillRect"
+        );
     }
 }

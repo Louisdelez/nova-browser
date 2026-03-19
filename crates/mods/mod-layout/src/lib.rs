@@ -232,6 +232,49 @@ fn add_node(
             children,
             attributes,
         } => {
+            // Special case: <img> is a replaced element with intrinsic dimensions.
+            if tag == "img" {
+                let src = attributes
+                    .iter()
+                    .find(|(k, _)| k == "src")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+
+                // Parse width/height attributes (default 300x150 per HTML spec).
+                let img_width = attributes
+                    .iter()
+                    .find(|(k, _)| k == "width")
+                    .and_then(|(_, v)| v.parse::<f32>().ok())
+                    .unwrap_or(300.0);
+                let img_height = attributes
+                    .iter()
+                    .find(|(k, _)| k == "height")
+                    .and_then(|(_, v)| v.parse::<f32>().ok())
+                    .unwrap_or(150.0);
+
+                let ctx = NodeContext {
+                    content: LayoutContent::Image { src },
+                    style: StyleMap {
+                        properties: vec![
+                            ("display".into(), StyleValue::Keyword("inline".into())),
+                        ],
+                    },
+                };
+
+                let style = Style {
+                    display: Display::Flex,
+                    size: Size {
+                        width: Dimension::Length(img_width),
+                        height: Dimension::Length(img_height),
+                    },
+                    ..Style::DEFAULT
+                };
+
+                return taffy
+                    .new_leaf_with_context(style, ctx)
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+            }
+
             let display = resolve_display(tag, attributes);
 
             // display: none produces an invisible zero-size node.

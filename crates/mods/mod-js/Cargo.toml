@@ -11,6 +11,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 semver = { workspace = true }
+rquickjs = { version = "0.9", features = ["bindgen", "classes", "properties", "parallel"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

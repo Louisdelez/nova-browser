@@ -64,6 +64,10 @@ pub enum ContentRequest {
     /// Paint a layout tree into render commands.
     Paint {
         layout_tree: Box<TypedData>,
+        /// Decoded image data keyed by source URL.
+        /// Each entry is `(src_url, decoded_rgba_bytes)` where the bytes use
+        /// the mod-image wire format: `[width_u32_le][height_u32_le][rgba…]`.
+        images: Vec<(String, Vec<u8>)>,
     },
 
     /// Generic capability request (for extension capabilities).

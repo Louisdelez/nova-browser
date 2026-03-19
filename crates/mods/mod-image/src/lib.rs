@@ -1,9 +1,10 @@
 //! # mod-image
 //!
-//! NOVA Mod for image decoding (PNG, JPEG, WebP, GIF). Handles `DecodeImage`
+//! NOVA Mod for image decoding (PNG, JPEG, WebP, GIF, SVG). Handles `DecodeImage`
 //! capabilities for these formats.
 //!
-//! Decodes raw image bytes into RGBA8 pixel data using the `image` crate.
+//! Decodes raw image bytes into RGBA8 pixel data using the `image` crate
+//! (for raster formats) and `resvg` (for SVG).
 //! The decoded pixels are returned as `TypedData::Bytes` with a small header
 //! (8 bytes: width u32 LE + height u32 LE) followed by `width * height * 4`
 //! bytes of row-major RGBA data.
@@ -39,12 +40,13 @@ impl ImageMod {
             id: ModId::new("org.nova.image"),
             name: "NOVA Image Decoder".into(),
             version: Version::new(0, 1, 0),
-            description: "Image decoder for PNG, JPEG, WebP, and GIF".into(),
+            description: "Image decoder for PNG, JPEG, WebP, GIF, and SVG".into(),
             capabilities: vec![
                 CapabilityType::DecodeImage("png".into()),
                 CapabilityType::DecodeImage("jpeg".into()),
                 CapabilityType::DecodeImage("webp".into()),
                 CapabilityType::DecodeImage("gif".into()),
+                CapabilityType::DecodeImage("svg".into()),
             ],
             permissions: vec![Permission::GpuDecode],
             dependencies: vec![],
@@ -66,6 +68,11 @@ impl ImageMod {
                 },
                 ContentTrigger {
                     condition: TriggerCondition::MimeType("image/gif".into()),
+                    mod_id: ModId::new("org.nova.image"),
+                    priority: 100,
+                },
+                ContentTrigger {
+                    condition: TriggerCondition::MimeType("image/svg+xml".into()),
                     mod_id: ModId::new("org.nova.image"),
                     priority: 100,
                 },
@@ -129,6 +136,15 @@ fn detect_format(data: &[u8]) -> Option<ImageFormat> {
     None
 }
 
+/// Check if data looks like SVG (XML-based).
+fn is_svg(data: &[u8]) -> bool {
+    // Check for common SVG indicators in the first 256 bytes.
+    let check_len = data.len().min(512);
+    let prefix = String::from_utf8_lossy(&data[..check_len]);
+    let prefix_lower = prefix.to_lowercase();
+    prefix_lower.contains("<svg") || prefix_lower.contains("<!doctype svg")
+}
+
 /// Map a format hint string (e.g. "png", "jpeg") to an `ImageFormat`.
 fn format_from_hint(hint: &str) -> Option<ImageFormat> {
     match hint.to_lowercase().as_str() {
@@ -138,6 +154,39 @@ fn format_from_hint(hint: &str) -> Option<ImageFormat> {
         "gif" => Some(ImageFormat::Gif),
         _ => None,
     }
+}
+
+/// Rasterize an SVG to RGBA pixel data using resvg.
+///
+/// Returns `(width, height, rgba_pixels)` or an error.
+fn rasterize_svg(data: &[u8]) -> Result<(u32, u32, Vec<u8>), NovaError> {
+    let tree = resvg::usvg::Tree::from_data(data, &resvg::usvg::Options::default())
+        .map_err(|e| NovaError::DecodeError(format!("failed to parse SVG: {e}")))?;
+
+    let size = tree.size();
+    let width = size.width().ceil() as u32;
+    let height = size.height().ceil() as u32;
+
+    // Clamp to a reasonable size (max 2048x2048).
+    let (w, h) = if width > 2048 || height > 2048 {
+        let scale = 2048.0 / (width.max(height) as f64);
+        ((width as f64 * scale) as u32, (height as f64 * scale) as u32)
+    } else {
+        (width.max(1), height.max(1))
+    };
+
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)
+        .ok_or_else(|| NovaError::DecodeError("failed to create pixmap for SVG".into()))?;
+
+    let scale_x = w as f32 / size.width();
+    let scale_y = h as f32 / size.height();
+    let transform = resvg::tiny_skia::Transform::from_scale(scale_x, scale_y);
+
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    debug!(width = w, height = h, "rasterized SVG to RGBA");
+
+    Ok((w, h, pixmap.data().to_vec()))
 }
 
 /// Encode decoded RGBA image data into the wire format returned by this mod.
@@ -171,6 +220,15 @@ impl NovaMod for ImageMod {
                     format = ?format_hint,
                     "received image for decoding"
                 );
+
+                // Check for SVG first (by hint or content detection).
+                let is_svg_hint = format_hint.as_deref() == Some("svg")
+                    || format_hint.as_deref() == Some("svg+xml");
+                if is_svg_hint || is_svg(&data) {
+                    let (w, h, pixels) = rasterize_svg(&data)?;
+                    let payload = encode_decoded_image(w, h, &pixels);
+                    return Ok(TypedData::Bytes(payload));
+                }
 
                 // Determine format: try magic bytes first, then hint, then let
                 // the image crate guess.
@@ -234,6 +292,9 @@ mod tests {
         assert!(m
             .manifest()
             .provides(&CapabilityType::DecodeImage("gif".into())));
+        assert!(m
+            .manifest()
+            .provides(&CapabilityType::DecodeImage("svg".into())));
     }
 
     #[test]
@@ -267,6 +328,13 @@ mod tests {
         assert_eq!(detect_format(&data), Some(ImageFormat::WebP));
     }
 
+    #[test]
+    fn detect_svg_content() {
+        assert!(is_svg(b"<svg xmlns=\"http://www.w3.org/2000/svg\">"));
+        assert!(is_svg(b"<?xml version=\"1.0\"?><svg>"));
+        assert!(!is_svg(b"\x89PNG\r\n\x1a\n"));
+    }
+
     #[tokio::test]
     async fn decode_minimal_png() {
         // Create a minimal 1x1 red PNG in memory.
@@ -295,6 +363,32 @@ mod tests {
                 assert_eq!(h, 1);
                 // RGBA pixel: red.
                 assert_eq!(&b[8..12], &[255, 0, 0, 255]);
+            }
+            other => panic!("expected TypedData::Bytes, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_svg() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+            <rect width="10" height="10" fill="red"/>
+        </svg>"#;
+
+        let m = ImageMod::new();
+        let req = ContentRequest::DecodeImage {
+            data: bytes::Bytes::from(svg.to_vec()),
+            format_hint: Some("svg".into()),
+        };
+        let result = m.handle(req).await.unwrap();
+        match result {
+            TypedData::Bytes(b) => {
+                assert!(b.len() >= 8);
+                let w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                let h = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                assert_eq!(w, 10);
+                assert_eq!(h, 10);
+                // Should have pixel data.
+                assert_eq!(b.len(), 8 + (10 * 10 * 4));
             }
             other => panic!("expected TypedData::Bytes, got {other:?}"),
         }

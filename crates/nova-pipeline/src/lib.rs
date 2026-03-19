@@ -23,7 +23,7 @@ use nova_registry::CapabilityRegistry;
 struct SubResources {
     /// External stylesheet URLs.
     stylesheets: Vec<String>,
-    /// Image URLs (from `<img src="...">`).
+    /// Image URLs (from `<img src="...">` and `<picture><source>`).
     images: Vec<String>,
     /// External script URLs.
     scripts: Vec<String>,
@@ -73,13 +73,23 @@ impl PipelineEngine {
             _ => SubResources::default(),
         };
 
-        // Step 4: Fetch external stylesheets
-        let stylesheets = self.fetch_stylesheets(&sub_resources.stylesheets).await;
+        // Step 4: Fetch external stylesheets (in parallel)
+        let mut stylesheets = self.fetch_stylesheets_parallel(&sub_resources.stylesheets).await;
         info!(
             "Pipeline: fetched {}/{} external stylesheets",
             stylesheets.len(),
             sub_resources.stylesheets.len()
         );
+
+        // Step 4b: Extract and fetch @import URLs from stylesheets
+        let import_sheets = self.fetch_css_imports(&stylesheets, &base_url).await;
+        if !import_sheets.is_empty() {
+            info!("Pipeline: fetched {} @import stylesheets", import_sheets.len());
+            // Prepend @import sheets so they're processed before the importing sheets.
+            let mut all = import_sheets;
+            all.extend(stylesheets);
+            stylesheets = all;
+        }
 
         // Step 5: Compute styles (with external stylesheets)
         let styles = self.compute_styles_with(&dom, stylesheets).await?;
@@ -87,8 +97,8 @@ impl PipelineEngine {
         // Step 6: Layout
         let layout_tree = self.layout(&styles, viewport).await?;
 
-        // Step 7: Fetch and decode images
-        let images = self.fetch_and_decode_images(&sub_resources.images).await;
+        // Step 7: Fetch and decode images (in parallel)
+        let images = self.fetch_and_decode_images_parallel(&sub_resources.images).await;
         info!(
             "Pipeline: decoded {}/{} images",
             images.len(),
@@ -203,71 +213,95 @@ impl PipelineEngine {
         self.registry.route(&cap, request).await
     }
 
-    /// Fetch external stylesheets, returning successfully fetched ones as `TypedData::Text`.
-    async fn fetch_stylesheets(&self, urls: &[String]) -> Vec<TypedData> {
-        let mut stylesheets = Vec::new();
-        for url in urls {
-            match self.fetch(url).await {
-                Ok(response) => {
-                    let css = String::from_utf8_lossy(&response.body).to_string();
-                    debug!(url = %url, len = css.len(), "fetched external stylesheet");
-                    stylesheets.push(TypedData::Text(css));
-                }
-                Err(e) => {
-                    warn!(url = %url, error = %e, "failed to fetch stylesheet, skipping");
-                }
-            }
+    /// Fetch external stylesheets in parallel.
+    async fn fetch_stylesheets_parallel(&self, urls: &[String]) -> Vec<TypedData> {
+        if urls.is_empty() {
+            return vec![];
         }
-        stylesheets
+
+        let futures: Vec<_> = urls.iter().map(|url| self.fetch_stylesheet(url)).collect();
+        let results = futures::future::join_all(futures).await;
+
+        results.into_iter().flatten().collect()
     }
 
-    /// Fetch and decode images, returning `(src_url, decoded_rgba_bytes)` pairs.
-    async fn fetch_and_decode_images(&self, urls: &[String]) -> Vec<(String, Vec<u8>)> {
-        let mut images = Vec::new();
-        for url in urls {
-            match self.fetch_and_decode_image(url).await {
-                Ok(decoded) => {
-                    images.push((url.clone(), decoded));
-                }
-                Err(e) => {
-                    warn!(url = %url, error = %e, "failed to fetch/decode image, skipping");
+    /// Fetch a single stylesheet.
+    async fn fetch_stylesheet(&self, url: &str) -> Option<TypedData> {
+        match self.fetch(url).await {
+            Ok(response) => {
+                let css = String::from_utf8_lossy(&response.body).to_string();
+                debug!(url = %url, len = css.len(), "fetched external stylesheet");
+                Some(TypedData::Text(css))
+            }
+            Err(e) => {
+                warn!(url = %url, error = %e, "failed to fetch stylesheet, skipping");
+                None
+            }
+        }
+    }
+
+    /// Extract `@import` URLs from fetched stylesheets and fetch them.
+    async fn fetch_css_imports(
+        &self,
+        stylesheets: &[TypedData],
+        base_url: &Option<Url>,
+    ) -> Vec<TypedData> {
+        let mut import_urls = Vec::new();
+
+        for sheet in stylesheets {
+            if let TypedData::Text(css) = sheet {
+                for line in css.lines() {
+                    let trimmed = line.trim();
+                    if let Some(url) = parse_css_import(trimmed) {
+                        let resolved = resolve_url(&url, base_url);
+                        import_urls.push(resolved);
+                    }
                 }
             }
         }
-        images
+
+        if import_urls.is_empty() {
+            return vec![];
+        }
+
+        self.fetch_stylesheets_parallel(&import_urls).await
+    }
+
+    /// Fetch and decode images in parallel.
+    async fn fetch_and_decode_images_parallel(
+        &self,
+        urls: &[String],
+    ) -> Vec<(String, Vec<u8>)> {
+        if urls.is_empty() {
+            return vec![];
+        }
+
+        let futures: Vec<_> = urls
+            .iter()
+            .map(|url| self.fetch_and_decode_image_safe(url))
+            .collect();
+        let results = futures::future::join_all(futures).await;
+
+        results.into_iter().flatten().collect()
+    }
+
+    /// Fetch and decode a single image, returning None on failure.
+    async fn fetch_and_decode_image_safe(&self, url: &str) -> Option<(String, Vec<u8>)> {
+        match self.fetch_and_decode_image(url).await {
+            Ok(decoded) => Some((url.to_string(), decoded)),
+            Err(e) => {
+                warn!(url = %url, error = %e, "failed to fetch/decode image, skipping");
+                None
+            }
+        }
     }
 
     /// Fetch a single image URL and decode it via the image mod.
     async fn fetch_and_decode_image(&self, url: &str) -> Result<Vec<u8>, NovaError> {
         let response = self.fetch(url).await?;
 
-        // Detect format from Content-Type or URL extension.
-        let format_hint = response
-            .content_type()
-            .and_then(|ct| {
-                let mime = ct.split(';').next().unwrap_or(ct).trim();
-                match mime {
-                    "image/png" => Some("png"),
-                    "image/jpeg" | "image/jpg" => Some("jpeg"),
-                    "image/webp" => Some("webp"),
-                    "image/gif" => Some("gif"),
-                    _ => None,
-                }
-            })
-            .or_else(|| {
-                // Fall back to URL extension.
-                let path = url.rsplit('?').last().unwrap_or(url);
-                let ext = path.rsplit('.').next().unwrap_or("");
-                match ext.to_lowercase().as_str() {
-                    "png" => Some("png"),
-                    "jpg" | "jpeg" => Some("jpeg"),
-                    "webp" => Some("webp"),
-                    "gif" => Some("gif"),
-                    _ => None,
-                }
-            })
-            .unwrap_or("png")
-            .to_string();
+        // Detect format from Content-Type, URL extension, or content sniffing.
+        let format_hint = detect_image_format(&response, url);
 
         let cap = CapabilityType::DecodeImage(format_hint.clone());
         let request = ContentRequest::DecodeImage {
@@ -286,23 +320,18 @@ impl PipelineEngine {
 
     /// Execute external and inline scripts via the JS mod.
     async fn execute_scripts(&self, external_urls: &[String], inline_scripts: &[String]) {
-        // Fetch external scripts first.
+        // Fetch external scripts in parallel.
         let mut scripts: Vec<String> = Vec::new();
-        for url in external_urls {
-            match self.fetch(url).await {
-                Ok(response) => {
-                    let source = String::from_utf8_lossy(&response.body).to_string();
-                    debug!(url = %url, len = source.len(), "fetched external script");
-                    scripts.push(source);
-                }
-                Err(e) => {
-                    warn!(url = %url, error = %e, "failed to fetch script, skipping");
-                }
-            }
+        if !external_urls.is_empty() {
+            let futures: Vec<_> = external_urls
+                .iter()
+                .map(|url| self.fetch_script(url))
+                .collect();
+            let results = futures::future::join_all(futures).await;
+            scripts.extend(results.into_iter().flatten());
         }
 
-        // Append inline scripts (they execute in document order after externals
-        // for simplicity — a real browser interleaves them).
+        // Append inline scripts.
         scripts.extend(inline_scripts.iter().cloned());
 
         // Execute each script.
@@ -326,6 +355,107 @@ impl PipelineEngine {
             }
         }
     }
+
+    /// Fetch a single external script, returning None on failure.
+    async fn fetch_script(&self, url: &str) -> Option<String> {
+        match self.fetch(url).await {
+            Ok(response) => {
+                let source = String::from_utf8_lossy(&response.body).to_string();
+                debug!(url = %url, len = source.len(), "fetched external script");
+                Some(source)
+            }
+            Err(e) => {
+                warn!(url = %url, error = %e, "failed to fetch script, skipping");
+                None
+            }
+        }
+    }
+}
+
+/// Detect the image format from Content-Type header, URL extension, or content sniffing.
+fn detect_image_format(response: &HttpResponse, url: &str) -> String {
+    // Try Content-Type header first.
+    if let Some(ct) = response.content_type() {
+        let mime = ct.split(';').next().unwrap_or(ct).trim();
+        match mime {
+            "image/png" => return "png".into(),
+            "image/jpeg" | "image/jpg" => return "jpeg".into(),
+            "image/webp" => return "webp".into(),
+            "image/gif" => return "gif".into(),
+            "image/svg+xml" => return "svg".into(),
+            _ => {}
+        }
+    }
+
+    // Try URL extension.
+    let path = url.split('?').next().unwrap_or(url);
+    if let Some(ext) = path.rsplit('.').next() {
+        match ext.to_lowercase().as_str() {
+            "png" => return "png".into(),
+            "jpg" | "jpeg" => return "jpeg".into(),
+            "webp" => return "webp".into(),
+            "gif" => return "gif".into(),
+            "svg" => return "svg".into(),
+            _ => {}
+        }
+    }
+
+    // Try content sniffing on the response body.
+    let body = &response.body;
+    if body.len() >= 4 {
+        if body.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+            return "png".into();
+        }
+        if body.starts_with(&[0xFF, 0xD8]) {
+            return "jpeg".into();
+        }
+        if body.starts_with(b"GIF8") {
+            return "gif".into();
+        }
+        if body.len() >= 12 && body.starts_with(b"RIFF") && &body[8..12] == b"WEBP" {
+            return "webp".into();
+        }
+        // Check for SVG.
+        let check_len = body.len().min(512);
+        let prefix = String::from_utf8_lossy(&body[..check_len]).to_lowercase();
+        if prefix.contains("<svg") || prefix.contains("<!doctype svg") {
+            return "svg".into();
+        }
+    }
+
+    // Default: let the decoder auto-detect.
+    "auto".into()
+}
+
+/// Parse a CSS `@import` directive and return the URL.
+///
+/// Supports:
+/// - `@import url("style.css");`
+/// - `@import url(style.css);`
+/// - `@import "style.css";`
+fn parse_css_import(line: &str) -> Option<String> {
+    let line = line.trim();
+    if !line.starts_with("@import") {
+        return None;
+    }
+    let rest = line.strip_prefix("@import")?.trim();
+
+    // @import url("...") or @import url(...)
+    if let Some(inner) = rest.strip_prefix("url(") {
+        let inner = inner.trim_start_matches(|c: char| c == '"' || c == '\'');
+        let end = inner.find(|c: char| c == '"' || c == '\'' || c == ')');
+        return end.map(|i| inner[..i].to_string());
+    }
+
+    // @import "..." or @import '...'
+    let quote = rest.chars().next()?;
+    if quote == '"' || quote == '\'' {
+        let inner = &rest[1..];
+        let end = inner.find(quote);
+        return end.map(|i| inner[..i].to_string());
+    }
+
+    None
 }
 
 /// Walk a DOM tree and extract sub-resource URLs (stylesheets, images, scripts).
@@ -361,13 +491,43 @@ fn walk_dom_for_resources(node: &DomNode, base_url: &Option<Url>, resources: &mu
                     }
                 }
                 "img" => {
-                    // <img src="...">
-                    if let Some(src) = attributes.iter().find(|(k, _)| k == "src") {
+                    // <img src="..."> or <img srcset="...">
+                    // Prefer srcset if available, fall back to src.
+                    if let Some(srcset) = attributes.iter().find(|(k, _)| k == "srcset") {
+                        if let Some(best) = pick_srcset_url(&srcset.1) {
+                            let resolved = resolve_url(&best, base_url);
+                            resources.images.push(resolved);
+                        }
+                    } else if let Some(src) = attributes.iter().find(|(k, _)| k == "src") {
                         if !src.1.is_empty() {
                             let resolved = resolve_url(&src.1, base_url);
                             resources.images.push(resolved);
                         }
                     }
+                }
+                "picture" => {
+                    // <picture> contains <source> and <img> children.
+                    // We extract <source srcset="..."> and the fallback <img>.
+                    for child in children {
+                        if let DomNode::Element {
+                            tag: child_tag,
+                            attributes: child_attrs,
+                            ..
+                        } = child
+                        {
+                            if child_tag == "source" {
+                                if let Some(srcset) =
+                                    child_attrs.iter().find(|(k, _)| k == "srcset")
+                                {
+                                    if let Some(best) = pick_srcset_url(&srcset.1) {
+                                        let resolved = resolve_url(&best, base_url);
+                                        resources.images.push(resolved);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Continue to recurse into children to get the <img> fallback.
                 }
                 "script" => {
                     // External: <script src="...">
@@ -400,6 +560,21 @@ fn walk_dom_for_resources(node: &DomNode, base_url: &Option<Url>, resources: &mu
         }
         _ => {}
     }
+}
+
+/// Pick the best URL from a `srcset` attribute value.
+///
+/// Parses entries like `"image-1x.png 1x, image-2x.png 2x"` and picks
+/// the first one (simplest heuristic — a real browser would pick based on DPR).
+fn pick_srcset_url(srcset: &str) -> Option<String> {
+    srcset
+        .split(',')
+        .next()
+        .and_then(|entry| {
+            let parts: Vec<&str> = entry.trim().split_whitespace().collect();
+            parts.first().map(|url| url.to_string())
+        })
+        .filter(|url| !url.is_empty())
 }
 
 /// Collect text content from DOM children (for inline `<script>` elements).
@@ -533,5 +708,95 @@ mod tests {
         };
         let res = extract_sub_resources(&dom, &None);
         assert!(res.images.is_empty());
+    }
+
+    #[test]
+    fn parse_import_url_quoted() {
+        assert_eq!(
+            parse_css_import("@import \"reset.css\";"),
+            Some("reset.css".into())
+        );
+    }
+
+    #[test]
+    fn parse_import_url_function() {
+        assert_eq!(
+            parse_css_import("@import url(\"styles/main.css\");"),
+            Some("styles/main.css".into())
+        );
+    }
+
+    #[test]
+    fn parse_import_url_unquoted() {
+        assert_eq!(
+            parse_css_import("@import url(base.css);"),
+            Some("base.css".into())
+        );
+    }
+
+    #[test]
+    fn parse_import_not_import() {
+        assert_eq!(parse_css_import("body { color: red; }"), None);
+    }
+
+    #[test]
+    fn pick_srcset_first() {
+        assert_eq!(
+            pick_srcset_url("small.jpg 1x, large.jpg 2x"),
+            Some("small.jpg".into())
+        );
+    }
+
+    #[test]
+    fn pick_srcset_single() {
+        assert_eq!(
+            pick_srcset_url("image.webp 480w"),
+            Some("image.webp".into())
+        );
+    }
+
+    #[test]
+    fn extract_picture_source() {
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "picture".into(),
+                attributes: vec![],
+                children: vec![
+                    DomNode::Element {
+                        tag: "source".into(),
+                        attributes: vec![("srcset".into(), "photo.webp".into())],
+                        children: vec![],
+                    },
+                    DomNode::Element {
+                        tag: "img".into(),
+                        attributes: vec![("src".into(), "photo.jpg".into())],
+                        children: vec![],
+                    },
+                ],
+            }],
+        };
+        let res = extract_sub_resources(&dom, &None);
+        // Should extract both the <source srcset> and the <img src>.
+        assert_eq!(res.images.len(), 2);
+        assert!(res.images.contains(&"photo.webp".to_string()));
+        assert!(res.images.contains(&"photo.jpg".to_string()));
+    }
+
+    #[test]
+    fn extract_img_srcset() {
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "img".into(),
+                attributes: vec![
+                    ("src".into(), "fallback.jpg".into()),
+                    ("srcset".into(), "better.webp 2x".into()),
+                ],
+                children: vec![],
+            }],
+        };
+        let res = extract_sub_resources(&dom, &None);
+        // srcset takes precedence over src.
+        assert_eq!(res.images.len(), 1);
+        assert_eq!(res.images[0], "better.webp");
     }
 }

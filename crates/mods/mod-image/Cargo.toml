@@ -13,6 +13,7 @@ async-trait = { workspace = true }
 semver = { workspace = true }
 bytes = { workspace = true }
 image = { version = "0.25.10", features = ["png", "jpeg", "webp", "gif"] }
+resvg = "0.45"
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -1,0 +1,11 @@
+[package]
+name = "nova-security"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NOVA Browser - Security layer, permissions enforcement, mod sandboxing"
+
+[dependencies]
+nova-mod-api = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

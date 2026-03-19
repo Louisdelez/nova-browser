@@ -1,0 +1,31 @@
+[package]
+name = "nova-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NOVA Browser - UI shell and main entry point"
+
+[[bin]]
+name = "nova"
+path = "src/main.rs"
+
+[dependencies]
+nova-mod-api = { workspace = true }
+nova-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+# Mods to load at startup (the "essential pack")
+mod-network = { path = "../mods/mod-network" }
+mod-html-parser = { path = "../mods/mod-html-parser" }
+mod-css-engine = { path = "../mods/mod-css-engine" }
+mod-layout = { path = "../mods/mod-layout" }
+mod-painter = { path = "../mods/mod-painter" }
+mod-js = { path = "../mods/mod-js" }
+mod-image = { path = "../mods/mod-image" }
+winit = "0.30"
+wgpu = "24"
+pollster = "0.4.0"
+fontdue = "0.9.3"

@@ -1,0 +1,24 @@
+[package]
+name = "mod-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NOVA Mod - HTTP/HTTPS networking"
+
+[dependencies]
+nova-mod-api = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
+async-trait = { workspace = true }
+semver = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = "1.0.6"
+rustls-native-certs = "0.8.3"
+flate2 = "1.1.9"

@@ -1,0 +1,16 @@
+[package]
+name = "mod-js"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NOVA Mod - JavaScript engine (placeholder for QuickJS integration)"
+
+[dependencies]
+nova-mod-api = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+semver = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

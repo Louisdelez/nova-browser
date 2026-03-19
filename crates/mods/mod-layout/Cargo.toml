@@ -1,0 +1,14 @@
+[package]
+name = "mod-layout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NOVA Mod - Layout engine (block, inline, flex, grid)"
+
+[dependencies]
+nova-mod-api = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+semver = { workspace = true }
+taffy = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name = "nova-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NOVA Browser - Pipeline engine: orchestrates URL -> pixels"
+
+[dependencies]
+nova-mod-api = { workspace = true }
+nova-registry = { workspace = true }
+nova-gpu = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
+async-trait = { workspace = true }

@@ -1,0 +1,23 @@
+[package]
+name = "nova-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NOVA Browser - The micro-kernel that ties everything together"
+
+[dependencies]
+nova-mod-api = { workspace = true }
+nova-ipc = { workspace = true }
+nova-gpu = { workspace = true }
+nova-registry = { workspace = true }
+nova-security = { workspace = true }
+nova-pipeline = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }

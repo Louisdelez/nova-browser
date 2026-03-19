@@ -1,0 +1,426 @@
+//! CSS value parsing: colors, lengths, keywords.
+//!
+//! Converts raw CSS tokens into `StyleValue` / `CssColor` types from `nova-mod-api`.
+
+use nova_mod_api::content::{CssColor, StyleValue};
+
+/// Parse a CSS value string into a `StyleValue`.
+///
+/// This handles the common value types: keywords, lengths (px, em, %),
+/// colors (named, hex, rgb/rgba), numbers, and strings.
+pub fn parse_value(property: &str, raw: &str) -> StyleValue {
+    let raw = raw.trim();
+
+    // Try color properties first.
+    if is_color_property(property) {
+        if let Some(color) = parse_color(raw) {
+            return StyleValue::Color(color);
+        }
+        // Fall through to keyword/other parsing.
+    }
+
+    // Try numeric/length values.
+    if let Some(sv) = parse_length_or_number(raw) {
+        return sv;
+    }
+
+    // Default: treat as keyword.
+    StyleValue::Keyword(raw.to_string())
+}
+
+/// Whether the given property expects a color value.
+fn is_color_property(property: &str) -> bool {
+    matches!(
+        property,
+        "color"
+            | "background-color"
+            | "border-color"
+            | "border-top-color"
+            | "border-right-color"
+            | "border-bottom-color"
+            | "border-left-color"
+            | "outline-color"
+            | "text-decoration-color"
+    )
+}
+
+/// Try to parse a CSS length (`px`, `em`, `rem`, `%`) or plain number.
+fn parse_length_or_number(raw: &str) -> Option<StyleValue> {
+    if raw.ends_with("px") {
+        raw[..raw.len() - 2].trim().parse::<f32>().ok().map(StyleValue::Px)
+    } else if raw.ends_with('%') {
+        raw[..raw.len() - 1]
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(StyleValue::Percent)
+    } else if raw.ends_with("em") || raw.ends_with("rem") {
+        // Convert em/rem to px using 16px base (approximate).
+        let num_end = if raw.ends_with("rem") {
+            raw.len() - 3
+        } else {
+            raw.len() - 2
+        };
+        raw[..num_end]
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|n| StyleValue::Px(n * 16.0))
+    } else if raw.ends_with("pt") {
+        // 1pt = 1.333px
+        raw[..raw.len() - 2]
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|n| StyleValue::Px(n * 1.333))
+    } else if raw.ends_with("vh") || raw.ends_with("vw") {
+        // Treat viewport units as percentages for now.
+        raw[..raw.len() - 2]
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(StyleValue::Percent)
+    } else {
+        // Try plain number.
+        raw.parse::<f32>().ok().map(StyleValue::Number)
+    }
+}
+
+/// Parse a CSS color from a string.
+///
+/// Supports: named colors, `#hex`, `rgb()`, `rgba()`.
+pub fn parse_color(raw: &str) -> Option<CssColor> {
+    let raw = raw.trim();
+
+    if raw.starts_with('#') {
+        return parse_hex_color(raw);
+    }
+    if raw.starts_with("rgb") {
+        return parse_rgb_color(raw);
+    }
+    parse_named_color(raw)
+}
+
+/// Parse a hex color: `#RGB`, `#RRGGBB`, `#RGBA`, `#RRGGBBAA`.
+fn parse_hex_color(raw: &str) -> Option<CssColor> {
+    let hex = &raw[1..];
+    match hex.len() {
+        3 => {
+            let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
+            let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
+            let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
+            Some(CssColor { r, g, b, a: 1.0 })
+        }
+        4 => {
+            let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
+            let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
+            let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
+            let a = u8::from_str_radix(&hex[3..4], 16).ok()? * 17;
+            Some(CssColor {
+                r,
+                g,
+                b,
+                a: a as f32 / 255.0,
+            })
+        }
+        6 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            Some(CssColor { r, g, b, a: 1.0 })
+        }
+        8 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
+            Some(CssColor {
+                r,
+                g,
+                b,
+                a: a as f32 / 255.0,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Parse `rgb(r, g, b)` or `rgba(r, g, b, a)`.
+fn parse_rgb_color(raw: &str) -> Option<CssColor> {
+    // Strip "rgb(" or "rgba(" and the closing ")".
+    let inner = raw
+        .strip_prefix("rgba(")
+        .or_else(|| raw.strip_prefix("rgb("))?
+        .strip_suffix(')')?
+        .trim();
+
+    // Split by comma or slash (modern syntax uses spaces + slash for alpha).
+    let parts: Vec<&str> = if inner.contains(',') {
+        inner.split(',').map(str::trim).collect()
+    } else {
+        // Modern syntax: `rgb(255 128 0 / 0.5)`
+        let slash_parts: Vec<&str> = inner.splitn(2, '/').collect();
+        let mut rgb: Vec<&str> = slash_parts[0].split_whitespace().collect();
+        if slash_parts.len() > 1 {
+            rgb.push(slash_parts[1].trim());
+        }
+        rgb
+    };
+
+    if parts.len() < 3 {
+        return None;
+    }
+
+    let r = parse_color_component(parts[0])?;
+    let g = parse_color_component(parts[1])?;
+    let b = parse_color_component(parts[2])?;
+    let a = if parts.len() >= 4 {
+        parts[3].trim().parse::<f32>().unwrap_or(1.0)
+    } else {
+        1.0
+    };
+
+    Some(CssColor { r, g, b, a })
+}
+
+/// Parse a single color component (0-255 or 0%-100%).
+fn parse_color_component(s: &str) -> Option<u8> {
+    let s = s.trim();
+    if let Some(pct) = s.strip_suffix('%') {
+        let val: f32 = pct.trim().parse().ok()?;
+        Some((val * 2.55).round().clamp(0.0, 255.0) as u8)
+    } else {
+        let val: f32 = s.parse().ok()?;
+        Some(val.round().clamp(0.0, 255.0) as u8)
+    }
+}
+
+/// Parse a named CSS color.
+pub fn parse_named_color(name: &str) -> Option<CssColor> {
+    let c = |r, g, b| {
+        Some(CssColor {
+            r,
+            g,
+            b,
+            a: 1.0,
+        })
+    };
+
+    match name.to_ascii_lowercase().as_str() {
+        "transparent" => Some(CssColor { r: 0, g: 0, b: 0, a: 0.0 }),
+        "black" => c(0, 0, 0),
+        "white" => c(255, 255, 255),
+        "red" => c(255, 0, 0),
+        "green" => c(0, 128, 0),
+        "blue" => c(0, 0, 255),
+        "yellow" => c(255, 255, 0),
+        "cyan" | "aqua" => c(0, 255, 255),
+        "magenta" | "fuchsia" => c(255, 0, 255),
+        "gray" | "grey" => c(128, 128, 128),
+        "silver" => c(192, 192, 192),
+        "maroon" => c(128, 0, 0),
+        "olive" => c(128, 128, 0),
+        "lime" => c(0, 255, 0),
+        "teal" => c(0, 128, 128),
+        "navy" => c(0, 0, 128),
+        "purple" => c(128, 0, 128),
+        "orange" => c(255, 165, 0),
+        "pink" => c(255, 192, 203),
+        "brown" => c(165, 42, 42),
+        "coral" => c(255, 127, 80),
+        "crimson" => c(220, 20, 60),
+        "darkblue" => c(0, 0, 139),
+        "darkgray" | "darkgrey" => c(169, 169, 169),
+        "darkgreen" => c(0, 100, 0),
+        "darkred" => c(139, 0, 0),
+        "gold" => c(255, 215, 0),
+        "indigo" => c(75, 0, 130),
+        "ivory" => c(255, 255, 240),
+        "khaki" => c(240, 230, 140),
+        "lavender" => c(230, 230, 250),
+        "lightblue" => c(173, 216, 230),
+        "lightgray" | "lightgrey" => c(211, 211, 211),
+        "lightgreen" => c(144, 238, 144),
+        "lightyellow" => c(255, 255, 224),
+        "linen" => c(250, 240, 230),
+        "mintcream" => c(245, 255, 250),
+        "mistyrose" => c(255, 228, 225),
+        "moccasin" => c(255, 228, 181),
+        "oldlace" => c(253, 245, 230),
+        "orangered" => c(255, 69, 0),
+        "orchid" => c(218, 112, 214),
+        "peru" => c(205, 133, 63),
+        "plum" => c(221, 160, 221),
+        "salmon" => c(250, 128, 114),
+        "sienna" => c(160, 82, 45),
+        "skyblue" => c(135, 206, 235),
+        "slategray" | "slategrey" => c(112, 128, 144),
+        "steelblue" => c(70, 130, 180),
+        "tan" => c(210, 180, 140),
+        "tomato" => c(255, 99, 71),
+        "turquoise" => c(64, 224, 208),
+        "violet" => c(238, 130, 238),
+        "wheat" => c(245, 222, 179),
+        "whitesmoke" => c(245, 245, 245),
+        "yellowgreen" => c(154, 205, 50),
+        "aliceblue" => c(240, 248, 255),
+        "antiquewhite" => c(250, 235, 215),
+        "aquamarine" => c(127, 255, 212),
+        "azure" => c(240, 255, 255),
+        "beige" => c(245, 245, 220),
+        "bisque" => c(255, 228, 196),
+        "blanchedalmond" => c(255, 235, 205),
+        "blueviolet" => c(138, 43, 226),
+        "burlywood" => c(222, 184, 135),
+        "cadetblue" => c(95, 158, 160),
+        "chartreuse" => c(127, 255, 0),
+        "chocolate" => c(210, 105, 30),
+        "cornflowerblue" => c(100, 149, 237),
+        "cornsilk" => c(255, 248, 220),
+        "darkkhaki" => c(189, 183, 107),
+        "darkorange" => c(255, 140, 0),
+        "darkorchid" => c(153, 50, 204),
+        "darksalmon" => c(233, 150, 122),
+        "darkseagreen" => c(143, 188, 143),
+        "darkslateblue" => c(72, 61, 139),
+        "darkslategray" | "darkslategrey" => c(47, 79, 79),
+        "darkturquoise" => c(0, 206, 209),
+        "darkviolet" => c(148, 0, 211),
+        "deeppink" => c(255, 20, 147),
+        "deepskyblue" => c(0, 191, 255),
+        "dimgray" | "dimgrey" => c(105, 105, 105),
+        "dodgerblue" => c(30, 144, 255),
+        "firebrick" => c(178, 34, 34),
+        "floralwhite" => c(255, 250, 240),
+        "forestgreen" => c(34, 139, 34),
+        "gainsboro" => c(220, 220, 220),
+        "ghostwhite" => c(248, 248, 255),
+        "goldenrod" => c(218, 165, 32),
+        "greenyellow" => c(173, 255, 47),
+        "honeydew" => c(240, 255, 240),
+        "hotpink" => c(255, 105, 180),
+        "indianred" => c(205, 92, 92),
+        "lawngreen" => c(124, 252, 0),
+        "lemonchiffon" => c(255, 250, 205),
+        "lightcoral" => c(240, 128, 128),
+        "lightcyan" => c(224, 255, 255),
+        "lightgoldenrodyellow" => c(250, 250, 210),
+        "lightpink" => c(255, 182, 193),
+        "lightsalmon" => c(255, 160, 122),
+        "lightseagreen" => c(32, 178, 170),
+        "lightskyblue" => c(135, 206, 250),
+        "lightslategray" | "lightslategrey" => c(119, 136, 153),
+        "lightsteelblue" => c(176, 196, 222),
+        "limegreen" => c(50, 205, 50),
+        "mediumaquamarine" => c(102, 205, 170),
+        "mediumblue" => c(0, 0, 205),
+        "mediumorchid" => c(186, 85, 211),
+        "mediumpurple" => c(147, 111, 219),
+        "mediumseagreen" => c(60, 179, 113),
+        "mediumslateblue" => c(123, 104, 238),
+        "mediumspringgreen" => c(0, 250, 154),
+        "mediumturquoise" => c(72, 209, 204),
+        "mediumvioletred" => c(199, 21, 133),
+        "midnightblue" => c(25, 25, 112),
+        "navajowhite" => c(255, 222, 173),
+        "olivedrab" => c(107, 142, 35),
+        "palegoldenrod" => c(238, 232, 170),
+        "palegreen" => c(152, 251, 152),
+        "paleturquoise" => c(175, 238, 238),
+        "palevioletred" => c(219, 112, 147),
+        "papayawhip" => c(255, 239, 213),
+        "peachpuff" => c(255, 218, 185),
+        "powderblue" => c(176, 224, 230),
+        "rosybrown" => c(188, 143, 143),
+        "royalblue" => c(65, 105, 225),
+        "saddlebrown" => c(139, 69, 19),
+        "sandybrown" => c(244, 164, 96),
+        "seagreen" => c(46, 139, 87),
+        "seashell" => c(255, 245, 238),
+        "snow" => c(255, 250, 250),
+        "springgreen" => c(0, 255, 127),
+        "thistle" => c(216, 191, 216),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_colors() {
+        let c = parse_color("#ff0000").unwrap();
+        assert_eq!(c.r, 255);
+        assert_eq!(c.g, 0);
+        assert_eq!(c.b, 0);
+        assert_eq!(c.a, 1.0);
+
+        let c = parse_color("#0f0").unwrap();
+        assert_eq!(c.r, 0);
+        assert_eq!(c.g, 255);
+        assert_eq!(c.b, 0);
+    }
+
+    #[test]
+    fn rgb_colors() {
+        let c = parse_color("rgb(10, 20, 30)").unwrap();
+        assert_eq!(c.r, 10);
+        assert_eq!(c.g, 20);
+        assert_eq!(c.b, 30);
+        assert_eq!(c.a, 1.0);
+    }
+
+    #[test]
+    fn rgba_colors() {
+        let c = parse_color("rgba(10, 20, 30, 0.5)").unwrap();
+        assert_eq!(c.r, 10);
+        assert_eq!(c.g, 20);
+        assert_eq!(c.b, 30);
+        assert!((c.a - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn named_colors() {
+        let c = parse_color("red").unwrap();
+        assert_eq!(c.r, 255);
+        assert_eq!(c.g, 0);
+        assert_eq!(c.b, 0);
+    }
+
+    #[test]
+    fn parse_px_value() {
+        match parse_value("width", "100px") {
+            StyleValue::Px(v) => assert!((v - 100.0).abs() < 0.01),
+            other => panic!("expected Px, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_percent_value() {
+        match parse_value("width", "50%") {
+            StyleValue::Percent(v) => assert!((v - 50.0).abs() < 0.01),
+            other => panic!("expected Percent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_keyword_value() {
+        match parse_value("display", "flex") {
+            StyleValue::Keyword(k) => assert_eq!(k, "flex"),
+            other => panic!("expected Keyword, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_color_value() {
+        match parse_value("color", "#336699") {
+            StyleValue::Color(c) => {
+                assert_eq!(c.r, 0x33);
+                assert_eq!(c.g, 0x66);
+                assert_eq!(c.b, 0x99);
+            }
+            other => panic!("expected Color, got {other:?}"),
+        }
+    }
+}

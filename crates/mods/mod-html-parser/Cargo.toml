@@ -1,0 +1,20 @@
+[package]
+name = "mod-html-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NOVA Mod - HTML5 parser using html5ever"
+
+[dependencies]
+nova-mod-api = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+semver = { workspace = true }
+html5ever = { workspace = true }
+markup5ever = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }

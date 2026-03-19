@@ -1,0 +1,13 @@
+[package]
+name = "mod-painter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NOVA Mod - Painter: generates render commands from layout tree"
+
+[dependencies]
+nova-mod-api = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+semver = { workspace = true }

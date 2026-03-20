@@ -15,7 +15,7 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
 
     // Default colors — only set color on root elements so that CSS
     // inheritance works for all other elements.  `<a>` overrides to blue
-    // further below.  background-color is always transparent by default.
+    // further below.
     match tag {
         "html" | "body" => {
             props.push((
@@ -30,15 +30,33 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
         }
         _ => {}
     }
-    props.push((
-        "background-color".into(),
-        StyleValue::Color(CssColor {
-            r: 255,
-            g: 255,
-            b: 255,
-            a: 0.0, // transparent by default
-        }),
-    ));
+
+    // Background-color: `<html>` defaults to white (the canvas background),
+    // all other elements default to transparent.
+    match tag {
+        "html" => {
+            props.push((
+                "background-color".into(),
+                StyleValue::Color(CssColor {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 1.0, // opaque white — the page canvas
+                }),
+            ));
+        }
+        _ => {
+            props.push((
+                "background-color".into(),
+                StyleValue::Color(CssColor {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 0.0, // transparent by default
+                }),
+            ));
+        }
+    }
 
     // Font sizes for headings.
     let font_size = match tag {

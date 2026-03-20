@@ -1451,6 +1451,50 @@ mod tests {
     }
 
     #[test]
+    fn margin_auto_and_max_width_pass_through() {
+        // Simulates example.com: body has max-width + margin: 0 auto
+        let dom = make_dom(vec![
+            DomNode::Element {
+                tag: "style".into(),
+                attributes: vec![],
+                children: vec![DomNode::Text("body { margin: 0 auto; max-width: 600px; }".into())],
+            },
+            DomNode::Element {
+                tag: "div".into(),
+                attributes: vec![],
+                children: vec![DomNode::Text("Hello".into())],
+            },
+        ]);
+
+        let result = compute_styles(dom, &[], 1280.0);
+        // Find body element
+        fn find_body(node: &DomNode) -> Option<&DomNode> {
+            match node {
+                DomNode::Element { tag, children, .. } => {
+                    if tag == "body" { return Some(node); }
+                    for child in children {
+                        if let Some(found) = find_body(child) { return Some(found); }
+                    }
+                    None
+                }
+                DomNode::Document { children } => {
+                    for child in children {
+                        if let Some(found) = find_body(child) { return Some(found); }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        }
+
+        let body = find_body(&result).expect("should find body");
+        let style = body.attr("data-nova-style").expect("body should have data-nova-style");
+        assert!(style.contains("max-width: 600px"), "body should have max-width: 600px, style = {style}");
+        assert!(style.contains("margin-left: auto"), "body should have margin-left: auto, style = {style}");
+        assert!(style.contains("margin-right: auto"), "body should have margin-right: auto, style = {style}");
+    }
+
+    #[test]
     fn shorthand_margin_expands() {
         let dom = make_dom(vec![
             DomNode::Element {

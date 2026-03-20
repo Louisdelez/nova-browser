@@ -590,24 +590,29 @@ fn add_node(
 
         DomNode::Text(text) => {
             // Text nodes inherit font-size from their parent element,
-            // along with color, background-color, and text-decoration.
+            // along with color, text-decoration, font-weight, etc.
+            // NOTE: background-color is NOT inherited in CSS — only the
+            // element itself paints its background, not its text children.
             let font_size = parent_font_size;
             let mut text_props = vec![
                 ("font-size".into(), StyleValue::Px(font_size)),
             ];
-            // Inherit color, background-color, and text-decoration from parent.
+            // Inherit color and text-related properties from parent.
             for (key, value) in parent_style_props {
-                if key == "color" || key == "background-color" || key == "text-decoration"
+                if key == "color" || key == "text-decoration"
                     || key == "text-align" || key == "font-weight" || key == "font-style"
-                    || key == "white-space" || key == "overflow" {
+                    || key == "white-space" || key == "overflow"
+                    || key == "text-transform" || key == "font-family" {
                     text_props.push((key.clone(), value.clone()));
                 }
             }
 
             let line_height = font_size * LINE_HEIGHT_FACTOR;
-            // Use a standard web-metric space width (≈ 0.25 em) instead of
-            // fontdue's rasterize advance_width which tends to be too large.
-            let space_width = (font_size * 0.25).max(1.0);
+            // Measure space width from the actual font glyph so it matches
+            // what the renderer will produce. Fall back to 0.3em if the font
+            // measurement returns zero (e.g. no font loaded).
+            let measured_space = measure_text_width(" ", font_size);
+            let space_width = if measured_space > 0.0 { measured_space } else { (font_size * 0.3).max(1.0) };
 
             // Split the text into individual words.  When there are multiple
             // words we create one leaf node per word (plus thin "space" nodes
@@ -902,7 +907,21 @@ fn flatten_node_recursive(
 ) {
     match node {
         DomNode::Text(text) => {
-            let space_width = (font_size * 0.25).max(1.0);
+            // Measure space width from the actual font glyph so it matches
+            // what the renderer will produce. Fall back to 0.3em if the font
+            // measurement returns zero (e.g. no font loaded).
+            let measured_space = measure_text_width(" ", font_size);
+            let space_width = if measured_space > 0.0 { measured_space } else { (font_size * 0.3).max(1.0) };
+
+            // Text nodes should NOT carry background-color — only the
+            // containing element paints its background (CSS spec: background
+            // is not inherited).
+            let text_style: Vec<(String, StyleValue)> = style_props
+                .iter()
+                .filter(|(k, _)| k != "background-color")
+                .cloned()
+                .collect();
+            let style_props = &text_style[..];
 
             // Check white-space property to decide how to split text.
             let white_space = style_props.iter()
@@ -1410,11 +1429,15 @@ struct LayoutProps {
 
 /// Parse a CSS value into `LengthPercentageAuto`.
 ///
-/// Recognises `auto`, `<n>px`, `<n>%`, and `<n>vw` (treated as percent).
+/// Recognises `auto`, `<n>px`, `<n>%`, `<n>vw`, `<n>vh` (viewport units
+/// treated as percent), and bare `0`.
 fn parse_length_percentage_auto(val: &str) -> Option<LengthPercentageAuto> {
     let val = val.trim();
     if val == "auto" {
         return Some(LengthPercentageAuto::Auto);
+    }
+    if val == "0" {
+        return Some(LengthPercentageAuto::Length(0.0));
     }
     if let Some(px) = val.strip_suffix("px").and_then(|s| s.trim().parse::<f32>().ok()) {
         return Some(LengthPercentageAuto::Length(px));
@@ -1425,12 +1448,20 @@ fn parse_length_percentage_auto(val: &str) -> Option<LengthPercentageAuto> {
     if let Some(vw) = val.strip_suffix("vw").and_then(|s| s.trim().parse::<f32>().ok()) {
         return Some(LengthPercentageAuto::Percent(vw / 100.0));
     }
+    if let Some(vh) = val.strip_suffix("vh").and_then(|s| s.trim().parse::<f32>().ok()) {
+        return Some(LengthPercentageAuto::Percent(vh / 100.0));
+    }
     None
 }
 
 /// Parse a CSS value into `LengthPercentage` (no `auto`).
+///
+/// Recognises `<n>px`, `<n>%`, and bare `0`.
 fn parse_length_percentage(val: &str) -> Option<LengthPercentage> {
     let val = val.trim();
+    if val == "0" {
+        return Some(LengthPercentage::Length(0.0));
+    }
     if let Some(px) = val.strip_suffix("px").and_then(|s| s.trim().parse::<f32>().ok()) {
         return Some(LengthPercentage::Length(px));
     }
@@ -1442,11 +1473,15 @@ fn parse_length_percentage(val: &str) -> Option<LengthPercentage> {
 
 /// Parse a CSS value into a `Dimension`.
 ///
-/// Recognises `auto`, `<n>px`, `<n>%`, and `<n>vw` (treated as percent).
+/// Recognises `auto`, `<n>px`, `<n>%`, `<n>vw`, `<n>vh` (viewport units
+/// treated as percent), and bare `0`.
 fn parse_dimension(val: &str) -> Option<Dimension> {
     let val = val.trim();
     if val == "auto" {
         return Some(Dimension::Auto);
+    }
+    if val == "0" {
+        return Some(Dimension::Length(0.0));
     }
     // Handle calc() expressions.
     if val.starts_with("calc(") {
@@ -1465,6 +1500,9 @@ fn parse_dimension(val: &str) -> Option<Dimension> {
     }
     if let Some(vw) = val.strip_suffix("vw").and_then(|s| s.trim().parse::<f32>().ok()) {
         return Some(Dimension::Percent(vw / 100.0));
+    }
+    if let Some(vh) = val.strip_suffix("vh").and_then(|s| s.trim().parse::<f32>().ok()) {
+        return Some(Dimension::Percent(vh / 100.0));
     }
     None
 }
@@ -2133,14 +2171,22 @@ fn build_taffy_style(
 
         // "block" and everything else: column flex container at full width.
         _ => {
-            let _ = tag;
+            // For <html> and <body>, ensure they fill at least the viewport
+            // height so their background-color covers the entire page.
+            let is_root_element = tag == "html" || tag == "body";
             // Use Auto width + flex_grow to fill available space (respects margins).
             // Only use Percent(1.0) if no margins and no explicit width.
             // Floated elements always use Auto width by default and don't grow.
             let is_floated = lp.float.as_deref().map_or(false, |f| f == "left" || f == "right");
             let has_h_margins = lp.margin_left.is_some() || lp.margin_right.is_some()
                 || is_floated;
-            let default_width = if has_h_margins || lp.width.is_some() || is_floated {
+            let default_width = if center_via_auto_margin && lp.width.is_none() {
+                // When both horizontal margins are `auto` (centering) and no
+                // explicit width is set, use 100% so the element fills its
+                // parent. `max_size.width` will clamp it and `align_self:
+                // Center` will centre the clamped box.
+                Dimension::Percent(1.0)
+            } else if has_h_margins || lp.width.is_some() || is_floated {
                 lp.width.unwrap_or(Dimension::Auto)
             } else {
                 Dimension::Percent(1.0)
@@ -2174,7 +2220,9 @@ fn build_taffy_style(
                 },
                 min_size: Size {
                     width: lp.min_width.unwrap_or(Dimension::Auto),
-                    height: lp.min_height.unwrap_or(Dimension::Auto),
+                    height: lp.min_height.unwrap_or(
+                        if is_root_element { Dimension::Percent(1.0) } else { Dimension::Auto }
+                    ),
                 },
                 max_size: Size {
                     width: lp.max_width.unwrap_or(Dimension::Auto),
@@ -2896,6 +2944,69 @@ mod phase4_tests {
         ];
         let lp = parse_layout_props(&attrs);
         assert_eq!(lp.float.as_deref(), Some("right"));
+    }
+
+    #[test]
+    fn example_com_centering_with_max_width() {
+        // Simulates example.com: body has max-width + margin: 0 auto
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "body".into(),
+                attributes: vec![(
+                    "data-nova-style".into(),
+                    "margin-top: 0; margin-right: auto; margin-bottom: 0; margin-left: auto; max-width: 600px".into(),
+                )],
+                children: vec![DomNode::Element {
+                    tag: "div".into(),
+                    attributes: vec![],
+                    children: vec![DomNode::Text("Example Domain".into())],
+                }],
+            }],
+        };
+        let vp = Viewport { width: 1024.0, height: 768.0, scale_factor: 1.0 };
+        let root = compute_layout(&dom, &vp).expect("layout should succeed");
+        let body = &root.children[0];
+        assert!(body.width <= 600.01, "body should be max 600px wide, got {}", body.width);
+        let expected_x = (1024.0 - body.width) / 2.0;
+        assert!((body.x - expected_x).abs() < 2.0, "body should be centered at x~{}, got {}", expected_x, body.x);
+    }
+
+    #[test]
+    fn example_com_real_css_width_60vw() {
+        // Real example.com uses: body { width: 60vw; margin: 15vh auto; }
+        // After CSS cascade, 60vw becomes 60% and 15vh becomes 15%.
+        // The layout should center the body.
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "body".into(),
+                attributes: vec![(
+                    "data-nova-style".into(),
+                    "width: 60%; margin-top: 15%; margin-right: auto; margin-bottom: 15%; margin-left: auto".into(),
+                )],
+                children: vec![
+                    DomNode::Element {
+                        tag: "h1".into(),
+                        attributes: vec![],
+                        children: vec![DomNode::Text("Example Domain".into())],
+                    },
+                    DomNode::Element {
+                        tag: "div".into(),
+                        attributes: vec![],
+                        children: vec![DomNode::Text("This domain is for use in illustrative examples.".into())],
+                    },
+                ],
+            }],
+        };
+        let vp = Viewport { width: 1024.0, height: 768.0, scale_factor: 1.0 };
+        let root = compute_layout(&dom, &vp).expect("layout should succeed");
+        let body = &root.children[0];
+        // 60% of 1024 = 614.4
+        let expected_width = 1024.0 * 0.60;
+        assert!((body.width - expected_width).abs() < 2.0,
+            "body width should be ~{}, got {}", expected_width, body.width);
+        let expected_x = (1024.0 - body.width) / 2.0;
+        assert!((body.x - expected_x).abs() < 2.0,
+            "body should be centered at x~{}, got {}", expected_x, body.x);
     }
 
     #[test]

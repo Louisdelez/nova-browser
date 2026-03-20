@@ -2028,4 +2028,103 @@ mod pseudo_element_injection_tests {
             panic!("expected Element for p");
         }
     }
+
+    #[test]
+    fn link_gets_blue_color_from_ua_defaults() {
+        // An <a> element should get color: #0000ee from UA defaults.
+        let dom = make_dom(vec![DomNode::Element {
+            tag: "p".into(),
+            attributes: vec![],
+            children: vec![
+                DomNode::Text("Hello ".into()),
+                DomNode::Element {
+                    tag: "a".into(),
+                    attributes: vec![("href".into(), "https://example.com".into())],
+                    children: vec![DomNode::Text("world".into())],
+                },
+            ],
+        }]);
+
+        let result = compute_styles(dom, &[], 1280.0);
+
+        fn find_a(node: &DomNode) -> Option<&DomNode> {
+            match node {
+                DomNode::Element { tag, children, .. } => {
+                    if tag == "a" { return Some(node); }
+                    for child in children {
+                        if let Some(found) = find_a(child) { return Some(found); }
+                    }
+                    None
+                }
+                DomNode::Document { children } => {
+                    for child in children {
+                        if let Some(found) = find_a(child) { return Some(found); }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        }
+
+        let a = find_a(&result).expect("should find <a>");
+        let style = a.attr("data-nova-style").expect("a should have data-nova-style");
+        assert!(
+            style.contains("color: #0000ee"),
+            "link should have blue color in data-nova-style, got: {style}"
+        );
+        assert!(
+            style.contains("text-decoration: underline"),
+            "link should have underline in data-nova-style, got: {style}"
+        );
+    }
+
+    #[test]
+    fn link_color_not_overridden_by_parent_inheritance() {
+        // When a parent has color: black (from author CSS), the <a> element's
+        // UA default color: #0000ee should still win over inheritance.
+        let dom = make_dom(vec![
+            DomNode::Element {
+                tag: "style".into(),
+                attributes: vec![],
+                children: vec![DomNode::Text("body { color: black; }".into())],
+            },
+            DomNode::Element {
+                tag: "p".into(),
+                attributes: vec![],
+                children: vec![DomNode::Element {
+                    tag: "a".into(),
+                    attributes: vec![("href".into(), "https://example.com".into())],
+                    children: vec![DomNode::Text("link".into())],
+                }],
+            },
+        ]);
+
+        let result = compute_styles(dom, &[], 1280.0);
+
+        fn find_a(node: &DomNode) -> Option<&DomNode> {
+            match node {
+                DomNode::Element { tag, children, .. } => {
+                    if tag == "a" { return Some(node); }
+                    for child in children {
+                        if let Some(found) = find_a(child) { return Some(found); }
+                    }
+                    None
+                }
+                DomNode::Document { children } => {
+                    for child in children {
+                        if let Some(found) = find_a(child) { return Some(found); }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        }
+
+        let a = find_a(&result).expect("should find <a>");
+        let style = a.attr("data-nova-style").expect("a should have data-nova-style");
+        assert!(
+            style.contains("color: #0000ee"),
+            "link should keep blue color despite parent having black, got: {style}"
+        );
+    }
 }

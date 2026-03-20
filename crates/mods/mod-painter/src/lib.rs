@@ -602,6 +602,13 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                         let seg_color_str = parts[3];
                         let seg_weight_str = parts[4];
                         let seg_texdec = parts[5];
+                        // 7th field: href (may contain colons, so rejoin everything after field 6).
+                        let seg_href = if parts.len() > 6 {
+                            parts[6..].join(":")
+                        } else {
+                            String::new()
+                        };
+                        let has_href = !seg_href.is_empty();
 
                         if start < end && end <= transformed_text.len() {
                             let seg_text = &transformed_text[start..end];
@@ -636,21 +643,35 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                                 letter_spacing,
                             });
 
-                            // Per-segment underline.
-                            if seg_texdec.contains("underline") {
-                                let seg_width = if end < transformed_text.len() {
-                                    // Width = next segment's x_off - this x_off.
-                                    // We approximate with estimate_text_width for the segment.
-                                    estimate_text_width(seg_text, font_size)
-                                } else {
-                                    layout_box.width - x_off
-                                };
+                            // Per-segment underline: draw if text-decoration
+                            // says underline OR the segment is a link (links
+                            // always get an underline so they remain
+                            // distinguishable even when the site overrides
+                            // color/decoration).
+                            let seg_width = if end < transformed_text.len() {
+                                estimate_text_width(seg_text, font_size)
+                            } else {
+                                layout_box.width - x_off
+                            };
+                            if seg_texdec.contains("underline") || has_href {
                                 ops.push(RenderOp::FillRect {
                                     x: layout_box.x + x_off,
                                     y: layout_box.y + font_size + 2.0,
                                     width: seg_width,
                                     height: 1.0,
                                     color: seg_color,
+                                });
+                            }
+
+                            // Emit a Link op for segments that carry an href
+                            // so the segment is clickable.
+                            if has_href {
+                                ops.push(RenderOp::Link {
+                                    x: layout_box.x + x_off,
+                                    y: layout_box.y,
+                                    width: seg_width,
+                                    height: font_size + 4.0,
+                                    url: seg_href,
                                 });
                             }
                         }

@@ -103,6 +103,7 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
     match tag {
         "pre" => {
             props.push(("white-space".into(), StyleValue::Keyword("pre".into())));
+            props.push(("font-family".into(), StyleValue::Keyword("monospace".into())));
             props.push((
                 "background-color".into(),
                 StyleValue::Color(CssColor {
@@ -118,8 +119,10 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
             props.push(("padding-left".into(), StyleValue::Px(8.0)));
             props.push(("margin-top".into(), StyleValue::Px(16.0)));
             props.push(("margin-bottom".into(), StyleValue::Px(16.0)));
+            props.push(("overflow-x".into(), StyleValue::Keyword("auto".into())));
         }
-        "code" => {
+        "code" | "kbd" | "samp" => {
+            props.push(("font-family".into(), StyleValue::Keyword("monospace".into())));
             props.push((
                 "background-color".into(),
                 StyleValue::Color(CssColor {
@@ -142,7 +145,9 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
 
     // <hr> — visible divider line.
     if tag == "hr" {
-        props.push(("border-top".into(), StyleValue::Str("1px solid #ccc".into())));
+        props.push(("border-top-style".into(), StyleValue::Keyword("solid".into())));
+        props.push(("border-top-width".into(), StyleValue::Px(1.0)));
+        props.push(("border-top-color".into(), StyleValue::Str("#ccc".to_string())));
         props.push(("margin-top".into(), StyleValue::Px(8.0)));
         props.push(("margin-bottom".into(), StyleValue::Px(8.0)));
     }

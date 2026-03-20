@@ -1635,7 +1635,7 @@ fn layout_inline_run(
 
                         // Build segment data with pre-computed x-offsets so
                         // the painter doesn't need its own font metrics.
-                        // Format: "start:end:xoff:color:weight:texdec"
+                        // Format: "start:end:xoff:color:weight:texdec:href"
                         let mut segment_data = Vec::new();
                         let mut all_same_style = true;
                         for (idx, (start, end, seg_style)) in segments.iter().enumerate() {
@@ -1668,7 +1668,14 @@ fn layout_inline_run(
                                     _ => String::new(),
                                 })
                                 .unwrap_or_default();
-                            segment_data.push(format!("{start}:{end}:{x_off}:{color}:{weight}:{texdec}"));
+                            let href = seg_style.iter()
+                                .find(|(k, _)| k == "href")
+                                .map(|(_, v)| match v {
+                                    StyleValue::Str(s) => s.clone(),
+                                    _ => String::new(),
+                                })
+                                .unwrap_or_default();
+                            segment_data.push(format!("{start}:{end}:{x_off}:{color}:{weight}:{texdec}:{href}"));
                             // Check if this segment differs from the first.
                             if idx > 0 && all_same_style {
                                 if !styles_compatible_for_merge(&first_style, seg_style) {
@@ -1794,7 +1801,7 @@ fn styles_compatible_for_merge(a: &[(String, StyleValue)], b: &[(String, StyleVa
 
     static MERGE_KEYS: &[&str] = &[
         "font-size", "color", "font-weight", "font-style",
-        "font-family", "text-decoration",
+        "font-family", "text-decoration", "href",
     ];
     for &key in MERGE_KEYS {
         if get(a, key) != get(b, key) {
@@ -2704,6 +2711,58 @@ fn parse_layout_props(attributes: &[(String, String)]) -> LayoutProps {
                 "flex-basis" => props.flex_basis = parse_dimension(val),
                 "align-self" => props.align_self = Some(val.to_string()),
 
+                // ── `flex` shorthand ──────────────────────────────────
+                // Supports: `flex: none`, `flex: <grow>`, `flex: <grow> <shrink>`,
+                // `flex: <grow> <shrink> <basis>`, and `flex: <grow> <basis>`.
+                "flex" => {
+                    let parts: Vec<&str> = val.split_whitespace().collect();
+                    match parts.len() {
+                        1 => {
+                            if parts[0] == "none" {
+                                // flex: none → 0 0 auto
+                                props.flex_grow = Some(0.0);
+                                props.flex_shrink = Some(0.0);
+                                props.flex_basis = Some(Dimension::Auto);
+                            } else if parts[0] == "auto" {
+                                // flex: auto → 1 1 auto
+                                props.flex_grow = Some(1.0);
+                                props.flex_shrink = Some(1.0);
+                                props.flex_basis = Some(Dimension::Auto);
+                            } else if let Ok(grow) = parts[0].parse::<f32>() {
+                                // flex: <number> → <number> 1 0
+                                props.flex_grow = Some(grow);
+                                props.flex_shrink = Some(1.0);
+                                props.flex_basis = Some(Dimension::Length(0.0));
+                            }
+                        }
+                        2 => {
+                            if let Ok(grow) = parts[0].parse::<f32>() {
+                                if let Ok(shrink) = parts[1].parse::<f32>() {
+                                    // flex: <grow> <shrink>
+                                    props.flex_grow = Some(grow);
+                                    props.flex_shrink = Some(shrink);
+                                    props.flex_basis = Some(Dimension::Length(0.0));
+                                } else if let Some(basis) = parse_dimension(parts[1]) {
+                                    // flex: <grow> <basis>
+                                    props.flex_grow = Some(grow);
+                                    props.flex_shrink = Some(1.0);
+                                    props.flex_basis = Some(basis);
+                                }
+                            }
+                        }
+                        3 => {
+                            if let (Ok(grow), Ok(shrink)) =
+                                (parts[0].parse::<f32>(), parts[1].parse::<f32>())
+                            {
+                                props.flex_grow = Some(grow);
+                                props.flex_shrink = Some(shrink);
+                                props.flex_basis = parse_dimension(parts[2]).or(Some(Dimension::Auto));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 _ => {}
             }
         }
@@ -2929,8 +2988,10 @@ fn build_taffy_style(
             ..Style::DEFAULT
         },
 
-        "grid" => {
+        "grid" | "inline-grid" => {
             // Map CSS grid properties to Taffy Grid style.
+            // inline-grid containers shrink-wrap instead of filling 100% width.
+            let is_inline_grid = display == "inline-grid";
             let columns = lp.grid_template_columns.clone().unwrap_or_default();
             let rows = lp.grid_template_rows.clone().unwrap_or_default();
             let (row_gap, col_gap) = lp.gap.unwrap_or((0.0, 0.0));
@@ -2946,15 +3007,22 @@ fn build_taffy_style(
             // Flex item properties when this grid container is itself a flex/grid child.
             let grid_flex_grow = item_flex_grow.unwrap_or(0.0);
             let grid_flex_shrink = item_flex_shrink.unwrap_or(1.0);
+            let default_grid_width = if is_inline_grid {
+                Dimension::Auto
+            } else {
+                Dimension::Percent(1.0)
+            };
             let grid_width = if let Some(basis) = item_flex_basis {
                 basis
             } else {
-                lp.width.unwrap_or(Dimension::Percent(1.0))
+                lp.width.unwrap_or(default_grid_width)
             };
             let grid_align_self = if item_align_self.is_some() {
                 item_align_self
             } else if center_via_auto_margin {
                 Some(AlignSelf::Center)
+            } else if is_inline_grid {
+                Some(AlignSelf::FlexStart)
             } else {
                 None
             };
@@ -3003,8 +3071,11 @@ fn build_taffy_style(
             }
         }
 
-        "flex" => {
+        "flex" | "inline-flex" => {
             let direction = resolve_flex_direction(attributes);
+            // inline-flex containers shrink-wrap (Auto width) instead of
+            // filling 100% of the parent.
+            let is_inline_flex = display == "inline-flex";
             let flex_wrap = match lp.flex_wrap.as_deref() {
                 Some("wrap") => FlexWrap::Wrap,
                 Some("wrap-reverse") => FlexWrap::WrapReverse,
@@ -3031,15 +3102,24 @@ fn build_taffy_style(
             // Flex item properties when this flex container is itself a flex/grid child.
             let flex_item_grow = item_flex_grow.unwrap_or(0.0);
             let flex_item_shrink = item_flex_shrink.unwrap_or(1.0);
+            let default_flex_width = if is_inline_flex {
+                Dimension::Auto
+            } else {
+                Dimension::Percent(1.0)
+            };
             let flex_item_width = if let Some(basis) = item_flex_basis {
                 basis
             } else {
-                lp.width.unwrap_or(Dimension::Percent(1.0))
+                lp.width.unwrap_or(default_flex_width)
             };
             let flex_item_align_self = if item_align_self.is_some() {
                 item_align_self
             } else if center_via_auto_margin {
                 Some(AlignSelf::Center)
+            } else if is_inline_flex {
+                // Prevent the parent's align-items: stretch from expanding
+                // this inline-level container to fill the cross axis.
+                Some(AlignSelf::FlexStart)
             } else {
                 None
             };
@@ -4132,6 +4212,296 @@ mod phase4_tests {
             div.x > 0.0,
             "float:right div should be pushed right, x={}",
             div.x
+        );
+    }
+
+    // ── Flex percentage children (Wikipedia 2-column layout) ──────────
+
+    #[test]
+    fn flex_children_percentage_widths() {
+        // A flex row container with two children at 70% and 30% should
+        // produce a side-by-side 2-column layout.
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "div".into(),
+                attributes: vec![(
+                    "data-nova-style".into(),
+                    "display: flex; flex-direction: row".into(),
+                )],
+                children: vec![
+                    DomNode::Element {
+                        tag: "div".into(),
+                        attributes: vec![(
+                            "data-nova-style".into(),
+                            "width: 70%".into(),
+                        )],
+                        children: vec![DomNode::Text("Main content".into())],
+                    },
+                    DomNode::Element {
+                        tag: "div".into(),
+                        attributes: vec![(
+                            "data-nova-style".into(),
+                            "width: 30%".into(),
+                        )],
+                        children: vec![DomNode::Text("Sidebar".into())],
+                    },
+                ],
+            }],
+        };
+        let root = compute_layout(&dom, &viewport()).expect("layout ok");
+        let flex = &root.children[0];
+        assert_eq!(flex.children.len(), 2, "flex should have 2 children");
+        let main = &flex.children[0];
+        let sidebar = &flex.children[1];
+        // Main should be ~70% of 800 = 560.
+        assert!(
+            (main.width - 560.0).abs() < 1.0,
+            "main should be ~560px (70%), got {}",
+            main.width
+        );
+        // Sidebar should be ~30% of 800 = 240.
+        assert!(
+            (sidebar.width - 240.0).abs() < 1.0,
+            "sidebar should be ~240px (30%), got {}",
+            sidebar.width
+        );
+        // Sidebar should be to the right of main.
+        assert!(
+            sidebar.x > main.x,
+            "sidebar should be to the right of main: sidebar.x={}, main.x={}",
+            sidebar.x,
+            main.x
+        );
+    }
+
+    #[test]
+    fn flex_shorthand_single_number() {
+        // `flex: 1` → flex-grow: 1, flex-shrink: 1, flex-basis: 0.
+        let attrs = vec![(
+            "data-nova-style".into(),
+            "flex: 1".into(),
+        )];
+        let lp = parse_layout_props(&attrs);
+        assert!(
+            matches!(lp.flex_grow, Some(v) if (v - 1.0).abs() < 0.01),
+            "flex-grow should be 1, got {:?}",
+            lp.flex_grow
+        );
+        assert!(
+            matches!(lp.flex_shrink, Some(v) if (v - 1.0).abs() < 0.01),
+            "flex-shrink should be 1, got {:?}",
+            lp.flex_shrink
+        );
+        assert!(
+            matches!(lp.flex_basis, Some(Dimension::Length(v)) if v.abs() < 0.01),
+            "flex-basis should be 0, got {:?}",
+            lp.flex_basis
+        );
+    }
+
+    #[test]
+    fn flex_shorthand_none() {
+        // `flex: none` → flex-grow: 0, flex-shrink: 0, flex-basis: auto.
+        let attrs = vec![(
+            "data-nova-style".into(),
+            "flex: none".into(),
+        )];
+        let lp = parse_layout_props(&attrs);
+        assert!(
+            matches!(lp.flex_grow, Some(v) if v.abs() < 0.01),
+            "flex-grow should be 0, got {:?}",
+            lp.flex_grow
+        );
+        assert!(
+            matches!(lp.flex_shrink, Some(v) if v.abs() < 0.01),
+            "flex-shrink should be 0, got {:?}",
+            lp.flex_shrink
+        );
+        assert!(
+            matches!(lp.flex_basis, Some(Dimension::Auto)),
+            "flex-basis should be auto, got {:?}",
+            lp.flex_basis
+        );
+    }
+
+    #[test]
+    fn flex_shorthand_three_values() {
+        // `flex: 0 0 75%` → flex-grow: 0, flex-shrink: 0, flex-basis: 75%.
+        let attrs = vec![(
+            "data-nova-style".into(),
+            "flex: 0 0 75%".into(),
+        )];
+        let lp = parse_layout_props(&attrs);
+        assert!(
+            matches!(lp.flex_grow, Some(v) if v.abs() < 0.01),
+            "flex-grow should be 0, got {:?}",
+            lp.flex_grow
+        );
+        assert!(
+            matches!(lp.flex_shrink, Some(v) if v.abs() < 0.01),
+            "flex-shrink should be 0, got {:?}",
+            lp.flex_shrink
+        );
+        assert!(
+            matches!(lp.flex_basis, Some(Dimension::Percent(p)) if (p - 0.75).abs() < 0.01),
+            "flex-basis should be 75%, got {:?}",
+            lp.flex_basis
+        );
+    }
+
+    #[test]
+    fn inline_flex_does_not_fill_width() {
+        // An inline-flex container should shrink-wrap, not fill 100%.
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "div".into(),
+                attributes: vec![(
+                    "data-nova-style".into(),
+                    "display: inline-flex".into(),
+                )],
+                children: vec![DomNode::Text("Short".into())],
+            }],
+        };
+        let root = compute_layout(&dom, &viewport()).expect("layout ok");
+        let div = &root.children[0];
+        // inline-flex should NOT be the full 800px viewport width.
+        assert!(
+            div.width < 790.0,
+            "inline-flex should shrink-wrap, not fill 800px, got {}",
+            div.width
+        );
+    }
+
+    #[test]
+    fn mixed_inline_generates_segments() {
+        // A <p> with "Hello " text + <a> "world" should generate segments
+        // because the link has a different color than the surrounding text.
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "body".into(),
+                attributes: vec![
+                    ("data-nova-style".into(), "display: block; color: #000000".into()),
+                ],
+                children: vec![DomNode::Element {
+                    tag: "p".into(),
+                    attributes: vec![
+                        ("data-nova-style".into(), "display: block; color: #000000".into()),
+                    ],
+                    children: vec![
+                        DomNode::Text("Hello ".into()),
+                        DomNode::Element {
+                            tag: "a".into(),
+                            attributes: vec![
+                                ("href".into(), "https://example.com".into()),
+                                ("data-nova-style".into(), "display: inline; color: #0000ee; text-decoration: underline".into()),
+                            ],
+                            children: vec![DomNode::Text("world".into())],
+                        },
+                    ],
+                }],
+            }],
+        };
+        let root = compute_layout(&dom, &viewport()).expect("layout ok");
+
+        // Walk the layout tree to find a text node that contains "Hello world"
+        // and has nova-text-segments.
+        fn find_segments(node: &LayoutBox) -> Option<String> {
+            if let LayoutContent::Text(ref t) = node.content {
+                if t.contains("Hello") && t.contains("world") {
+                    let seg = node.style.properties.iter()
+                        .find(|(k, _)| k == "nova-text-segments")
+                        .map(|(_, v)| match v {
+                            StyleValue::Str(s) => s.clone(),
+                            _ => String::new(),
+                        });
+                    return seg;
+                }
+            }
+            for child in &node.children {
+                if let Some(s) = find_segments(child) {
+                    return Some(s);
+                }
+            }
+            None
+        }
+
+        let seg = find_segments(&root);
+        assert!(
+            seg.is_some(),
+            "should find nova-text-segments on the merged 'Hello world' text node"
+        );
+        let seg_str = seg.unwrap();
+        // The segment data should contain a blue color (#0000ee) for "world".
+        assert!(
+            seg_str.contains("0000ee"),
+            "segments should include the link's blue color, got: {seg_str}"
+        );
+    }
+
+    #[test]
+    fn table_cell_link_has_color() {
+        // In a table cell (non-IFC path), a link's text should preserve the blue color.
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "body".into(),
+                attributes: vec![
+                    ("data-nova-style".into(), "display: block; color: #000000".into()),
+                ],
+                children: vec![DomNode::Element {
+                    tag: "table".into(),
+                    attributes: vec![("data-nova-style".into(), "display: block".into())],
+                    children: vec![DomNode::Element {
+                        tag: "tr".into(),
+                        attributes: vec![("data-nova-style".into(), "display: table-row".into())],
+                        children: vec![DomNode::Element {
+                            tag: "td".into(),
+                            attributes: vec![("data-nova-style".into(), "display: table-cell; color: #000000".into())],
+                            children: vec![DomNode::Element {
+                                tag: "a".into(),
+                                attributes: vec![
+                                    ("href".into(), "https://example.com".into()),
+                                    ("data-nova-style".into(), "display: inline; color: #0000ee; text-decoration: underline".into()),
+                                ],
+                                children: vec![DomNode::Text("Link Text".into())],
+                            }],
+                        }],
+                    }],
+                }],
+            }],
+        };
+        let root = compute_layout(&dom, &viewport()).expect("layout ok");
+
+        // Find the text node containing "Link Text" and check its color.
+        fn find_link_color(node: &LayoutBox) -> Option<String> {
+            if let LayoutContent::Text(ref t) = node.content {
+                if t.contains("Link") {
+                    let color = node.style.properties.iter()
+                        .find(|(k, _)| k == "color")
+                        .map(|(_, v)| match v {
+                            StyleValue::Str(s) | StyleValue::Keyword(s) => s.clone(),
+                            StyleValue::Color(c) => format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b),
+                            _ => String::new(),
+                        });
+                    return color;
+                }
+            }
+            for child in &node.children {
+                if let Some(c) = find_link_color(child) {
+                    return Some(c);
+                }
+            }
+            None
+        }
+
+        let color = find_link_color(&root);
+        assert!(
+            color.is_some(),
+            "should find color on the 'Link Text' text node"
+        );
+        let color_str = color.unwrap();
+        assert!(
+            color_str.contains("0000ee") || color_str.contains("0000EE"),
+            "link text should have blue color, got: {color_str}"
         );
     }
 }

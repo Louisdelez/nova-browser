@@ -8,6 +8,7 @@
 
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use tracing::{debug, info, warn};
@@ -19,6 +20,14 @@ use nova_mod_api::{
 };
 use mod_css_engine::FontFaceUrl;
 use nova_registry::CapabilityRegistry;
+
+/// Maximum number of images to fetch during a navigation.
+/// Pages with more images will have the rest skipped for faster initial display.
+const MAX_IMAGES_TO_FETCH: usize = 20;
+
+/// Timeout for fetching + decoding a single image.
+/// If an image takes longer than this, it is skipped.
+const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Sub-resources extracted from a parsed DOM tree.
 #[derive(Debug, Default)]
@@ -136,12 +145,32 @@ impl PipelineEngine {
             }
         }
 
-        // Step 7: Fetch and decode images (in parallel)
+        // Filter out favicon / tiny icon images (they don't contribute to page display).
+        let total_before_filter = all_images.len();
+        all_images.retain(|(src, _resolved)| !is_favicon_or_icon(src));
+        if all_images.len() < total_before_filter {
+            info!(
+                "Pipeline: skipped {} favicon/icon image(s)",
+                total_before_filter - all_images.len()
+            );
+        }
+
+        // Limit the number of images to avoid blocking on image-heavy pages.
+        if all_images.len() > MAX_IMAGES_TO_FETCH {
+            info!(
+                "Pipeline: capping images from {} to {} for faster display",
+                all_images.len(),
+                MAX_IMAGES_TO_FETCH
+            );
+            all_images.truncate(MAX_IMAGES_TO_FETCH);
+        }
+
+        // Step 7: Fetch and decode images (in parallel, with per-image timeout)
         let images = self.fetch_and_decode_images_parallel(&all_images).await;
         info!(
             "Pipeline: decoded {}/{} images",
             images.len(),
-            sub_resources.images.len()
+            all_images.len()
         );
 
         // Step 8: Paint (with decoded images)
@@ -512,17 +541,29 @@ impl PipelineEngine {
         results.into_iter().flatten().collect()
     }
 
-    /// Fetch and decode a single image, returning None on failure.
+    /// Fetch and decode a single image, returning None on failure or timeout.
     /// Returns `(original_src, decoded_bytes)`.
+    /// Each image fetch is capped at [`IMAGE_FETCH_TIMEOUT`] to prevent slow
+    /// images from blocking the entire page render.
     async fn fetch_and_decode_image_safe(
         &self,
         original_src: &str,
         resolved_url: &str,
     ) -> Option<(String, Vec<u8>)> {
-        match self.fetch_and_decode_image(resolved_url).await {
-            Ok(decoded) => Some((original_src.to_string(), decoded)),
-            Err(e) => {
+        match tokio::time::timeout(
+            IMAGE_FETCH_TIMEOUT,
+            self.fetch_and_decode_image(resolved_url),
+        )
+        .await
+        {
+            Ok(Ok(decoded)) => Some((original_src.to_string(), decoded)),
+            Ok(Err(e)) => {
                 warn!(url = %resolved_url, error = %e, "failed to fetch/decode image, skipping");
+                None
+            }
+            Err(_) => {
+                warn!(url = %resolved_url, timeout_secs = IMAGE_FETCH_TIMEOUT.as_secs(),
+                    "image fetch timed out, skipping");
                 None
             }
         }
@@ -890,6 +931,35 @@ fn extract_css_url_from_value(value: &str) -> Option<String> {
     if url_str.is_empty() { None } else { Some(url_str.to_string()) }
 }
 
+/// Check if an image source looks like a favicon or small icon that does not
+/// contribute to visible page content.
+///
+/// Matches paths like `/favicon.ico`, `/favicon-32x32.png`,
+/// `apple-touch-icon.png`, etc.
+fn is_favicon_or_icon(src: &str) -> bool {
+    // Normalise to just the path/filename for matching.
+    let path = src.split('?').next().unwrap_or(src);
+    let filename = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+
+    // Exact or prefix matches.
+    if filename == "favicon.ico" || filename.starts_with("favicon") {
+        return true;
+    }
+    if filename.contains("apple-touch-icon") {
+        return true;
+    }
+    // Common patterns: mstile-*, browserconfig-*, site.webmanifest icons
+    if filename.starts_with("mstile-") || filename.starts_with("browserconfig") {
+        return true;
+    }
+    // Data URIs for tiny 1x1 tracking pixels.
+    if src.starts_with("data:image/gif;base64,R0lGOD") && src.len() < 120 {
+        return true;
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1089,5 +1159,26 @@ mod tests {
         // srcset takes precedence over src.
         assert_eq!(res.images.len(), 1);
         assert_eq!(res.images[0].0, "better.webp");
+    }
+
+    #[test]
+    fn favicon_detection() {
+        assert!(is_favicon_or_icon("/favicon.ico"));
+        assert!(is_favicon_or_icon("https://example.com/favicon.ico"));
+        assert!(is_favicon_or_icon("/favicon-32x32.png"));
+        assert!(is_favicon_or_icon("/apple-touch-icon.png"));
+        assert!(is_favicon_or_icon("/icons/apple-touch-icon-180x180.png"));
+        assert!(is_favicon_or_icon("mstile-150x150.png"));
+        // Normal images should not be detected as favicons.
+        assert!(!is_favicon_or_icon("/images/logo.png"));
+        assert!(!is_favicon_or_icon("https://cdn.example.com/photo.jpg"));
+        assert!(!is_favicon_or_icon("/hero-banner.webp"));
+    }
+
+    #[test]
+    fn image_cap_constant() {
+        // Sanity check: the cap should be a reasonable number.
+        assert!(MAX_IMAGES_TO_FETCH > 0);
+        assert!(MAX_IMAGES_TO_FETCH <= 50);
     }
 }

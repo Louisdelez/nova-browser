@@ -232,6 +232,55 @@ fn add_node(
             children,
             attributes,
         } => {
+            // Special case: <br> forces a line break (full-width zero-height block).
+            if tag == "br" {
+                let ctx = NodeContext {
+                    content: LayoutContent::Block,
+                    style: StyleMap::default(),
+                };
+                let style = Style {
+                    display: Display::Flex,
+                    size: Size {
+                        width: Dimension::Percent(1.0),
+                        height: Dimension::Length(0.0),
+                    },
+                    ..Style::DEFAULT
+                };
+                return taffy
+                    .new_leaf_with_context(style, ctx)
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+            }
+
+            // Special case: <hr> draws a horizontal rule.
+            if tag == "hr" {
+                let ctx = NodeContext {
+                    content: LayoutContent::Block,
+                    style: StyleMap {
+                        properties: vec![
+                            ("display".into(), StyleValue::Keyword("block".into())),
+                            ("border-bottom".into(), StyleValue::Str("1px solid #ccc".into())),
+                        ],
+                    },
+                };
+                let style = Style {
+                    display: Display::Flex,
+                    size: Size {
+                        width: Dimension::Percent(1.0),
+                        height: Dimension::Length(1.0),
+                    },
+                    margin: Rect {
+                        top: LengthPercentageAuto::Length(8.0),
+                        right: LengthPercentageAuto::Length(0.0),
+                        bottom: LengthPercentageAuto::Length(8.0),
+                        left: LengthPercentageAuto::Length(0.0),
+                    },
+                    ..Style::DEFAULT
+                };
+                return taffy
+                    .new_leaf_with_context(style, ctx)
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+            }
+
             // Special case: table elements get flex-based table layout.
             if is_table_element(tag) {
                 return add_table_node(taffy, tag, children, attributes, available_width, parent_font_size, parent_style_props);
@@ -352,10 +401,16 @@ fn add_node(
                 }
             }
 
-            let child_ids = children
-                .iter()
-                .map(|c| add_node(taffy, c, available_width, font_size, &props))
-                .collect::<Result<Vec<_>, _>>()?;
+            // Build children with inline flow: consecutive inline elements
+            // are wrapped in synthetic flex-row containers ("line boxes").
+            let child_ids = if display != "inline" {
+                build_children_with_inline_flow(taffy, children, available_width, font_size, &props)?
+            } else {
+                children
+                    .iter()
+                    .map(|c| add_node(taffy, c, available_width, font_size, &props))
+                    .collect::<Result<Vec<_>, _>>()?
+            };
             let taffy_style = build_taffy_style(&display, tag, attributes);
 
             let content_type = match display.as_str() {
@@ -749,11 +804,17 @@ fn build_taffy_style(
     };
 
     // Build padding rect, defaulting unset sides to zero.
+    // Lists get default left padding for indentation.
+    let default_left_pad = if tag == "ul" || tag == "ol" {
+        LengthPercentage::Length(24.0)
+    } else {
+        LengthPercentage::Length(0.0)
+    };
     let padding = Rect {
         top: lp.padding_top.unwrap_or(LengthPercentage::Length(0.0)),
         right: lp.padding_right.unwrap_or(LengthPercentage::Length(0.0)),
         bottom: lp.padding_bottom.unwrap_or(LengthPercentage::Length(0.0)),
-        left: lp.padding_left.unwrap_or(LengthPercentage::Length(0.0)),
+        left: lp.padding_left.unwrap_or(default_left_pad),
     };
 
     // When both horizontal margins are `auto`, centre the element via
@@ -890,6 +951,105 @@ fn estimate_text_size(text: &str, font_size: f32, available_width: f32) -> (f32,
     let line_height = font_size * LINE_HEIGHT_FACTOR;
 
     (effective_width, line_count * line_height)
+}
+
+// ── Inline flow: wrapping consecutive inline children ───────────────────
+
+/// Determines if a DOM node is inline-level for flow purposes.
+fn is_inline_node(node: &DomNode) -> bool {
+    match node {
+        DomNode::Text(_) => true,
+        DomNode::Element { tag, attributes, .. } => {
+            let display = resolve_display(tag, attributes);
+            display == "inline"
+        }
+        _ => false,
+    }
+}
+
+/// Build child nodes with inline flow: consecutive inline children are
+/// wrapped in synthetic flex-row containers ("line boxes") so they flow
+/// horizontally. Block-level children break the inline flow.
+fn build_children_with_inline_flow(
+    taffy: &mut TaffyTree<NodeContext>,
+    children: &[DomNode],
+    available_width: f32,
+    font_size: f32,
+    parent_props: &[(String, StyleValue)],
+) -> Result<Vec<NodeId>, NovaError> {
+    let mut result = Vec::new();
+    let mut inline_run: Vec<&DomNode> = Vec::new();
+
+    for child in children {
+        if is_inline_node(child) {
+            inline_run.push(child);
+        } else {
+            // Flush any pending inline run before the block element.
+            if !inline_run.is_empty() {
+                let line_id = wrap_inline_run(taffy, &inline_run, available_width, font_size, parent_props)?;
+                result.push(line_id);
+                inline_run.clear();
+            }
+            // Add the block element directly.
+            let id = add_node(taffy, child, available_width, font_size, parent_props)?;
+            result.push(id);
+        }
+    }
+
+    // Flush remaining inline run.
+    if !inline_run.is_empty() {
+        // If the entire content is inline, just add them directly without
+        // a wrapper (the parent's flex-direction handles it).
+        if result.is_empty() && inline_run.len() == children.len() {
+            for child in &inline_run {
+                let id = add_node(taffy, child, available_width, font_size, parent_props)?;
+                result.push(id);
+            }
+        } else {
+            let line_id = wrap_inline_run(taffy, &inline_run, available_width, font_size, parent_props)?;
+            result.push(line_id);
+        }
+    }
+
+    Ok(result)
+}
+
+/// Wrap a run of inline nodes in a flex-row container.
+fn wrap_inline_run(
+    taffy: &mut TaffyTree<NodeContext>,
+    nodes: &[&DomNode],
+    available_width: f32,
+    font_size: f32,
+    parent_props: &[(String, StyleValue)],
+) -> Result<NodeId, NovaError> {
+    let child_ids: Vec<NodeId> = nodes
+        .iter()
+        .map(|n| add_node(taffy, n, available_width, font_size, parent_props))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let style = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Row,
+        flex_wrap: FlexWrap::Wrap,
+        size: Size {
+            width: Dimension::Percent(1.0),
+            height: Dimension::Auto,
+        },
+        ..Style::DEFAULT
+    };
+
+    let ctx = NodeContext {
+        content: LayoutContent::Inline,
+        style: StyleMap::default(),
+    };
+
+    taffy
+        .new_with_children(style, &child_ids)
+        .map(|id| {
+            taffy.set_node_context(id, Some(ctx)).ok();
+            id
+        })
+        .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))
 }
 
 // ── Table layout (flex-based simulation) ────────────────────────────────
@@ -1280,9 +1440,13 @@ fn display_for_tag(tag: &str) -> &'static str {
         // Table elements are handled by add_table_node, but keep them as block
         // for the display_for_tag fallback.
         "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption" => "block",
-        "span" | "a" | "em" | "strong" | "b" | "i" | "u" | "code" | "small" | "br" | "img"
-        | "input" | "label" => "inline",
-        "head" | "title" | "meta" | "link" | "style" | "script" => "none",
+        "span" | "a" | "em" | "strong" | "b" | "i" | "u" | "code" | "small" | "img"
+        | "input" | "label" | "abbr" | "cite" | "sub" | "sup" | "time" | "var"
+        | "kbd" | "samp" | "mark" | "q" | "dfn" | "bdo" | "bdi" | "data"
+        | "ruby" | "rt" | "rp" | "wbr" => "inline",
+        "br" => "block", // <br> handled as special case in add_node
+        "head" | "title" | "meta" | "link" | "style" | "script" | "noscript"
+        | "template" | "datalist" => "none",
         _ => "block",
     }
 }

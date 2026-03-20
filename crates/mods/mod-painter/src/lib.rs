@@ -125,6 +125,32 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         });
     }
 
+    // Paint borders if present.
+    let border = extract_border(&layout_box.style);
+    if let Some((width_px, border_color)) = border {
+        ops.push(RenderOp::StrokeRect {
+            x: layout_box.x,
+            y: layout_box.y,
+            width: layout_box.width,
+            height: layout_box.height,
+            color: border_color,
+            width_px,
+        });
+    }
+
+    // Paint <hr> as a line.
+    if extract_style_keyword(&layout_box.style, "border-bottom").is_some()
+        && layout_box.height <= 2.0
+    {
+        ops.push(RenderOp::FillRect {
+            x: layout_box.x,
+            y: layout_box.y,
+            width: layout_box.width,
+            height: 1.0,
+            color: Color::rgb(0.8, 0.8, 0.8),
+        });
+    }
+
     // Paint text content.
     if let LayoutContent::Text(ref text) = layout_box.content {
         if !text.trim().is_empty() {
@@ -329,6 +355,63 @@ fn parse_named_color(s: &str) -> Option<Color> {
         "transparent" => Some(Color::TRANSPARENT),
         _ => None,
     }
+}
+
+/// Extract border properties from a style map.
+/// Returns `Some((width_px, color))` if border is set.
+fn extract_border(style: &nova_mod_api::content::StyleMap) -> Option<(f32, Color)> {
+    let mut width = None;
+    let mut color = None;
+
+    for (key, value) in &style.properties {
+        match key.as_str() {
+            "border-width" => {
+                if let StyleValue::Px(px) = value {
+                    width = Some(*px);
+                } else if let StyleValue::Str(s) | StyleValue::Keyword(s) = value {
+                    if let Some(px) = s.strip_suffix("px").and_then(|n| n.parse::<f32>().ok()) {
+                        width = Some(px);
+                    }
+                }
+            }
+            "border-color" => {
+                color = style_value_to_color(value);
+            }
+            "border" => {
+                // Shorthand: parse "1px solid #color"
+                if let StyleValue::Str(s) | StyleValue::Keyword(s) = value {
+                    let parts: Vec<&str> = s.split_whitespace().collect();
+                    for part in &parts {
+                        if let Some(px) = part.strip_suffix("px").and_then(|n| n.parse::<f32>().ok()) {
+                            width = Some(px);
+                        } else if let Some(c) = parse_color_string(part) {
+                            color = Some(c);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(w) = width {
+        Some((w, color.unwrap_or(Color::rgb(0.8, 0.8, 0.8))))
+    } else {
+        None
+    }
+}
+
+/// Extract a keyword-valued style property.
+fn extract_style_keyword(style: &nova_mod_api::content::StyleMap, prop: &str) -> Option<String> {
+    for (key, value) in &style.properties {
+        if key == prop {
+            match value {
+                StyleValue::Str(s) | StyleValue::Keyword(s) => return Some(s.clone()),
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 /// Check if the style map contains `text-decoration: underline`.

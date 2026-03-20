@@ -329,7 +329,7 @@ impl HttpResponse {
 // ── JavaScript types ──
 
 /// A JavaScript value returned from execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum JsValue {
     Undefined,
     Null,

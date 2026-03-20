@@ -86,10 +86,7 @@ impl FontRenderer {
     /// variants if available. Returns `None` if the regular font is not found.
     fn new() -> Option<Self> {
         let regular_bytes = Self::find_font_bytes("DejaVuSans.ttf")?;
-        let settings = fontdue::FontSettings {
-            scale: 40.0, // hint at a common size for better hinting
-            ..fontdue::FontSettings::default()
-        };
+        let settings = fontdue::FontSettings::default();
         let regular = fontdue::Font::from_bytes(regular_bytes, settings).ok()?;
 
         let bold = Self::find_font_bytes("DejaVuSans-Bold.ttf")
@@ -105,17 +102,6 @@ impl FontRenderer {
             bold_italic = bold_italic.is_some(),
             "Font renderer initialized with variants"
         );
-
-        // Debug: verify proportional metrics — 'i' should be much narrower than 'm'.
-        {
-            let (mi, _) = regular.rasterize('i', 16.0);
-            let (mm, _) = regular.rasterize('m', 16.0);
-            tracing::info!(
-                i_advance = mi.advance_width,
-                m_advance = mm.advance_width,
-                "Font metrics at 16px: 'i' vs 'm' advance widths (proportional check)"
-            );
-        }
 
         Some(Self {
             regular,
@@ -224,21 +210,6 @@ impl FontRenderer {
         None
     }
 
-    /// Look up the horizontal kerning adjustment between two characters.
-    ///
-    /// Returns the kern value in pixels (usually negative to tighten spacing)
-    /// for the given font size. Uses the custom font if `custom_family` matches
-    /// a loaded `@font-face` font, otherwise uses the appropriate built-in
-    /// variant (currently always the regular font's kern table).
-    fn kern(&self, left: char, right: char, font_size: f32, custom_family: &Option<String>) -> Option<f32> {
-        if let Some(key) = custom_family {
-            if let Some(font) = self.custom_fonts.get(key) {
-                return font.horizontal_kern(left, right, font_size);
-            }
-        }
-        self.regular.horizontal_kern(left, right, font_size)
-    }
-
     /// Rasterize a glyph (or return it from cache) for a specific variant.
     fn rasterize(&mut self, ch: char, font_size: f32, variant: FontVariant) -> &CachedGlyph {
         let key = (variant, ch, (font_size * 10.0).round() as u32);
@@ -264,16 +235,34 @@ impl FontRenderer {
 // Framebuffer
 // ---------------------------------------------------------------------------
 
+/// A saved scroll state for fixed-position elements.
+#[derive(Debug, Clone, Copy)]
+struct SavedScrollState {
+    scroll_x: f32,
+    scroll_y: f32,
+}
+
+/// An entry on the transform stack, storing a 2x3 affine matrix.
+#[derive(Debug, Clone, Copy)]
+struct TransformEntry {
+    /// Affine matrix `[a, b, c, d, tx, ty]`.
+    matrix: [f32; 6],
+}
+
+impl TransformEntry {
+    /// Apply this transform to a point `(x, y)`, returning the transformed point.
+    fn apply(&self, x: f32, y: f32) -> (f32, f32) {
+        let [a, b, c, d, tx, ty] = self.matrix;
+        (a * x + c * y + tx, b * x + d * y + ty)
+    }
+}
+
 /// A simple software framebuffer.
 pub struct Framebuffer {
     pub width: u32,
     pub height: u32,
     /// RGBA pixel data, row-major, 4 bytes per pixel.
     pub pixels: Vec<u8>,
-    /// Whether the pixel data has changed since the last GPU upload.
-    /// Set to `true` when any rendering modifies the pixels;
-    /// set to `false` after the data has been uploaded to the GPU texture.
-    pub dirty: bool,
     /// Optional fontdue-based renderer (None when no font file is available).
     font_renderer: Option<FontRenderer>,
     /// Stack of clip rectangles. Rendering is restricted to the intersection of
@@ -281,6 +270,10 @@ pub struct Framebuffer {
     clip_stack: Vec<ClipRect>,
     /// Extra y-offset applied by sticky positioning (reset each frame).
     translate_y_offset: f32,
+    /// Stack of saved scroll states for fixed-position elements.
+    fixed_position_stack: Vec<SavedScrollState>,
+    /// Stack of active affine transforms.
+    transform_stack: Vec<TransformEntry>,
 }
 
 impl Framebuffer {
@@ -288,18 +281,15 @@ impl Framebuffer {
         let size = (width * height * 4) as usize;
         let pixels = vec![255u8; size]; // White background
         let font_renderer = FontRenderer::new();
-        match &font_renderer {
-            Some(_) => tracing::info!("TTF font renderer loaded successfully"),
-            None => tracing::warn!("TTF font NOT found — using bitmap fallback"),
-        }
         Self {
             width,
             height,
             pixels,
-            dirty: true,
             font_renderer,
             clip_stack: Vec::new(),
             translate_y_offset: 0.0,
+            fixed_position_stack: Vec::new(),
+            transform_stack: Vec::new(),
         }
     }
 
@@ -311,7 +301,6 @@ impl Framebuffer {
         let size = (width * height * 4) as usize;
         self.pixels.resize(size, 255);
         self.pixels.fill(255);
-        self.dirty = true;
     }
 
     /// Load custom `@font-face` fonts into the font renderer.
@@ -336,16 +325,9 @@ impl Framebuffer {
     pub fn measure_text_width(&mut self, text: &str, font_size: f32) -> f32 {
         if let Some(ref mut renderer) = self.font_renderer {
             let mut width: f32 = 0.0;
-            let chars: Vec<char> = text.chars().collect();
-            for i in 0..chars.len() {
-                let glyph = renderer.rasterize(chars[i], font_size, FontVariant::Regular);
+            for ch in text.chars() {
+                let glyph = renderer.rasterize(ch, font_size, FontVariant::Regular);
                 width += glyph.metrics.advance_width as f32;
-                // Apply kerning with the next character.
-                if i + 1 < chars.len() {
-                    if let Some(kern) = renderer.regular.horizontal_kern(chars[i], chars[i + 1], font_size) {
-                        width += kern;
-                    }
-                }
             }
             width
         } else {
@@ -353,6 +335,25 @@ impl Framebuffer {
             let scale = font_size / 16.0;
             text.len() as f32 * 8.0 * scale
         }
+    }
+
+    /// Apply the current transform stack to a point `(x, y)`.
+    ///
+    /// When no transforms are active, returns the point unchanged.
+    /// Otherwise, applies all stacked transforms in order (bottom to top).
+    #[inline]
+    fn apply_transform(&self, x: f32, y: f32) -> (f32, f32) {
+        if self.transform_stack.is_empty() {
+            return (x, y);
+        }
+        let mut rx = x;
+        let mut ry = y;
+        for entry in &self.transform_stack {
+            let (nx, ny) = entry.apply(rx, ry);
+            rx = nx;
+            ry = ny;
+        }
+        (rx, ry)
     }
 
     /// Compute the effective clip bounds from the clip stack.
@@ -425,113 +426,36 @@ impl Framebuffer {
     ///
     /// `coverage` is 0–255 (0 = fully transparent, 255 = fully opaque).
     /// The glyph colour is `color`, blended against the existing pixel.
-    ///
-    /// Uses gamma-correct compositing: the background is converted from sRGB
-    /// to linear space, the blend is performed in linear, and the result is
-    /// converted back to sRGB. This eliminates the dark fringing artefact that
-    /// naive alpha blending produces on light backgrounds.
     #[inline]
     fn blend_glyph_pixel(&mut self, x: i32, y: i32, coverage: u8, color: Color) {
-        if coverage == 0 || x < 0 || y < 0 {
+        if coverage == 0 {
             return;
         }
-        let ux = x as u32;
-        let uy = y as u32;
-        if ux >= self.width || uy >= self.height {
-            return;
-        }
-
-        let idx = ((uy * self.width + ux) * 4) as usize;
-        if idx + 3 >= self.pixels.len() {
-            return;
-        }
-
         let alpha = (coverage as f32 / 255.0) * color.a;
-        if alpha <= 0.0 {
-            return;
-        }
-
-        // Read existing pixel (sRGB).
-        let bg_r = self.pixels[idx] as f32 / 255.0;
-        let bg_g = self.pixels[idx + 1] as f32 / 255.0;
-        let bg_b = self.pixels[idx + 2] as f32 / 255.0;
-
-        // Gamma-correct blending (approximate sRGB gamma = 2.2).
-        #[inline]
-        fn to_linear(v: f32) -> f32 {
-            v * v
-        } // simplified gamma
-        #[inline]
-        fn to_srgb(v: f32) -> f32 {
-            v.sqrt()
-        } // simplified inverse
-
-        let r = to_srgb(to_linear(color.r) * alpha + to_linear(bg_r) * (1.0 - alpha));
-        let g = to_srgb(to_linear(color.g) * alpha + to_linear(bg_g) * (1.0 - alpha));
-        let b = to_srgb(to_linear(color.b) * alpha + to_linear(bg_b) * (1.0 - alpha));
-
-        self.pixels[idx] = (r * 255.0).round().clamp(0.0, 255.0) as u8;
-        self.pixels[idx + 1] = (g * 255.0).round().clamp(0.0, 255.0) as u8;
-        self.pixels[idx + 2] = (b * 255.0).round().clamp(0.0, 255.0) as u8;
-        self.pixels[idx + 3] = 255;
+        self.set_pixel(
+            x,
+            y,
+            Color {
+                r: color.r,
+                g: color.g,
+                b: color.b,
+                a: alpha,
+            },
+        );
     }
 
     /// Fill a rectangle.
-    ///
-    /// Uses fast row-based operations: opaque fills use `copy_from_slice` per
-    /// row (no per-pixel branch), semi-transparent fills alpha-blend in bulk.
-    /// Fully transparent colours are skipped entirely.
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
-        let x0 = x.round().max(0.0) as usize;
-        let y0 = y.round().max(0.0) as usize;
-        let x1 = (x + w).round().min(self.width as f32) as usize;
-        let y1 = (y + h).round().min(self.height as f32) as usize;
+        let x0 = x.round() as i32;
+        let y0 = y.round() as i32;
+        let x1 = (x + w).round() as i32;
+        let y1 = (y + h).round() as i32;
 
-        if x0 >= x1 || y0 >= y1 {
-            return;
-        }
-
-        let r = (color.r * 255.0).round().clamp(0.0, 255.0) as u8;
-        let g = (color.g * 255.0).round().clamp(0.0, 255.0) as u8;
-        let b = (color.b * 255.0).round().clamp(0.0, 255.0) as u8;
-        let a = (color.a * 255.0).round().clamp(0.0, 255.0) as u8;
-
-        let fb_w = self.width as usize;
-
-        if a == 255 {
-            // Opaque: direct write, no blending needed.
-            let pixel = [r, g, b, 255u8];
-            for row in y0..y1 {
-                let row_start = row * fb_w * 4 + x0 * 4;
-                let row_end = row * fb_w * 4 + x1 * 4;
-                if row_end <= self.pixels.len() {
-                    for chunk in self.pixels[row_start..row_end].chunks_exact_mut(4) {
-                        chunk.copy_from_slice(&pixel);
-                    }
-                }
-            }
-        } else if a > 0 {
-            // Semi-transparent: alpha blend per pixel.
-            let alpha = color.a;
-            let inv_alpha = 1.0 - alpha;
-            for row in y0..y1 {
-                for col in x0..x1 {
-                    let idx = (row * fb_w + col) * 4;
-                    if idx + 3 < self.pixels.len() {
-                        let bg_r = self.pixels[idx] as f32 / 255.0;
-                        let bg_g = self.pixels[idx + 1] as f32 / 255.0;
-                        let bg_b = self.pixels[idx + 2] as f32 / 255.0;
-                        self.pixels[idx] = ((color.r * alpha + bg_r * inv_alpha) * 255.0) as u8;
-                        self.pixels[idx + 1] =
-                            ((color.g * alpha + bg_g * inv_alpha) * 255.0) as u8;
-                        self.pixels[idx + 2] =
-                            ((color.b * alpha + bg_b * inv_alpha) * 255.0) as u8;
-                        self.pixels[idx + 3] = 255;
-                    }
-                }
+        for py in y0..y1 {
+            for px in x0..x1 {
+                self.set_pixel(px, py, color);
             }
         }
-        // a == 0 → fully transparent, nothing to draw.
     }
 
     /// Fill a rectangle with rounded corners using an SDF-based approach.
@@ -648,10 +572,8 @@ impl Framebuffer {
         font_weight: Option<u16>,
         font_style: Option<&str>,
         font_family: Option<&str>,
-        letter_spacing: Option<f32>,
     ) {
         if self.font_renderer.is_none() {
-            tracing::warn!("Using bitmap font fallback — TTF font not loaded");
             self.draw_text_bitmap(x, y, text, font_size, color);
             return;
         }
@@ -675,18 +597,13 @@ impl Framebuffer {
 
         let fb_width = self.width as i32;
 
-        let mut cx = x;
+        let mut cx = x.round() as i32;
         let mut cy = y.round() as i32;
         let line_height = (font_size * 1.2).round() as i32;
 
-        // Collect chars for indexed access (needed for look-ahead kerning).
-        let chars: Vec<char> = text.chars().collect();
-
-        for i in 0..chars.len() {
-            let ch = chars[i];
-
+        for ch in text.chars() {
             if ch == '\n' {
-                cx = x;
+                cx = x.round() as i32;
                 cy += line_height;
                 continue;
             }
@@ -707,13 +624,13 @@ impl Framebuffer {
 
             // Line wrapping: if this glyph would exceed the framebuffer width,
             // wrap to the next line.
-            if cx.round() as i32 + metrics.advance_width as i32 > fb_width && cx > x {
-                cx = x;
+            if cx + metrics.advance_width as i32 > fb_width && cx > x.round() as i32 {
+                cx = x.round() as i32;
                 cy += line_height;
             }
 
-            // Blit the glyph bitmap with subpixel horizontal positioning.
-            let gx = cx.round() as i32 + metrics.xmin;
+            // Blit the glyph bitmap.
+            let gx = cx + metrics.xmin;
             let gy = cy - metrics.ymin; // fontdue ymin is distance from baseline up
             let bw = metrics.width;
             let bh = metrics.height;
@@ -730,34 +647,7 @@ impl Framebuffer {
                 }
             }
 
-            // Synthetic bold: draw glyph again offset by 1px for extra weight.
-            // This makes bold text visually thicker even at small sizes.
-            if matches!(variant, FontVariant::Bold | FontVariant::BoldItalic) {
-                for row in 0..bh {
-                    for col in 0..bw {
-                        let coverage = bitmap[row * bw + col];
-                        self.blend_glyph_pixel(
-                            gx + col as i32 + 1, // 1px offset
-                            gy + row as i32,
-                            coverage / 2, // Half coverage for the extra pass
-                            color,
-                        );
-                    }
-                }
-            }
-
-            cx += metrics.advance_width;
-
-            // Apply kerning with the next character if available.
-            if i + 1 < chars.len() && chars[i + 1] != '\n' {
-                if let Some(kern) = renderer.kern(ch, chars[i + 1], font_size, &custom_family_key) {
-                    cx += kern;
-                }
-            }
-
-            if let Some(ls) = letter_spacing {
-                cx += ls;
-            }
+            cx += metrics.advance_width as i32;
         }
 
         // Put the renderer back.
@@ -848,6 +738,8 @@ impl Framebuffer {
         self.clear(Color::WHITE);
         self.clip_stack.clear();
         self.translate_y_offset = 0.0;
+        self.fixed_position_stack.clear();
+        self.transform_stack.clear();
 
         // Load any custom @font-face fonts that haven't been loaded yet.
         if !commands.fonts.is_empty() {
@@ -855,48 +747,48 @@ impl Framebuffer {
         }
 
         let sx = scroll_x;
-        let fb_height = self.height as f32;
 
         for op in &commands.ops {
             let sy_extra = self.translate_y_offset;
 
-            // ---- Off-screen culling ----
-            // Skip ops whose vertical position is entirely above or below the
-            // visible viewport. We use a generous margin (1000px below the
-            // element's y and 100px past the bottom) to avoid clipping
-            // tall elements or text that overflows its origin.
-            if let Some(op_y) = get_op_y(op) {
-                let screen_y = op_y + y_offset - scroll_y + sy_extra;
-                if screen_y > fb_height + 100.0 || screen_y + 1000.0 < 0.0 {
-                    continue;
-                }
-            }
+            // Compute effective scroll offsets (fixed positioning disables scroll).
+            let (eff_sx, eff_sy) = if !self.fixed_position_stack.is_empty() {
+                (0.0_f32, 0.0_f32)
+            } else {
+                (sx, scroll_y)
+            };
+
             match op {
                 RenderOp::FillRect { x, y, width, height, color } => {
-                    self.fill_rect(*x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, *color);
+                    let (rx, ry) = self.apply_transform(*x - eff_sx, *y + y_offset - eff_sy + sy_extra);
+                    self.fill_rect(rx, ry, *width, *height, *color);
                 }
-                RenderOp::DrawText { x, y, text, font_size, color, font_weight, font_style, font_family, letter_spacing } => {
+                RenderOp::DrawText { x, y, text, font_size, color, font_weight, font_style, font_family } => {
+                    let (rx, ry) = self.apply_transform(*x - eff_sx, *y + y_offset - eff_sy + sy_extra);
                     self.draw_text(
-                        *x - sx, *y + y_offset - scroll_y + sy_extra, text, *font_size, *color,
-                        *font_weight, font_style.as_deref(), font_family.as_deref(), *letter_spacing,
+                        rx, ry, text, *font_size, *color,
+                        *font_weight, font_style.as_deref(), font_family.as_deref(),
                     );
                 }
                 RenderOp::StrokeRect { x, y, width, height, color, width_px } => {
-                    self.stroke_rect(*x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, *color, *width_px);
+                    let (rx, ry) = self.apply_transform(*x - eff_sx, *y + y_offset - eff_sy + sy_extra);
+                    self.stroke_rect(rx, ry, *width, *height, *color, *width_px);
                 }
                 RenderOp::DrawImage {
                     x, y, width, height,
                     img_width, img_height, pixels,
                 } => {
+                    let (rx, ry) = self.apply_transform(*x - eff_sx, *y + y_offset - eff_sy + sy_extra);
                     self.draw_image(
-                        *x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height,
+                        rx, ry, *width, *height,
                         *img_width, *img_height, pixels,
                     );
                 }
                 RenderOp::PushClip { x, y, width, height } => {
+                    let (rx, ry) = self.apply_transform(*x - eff_sx, *y + y_offset - eff_sy + sy_extra);
                     self.clip_stack.push(ClipRect {
-                        x: (*x - sx).round() as i32,
-                        y: (*y + y_offset - scroll_y + sy_extra).round() as i32,
+                        x: rx.round() as i32,
+                        y: ry.round() as i32,
                         width: width.round() as i32,
                         height: height.round() as i32,
                     });
@@ -905,20 +797,19 @@ impl Framebuffer {
                     self.clip_stack.pop();
                 }
                 RenderOp::FillRoundedRect { x, y, width, height, color, radius } => {
+                    let (rx, ry) = self.apply_transform(*x - eff_sx, *y + y_offset - eff_sy + sy_extra);
                     self.fill_rounded_rect(
-                        *x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, *color, *radius,
+                        rx, ry, *width, *height, *color, *radius,
                     );
                 }
                 RenderOp::BoxShadow {
                     x, y, width, height, color, offset_x, offset_y, blur: _,
                 } => {
-                    self.fill_rect(
-                        *x + *offset_x - sx,
-                        *y + *offset_y + y_offset - scroll_y + sy_extra,
-                        *width,
-                        *height,
-                        *color,
+                    let (rx, ry) = self.apply_transform(
+                        *x + *offset_x - eff_sx,
+                        *y + *offset_y + y_offset - eff_sy + sy_extra,
                     );
+                    self.fill_rect(rx, ry, *width, *height, *color);
                 }
                 // Sticky positioning: adjust the y-offset for subsequent ops
                 // so the element sticks to the viewport during scroll.
@@ -934,103 +825,22 @@ impl Framebuffer {
                 RenderOp::StickyEnd => {
                     self.translate_y_offset = 0.0;
                 }
-                // Scrollable container: clip child rendering to the container bounds.
-                // Internal scroll state is tracked by the window; for now this
-                // behaves like PushClip/PopClip.
-                RenderOp::ScrollContainerStart { x, y, width, height, .. } => {
-                    self.clip_stack.push(ClipRect {
-                        x: (*x - sx).round() as i32,
-                        y: (*y + y_offset - scroll_y + sy_extra).round() as i32,
-                        width: width.round() as i32,
-                        height: height.round() as i32,
+                // Fixed positioning: save scroll state and ignore scroll.
+                RenderOp::FixedPosition { .. } => {
+                    self.fixed_position_stack.push(SavedScrollState {
+                        scroll_x: sx,
+                        scroll_y,
                     });
                 }
-                RenderOp::ScrollContainerEnd => {
-                    self.clip_stack.pop();
+                RenderOp::FixedPositionEnd => {
+                    self.fixed_position_stack.pop();
                 }
-                // Form field rendering: draw visual indicators on top of the
-                // background/text that the painter already emitted.
-                RenderOp::FormField { x, y, width, height, field_type, .. } => {
-                    let fx = *x - sx;
-                    let fy = *y + y_offset - scroll_y + sy_extra;
-                    let fw = *width;
-                    let fh = *height;
-
-                    match field_type.as_str() {
-                        "select" => {
-                            // Draw a 1px border around the select box.
-                            let border_color = Color::rgb(0.6, 0.6, 0.6);
-                            self.stroke_rect(fx, fy, fw, fh, border_color, 1.0);
-
-                            // Draw a separator line before the arrow area.
-                            let arrow_area_w = 20.0;
-                            let sep_x = fx + fw - arrow_area_w;
-                            let sep_color = Color::rgb(0.78, 0.78, 0.78);
-                            self.fill_rect(sep_x, fy + 1.0, 1.0, fh - 2.0, sep_color);
-
-                            // Draw a light background for the arrow area.
-                            let arrow_bg = Color::rgb(0.92, 0.92, 0.92);
-                            self.fill_rect(sep_x + 1.0, fy + 1.0, arrow_area_w - 2.0, fh - 2.0, arrow_bg);
-
-                            // Draw a downward triangle (▼) in the arrow area.
-                            let arrow_size = 6.0_f32;
-                            let arrow_cx = sep_x + arrow_area_w / 2.0;
-                            let arrow_cy = fy + (fh - arrow_size * 0.6) / 2.0;
-                            let arrow_color = Color::rgb(0.35, 0.35, 0.35);
-                            for row in 0..=(arrow_size as i32) {
-                                // Each row of the triangle is narrower.
-                                let half = ((arrow_size as i32 - row) as f32 / 2.0) as i32;
-                                let py = (arrow_cy + row as f32).round() as i32;
-                                for col in -half..=half {
-                                    let px = (arrow_cx + col as f32).round() as i32;
-                                    self.set_pixel(px, py, arrow_color);
-                                }
-                            }
-                        }
-                        "checkbox" => {
-                            // Draw a checkbox outline (square).
-                            let size = fw.min(fh).min(16.0);
-                            let cx = fx + (fw - size) / 2.0;
-                            let cy = fy + (fh - size) / 2.0;
-                            let outline_color = Color::rgb(0.4, 0.4, 0.4);
-                            // White fill inside.
-                            self.fill_rect(cx, cy, size, size, Color::WHITE);
-                            self.stroke_rect(cx, cy, size, size, outline_color, 1.0);
-                        }
-                        "radio" => {
-                            // Draw a radio circle (approximated with rounded rect).
-                            let size = fw.min(fh).min(16.0);
-                            let cx = fx + (fw - size) / 2.0;
-                            let cy = fy + (fh - size) / 2.0;
-                            let outline_color = Color::rgb(0.4, 0.4, 0.4);
-                            // White fill.
-                            let r = size / 2.0;
-                            self.fill_rounded_rect(cx, cy, size, size, Color::WHITE, [r, r, r, r]);
-                            // Border via stroke (square for now — the rounded fill gives the circle shape).
-                            // Draw circle outline using scanlines.
-                            let center_x = cx + r;
-                            let center_y = cy + r;
-                            for py_i in 0..=(size as i32) {
-                                for px_i in 0..=(size as i32) {
-                                    let dx = px_i as f32 - r;
-                                    let dy = py_i as f32 - r;
-                                    let dist = (dx * dx + dy * dy).sqrt();
-                                    if dist >= r - 1.0 && dist <= r {
-                                        self.set_pixel(
-                                            (cx + px_i as f32).round() as i32,
-                                            (cy + py_i as f32).round() as i32,
-                                            outline_color,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        _ => {
-                            // Generic form field: just draw a subtle border.
-                            let border_color = Color::rgb(0.7, 0.7, 0.7);
-                            self.stroke_rect(fx, fy, fw, fh, border_color, 1.0);
-                        }
-                    }
+                // CSS transforms: push/pop affine transform matrix.
+                RenderOp::Transform { matrix } => {
+                    self.transform_stack.push(TransformEntry { matrix: *matrix });
+                }
+                RenderOp::TransformEnd => {
+                    self.transform_stack.pop();
                 }
                 // Link ops are metadata-only; they don't draw anything.
                 RenderOp::Link { .. } => {}
@@ -1191,38 +1001,6 @@ impl Framebuffer {
                 self.set_pixel(px, py, Color { r, g, b, a });
             }
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Off-screen culling helper
-// ---------------------------------------------------------------------------
-
-/// Extract the Y coordinate from a `RenderOp`, if applicable.
-///
-/// Returns `None` for ops that are purely structural (e.g. `PopClip`,
-/// `StickyEnd`, `Save`, `Restore`) — those should never be skipped.
-fn get_op_y(op: &RenderOp) -> Option<f32> {
-    match op {
-        RenderOp::FillRect { y, .. }
-        | RenderOp::DrawText { y, .. }
-        | RenderOp::StrokeRect { y, .. }
-        | RenderOp::DrawImage { y, .. }
-        | RenderOp::FillRoundedRect { y, .. }
-        | RenderOp::BoxShadow { y, .. }
-        | RenderOp::FormField { y, .. }
-        | RenderOp::DrawTexture { y, .. } => Some(*y),
-        // Structural / state ops — never cull these.
-        RenderOp::PushClip { .. }
-        | RenderOp::PopClip
-        | RenderOp::StickyStart { .. }
-        | RenderOp::StickyEnd
-        | RenderOp::ScrollContainerStart { .. }
-        | RenderOp::ScrollContainerEnd
-        | RenderOp::Link { .. }
-        | RenderOp::Translate { .. }
-        | RenderOp::Save
-        | RenderOp::Restore => None,
     }
 }
 

@@ -89,12 +89,6 @@ impl NovaMod for PainterMod {
                 let mut ops = Vec::new();
                 paint_box(&root, &mut ops, &images_map);
 
-                // Post-process: coalesce adjacent DrawText ops on the same line
-                // into single ops. This ensures consistent word spacing because
-                // the renderer draws the combined string in one pass instead of
-                // positioning each word independently.
-                let ops = coalesce_text_ops(ops);
-
                 debug!(op_count = ops.len(), "painting complete");
                 Ok(TypedData::RenderCommands(RenderCommands { ops, fonts: vec![] }))
             }
@@ -108,107 +102,6 @@ impl NovaMod for PainterMod {
         info!(mod_id = %self.manifest.id, "painter mod shutting down");
         Ok(())
     }
-}
-
-// ---------------------------------------------------------------------------
-// Text op coalescing
-// ---------------------------------------------------------------------------
-
-/// Merge consecutive `DrawText` ops that share the same Y coordinate, font size,
-/// color, weight, style, and family into a single `DrawText` op.
-///
-/// Individual words are laid out by the layout engine as separate boxes, each
-/// producing its own `DrawText` op. When the renderer draws them independently,
-/// slight differences between layout measurement and rendering measurement
-/// cause words to visually overlap or have inconsistent spacing.
-///
-/// By joining adjacent words into one string (with a space between them when
-/// there's a gap), the renderer draws the whole line in one pass and its own
-/// advance-width calculations keep the spacing consistent.
-fn coalesce_text_ops(ops: Vec<RenderOp>) -> Vec<RenderOp> {
-    let mut result: Vec<RenderOp> = Vec::with_capacity(ops.len());
-
-    for op in ops {
-        if let RenderOp::DrawText {
-            x, y, ref text, font_size, color, ref font_weight, ref font_style, ref font_family, ref letter_spacing,
-        } = op
-        {
-            // Try to merge with the previous DrawText if on the same line.
-            let merged = match result.last() {
-                Some(RenderOp::DrawText {
-                    x: prev_x,
-                    y: prev_y,
-                    text: prev_text,
-                    font_size: prev_fs,
-                    color: prev_color,
-                    font_weight: prev_fw,
-                    font_style: prev_fst,
-                    font_family: prev_ff,
-                    letter_spacing: prev_ls,
-                }) => {
-                    // Same baseline Y (within 0.5px), same font properties, and same color.
-                    (y - prev_y).abs() < 0.5
-                        && (font_size - prev_fs).abs() < 0.1
-                        && color_eq(&color, prev_color)
-                        && font_weight == prev_fw
-                        && font_style == prev_fst
-                        && font_family == prev_ff
-                        && letter_spacing == prev_ls
-                        && x > *prev_x
-                        && (x - *prev_x) < prev_text.len() as f32 * font_size + font_size * 3.0
-                }
-                _ => false,
-            };
-
-            if merged {
-                // Pop the previous and merge.
-                if let Some(RenderOp::DrawText {
-                    x: prev_x,
-                    y: prev_y,
-                    text: prev_text,
-                    font_size: prev_fs,
-                    color: prev_color,
-                    font_weight: prev_fw,
-                    font_style: prev_fst,
-                    font_family: prev_ff,
-                    letter_spacing: prev_ls,
-                }) = result.pop()
-                {
-                    let combined = if text.starts_with(' ') || prev_text.ends_with(' ') {
-                        format!("{}{}", prev_text, text)
-                    } else {
-                        format!("{} {}", prev_text, text)
-                    };
-                    result.push(RenderOp::DrawText {
-                        x: prev_x,
-                        y: prev_y,
-                        text: combined,
-                        font_size: prev_fs,
-                        color: prev_color,
-                        font_weight: prev_fw,
-                        font_style: prev_fst,
-                        font_family: prev_ff,
-                        letter_spacing: prev_ls,
-                    });
-                }
-            } else {
-                result.push(op);
-            }
-        } else {
-            result.push(op);
-        }
-    }
-
-    result
-}
-
-/// Compare two colors for approximate equality.
-#[inline]
-fn color_eq(a: &Color, b: &Color) -> bool {
-    (a.r - b.r).abs() < 0.01
-        && (a.g - b.g).abs() < 0.01
-        && (a.b - b.b).abs() < 0.01
-        && (a.a - b.a).abs() < 0.01
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +127,57 @@ impl Default for CssTransform {
 impl CssTransform {
     fn has_translate(&self) -> bool {
         self.translate_x != 0.0 || self.translate_y != 0.0
+    }
+
+    /// Returns `true` if this transform has any non-identity operation.
+    fn is_non_identity(&self) -> bool {
+        self.translate_x != 0.0
+            || self.translate_y != 0.0
+            || self.scale_x != 1.0
+            || self.scale_y != 1.0
+            || self.rotate_deg != 0.0
+    }
+
+    /// Compute the 2x3 affine transform matrix `[a, b, c, d, tx, ty]`.
+    ///
+    /// The matrix represents the combined effect of translate, scale, and
+    /// rotate (applied in CSS order: translate first, then rotate, then scale).
+    fn to_matrix(&self) -> [f32; 6] {
+        // Start with identity.
+        let mut a = 1.0_f32;
+        let mut b = 0.0_f32;
+        let mut c = 0.0_f32;
+        let mut d = 1.0_f32;
+        let mut tx = 0.0_f32;
+        let mut ty = 0.0_f32;
+
+        // Apply translate.
+        tx += self.translate_x;
+        ty += self.translate_y;
+
+        // Apply rotation.
+        if self.rotate_deg != 0.0 {
+            let rad = self.rotate_deg.to_radians();
+            let cos = rad.cos();
+            let sin = rad.sin();
+            // Multiply current matrix by rotation matrix.
+            let na = a * cos + c * sin;
+            let nb = b * cos + d * sin;
+            let nc = a * -sin + c * cos;
+            let nd = b * -sin + d * cos;
+            a = na;
+            b = nb;
+            c = nc;
+            d = nd;
+        }
+
+        // Apply scale.
+        a *= self.scale_x;
+        b *= self.scale_x;
+        c *= self.scale_y;
+        d *= self.scale_y;
+
+        [a, b, c, d, tx, ty]
     }
 }
 
@@ -279,9 +223,47 @@ fn parse_transform(value: &str) -> Option<CssTransform> {
                     transform.scale_x *= sx; transform.scale_y *= sy; found_any = true;
                 }
             }
+            "scaleX" => {
+                if let Some(sx) = args.first().and_then(|a| a.parse::<f32>().ok()) {
+                    transform.scale_x *= sx; found_any = true;
+                }
+            }
+            "scaleY" => {
+                if let Some(sy) = args.first().and_then(|a| a.parse::<f32>().ok()) {
+                    transform.scale_y *= sy; found_any = true;
+                }
+            }
             "rotate" => {
                 if let Some(deg) = args.first().and_then(|a| parse_angle_deg(a)) {
                     transform.rotate_deg += deg; found_any = true;
+                }
+            }
+            "matrix" => {
+                // matrix(a, b, c, d, tx, ty)
+                if args.len() >= 6 {
+                    if let (Some(ma), Some(mb), Some(mc), Some(md), Some(mtx), Some(mty)) = (
+                        args[0].parse::<f32>().ok(),
+                        args[1].parse::<f32>().ok(),
+                        args[2].parse::<f32>().ok(),
+                        args[3].parse::<f32>().ok(),
+                        args[4].parse::<f32>().ok(),
+                        args[5].parse::<f32>().ok(),
+                    ) {
+                        // Decompose the matrix into our fields (approximate).
+                        // For a simple matrix, scale_x = a, scale_y = d,
+                        // translate_x = tx, translate_y = ty, and rotation is
+                        // derived from b and c.
+                        transform.translate_x += mtx;
+                        transform.translate_y += mty;
+                        transform.scale_x *= ma;
+                        transform.scale_y *= md;
+                        // Approximate rotation from b, c (only if no scale).
+                        if mb.abs() > 0.001 || mc.abs() > 0.001 {
+                            let angle = mb.atan2(ma).to_degrees();
+                            transform.rotate_deg += angle;
+                        }
+                        found_any = true;
+                    }
                 }
             }
             _ => {}
@@ -313,65 +295,6 @@ fn extract_transform(style: &nova_mod_api::content::StyleMap) -> Option<CssTrans
     None
 }
 
-/// Check if this element creates a new stacking context.
-///
-/// A stacking context is created by elements with:
-/// - `z-index` set AND `position` is not `static`
-/// - `opacity` < 1.0
-/// - CSS `transform` is set (non-none)
-/// - `position: fixed` or `position: sticky`
-fn creates_stacking_context(style: &nova_mod_api::content::StyleMap) -> bool {
-    let mut has_z_index = false;
-    let mut has_position = false;
-    let mut has_opacity_lt_1 = false;
-    let mut has_transform = false;
-    let mut is_fixed_or_sticky = false;
-
-    for (key, value) in &style.properties {
-        match key.as_str() {
-            "z-index" => {
-                match value {
-                    StyleValue::Number(n) if *n != 0.0 => has_z_index = true,
-                    StyleValue::Keyword(s) | StyleValue::Str(s) => {
-                        if s.trim() != "auto" {
-                            has_z_index = true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            "position" => {
-                if let StyleValue::Keyword(k) | StyleValue::Str(k) = value {
-                    let pos = k.trim();
-                    if pos != "static" { has_position = true; }
-                    if pos == "fixed" || pos == "sticky" { is_fixed_or_sticky = true; }
-                }
-            }
-            "opacity" => {
-                match value {
-                    StyleValue::Number(n) if *n < 1.0 => has_opacity_lt_1 = true,
-                    StyleValue::Str(s) | StyleValue::Keyword(s) => {
-                        if let Ok(v) = s.parse::<f32>() {
-                            if v < 1.0 { has_opacity_lt_1 = true; }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            "transform" => {
-                if let StyleValue::Str(s) | StyleValue::Keyword(s) = value {
-                    if s.trim() != "none" && !s.trim().is_empty() {
-                        has_transform = true;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    (has_z_index && has_position) || has_opacity_lt_1 || has_transform || is_fixed_or_sticky
-}
-
 /// Recursively paint a layout box into render operations.
 fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<String, Vec<u8>>) {
     // Skip zero-sized boxes (display: none, comments, etc.).
@@ -379,78 +302,62 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         return;
     }
 
-    // Check for position: sticky or position: fixed and emit StickyStart/StickyEnd.
-    // Fixed elements reuse the sticky mechanism — they always pin to the viewport.
+    // Check for position: sticky and emit StickyStart/StickyEnd.
     let is_sticky = is_position_sticky(&layout_box.style);
-    let is_fixed = is_position_fixed(&layout_box.style);
     if is_sticky {
         let sticky_top = extract_sticky_top(&layout_box.style);
         ops.push(RenderOp::StickyStart {
             original_y: layout_box.y,
             sticky_top,
         });
-    } else if is_fixed {
-        let fixed_top = extract_fixed_top(&layout_box.style);
-        ops.push(RenderOp::StickyStart {
-            original_y: layout_box.y,
-            sticky_top: fixed_top,
+    }
+
+    // Check for position: fixed and emit FixedPosition/FixedPositionEnd.
+    let is_fixed = is_position_fixed(&layout_box.style);
+    if is_fixed {
+        ops.push(RenderOp::FixedPosition {
+            x: layout_box.x,
+            y: layout_box.y,
+            width: layout_box.width,
+            height: layout_box.height,
         });
     }
 
-    // Check for CSS transform and wrap in Save/Translate/Restore if needed.
+    // Check for CSS transform and emit Transform/TransformEnd if needed.
     let transform = extract_transform(&layout_box.style);
-    let needs_translate = transform.as_ref().is_some_and(|t| t.has_translate());
-    if needs_translate {
+    let needs_transform = transform.as_ref().is_some_and(|t| t.is_non_identity());
+    if needs_transform {
+        let t = transform.as_ref().unwrap();
+        ops.push(RenderOp::Transform { matrix: t.to_matrix() });
+    }
+    // Legacy: also support translate-only via Save/Translate for backward compat.
+    let needs_translate_only = !needs_transform && transform.as_ref().is_some_and(|t| t.has_translate());
+    if needs_translate_only {
         let t = transform.as_ref().unwrap();
         ops.push(RenderOp::Save);
         ops.push(RenderOp::Translate { x: t.translate_x, y: t.translate_y });
     }
 
     // Determine opacity factor for this box (1.0 = fully opaque).
-    let (filter_opacity, css_filter) = extract_css_filter(&layout_box.style);
-    let opacity = extract_opacity(&layout_box.style) * filter_opacity;
+    let opacity = extract_opacity(&layout_box.style);
 
     // Emit box-shadow before the background (painter's order: shadow → bg → content).
     if let Some((shadow_color, offset_x, offset_y, blur)) = extract_box_shadow(&layout_box.style) {
         let shadow_color = multiply_alpha(shadow_color, opacity);
-        if blur > 0.0 {
-            // Simulate blur with concentric expanding rects of decreasing alpha.
-            let steps = (blur / 2.0).ceil().max(1.0) as i32;
-            for i in 0..=steps {
-                let expand = (i as f32 / steps as f32) * blur;
-                let alpha_factor = 1.0 - (i as f32 / steps as f32);
-                let c = Color::rgba(
-                    shadow_color.r, shadow_color.g, shadow_color.b,
-                    shadow_color.a * alpha_factor * 0.3,
-                );
-                ops.push(RenderOp::FillRect {
-                    x: layout_box.x + offset_x - expand,
-                    y: layout_box.y + offset_y - expand,
-                    width: layout_box.width + expand * 2.0,
-                    height: layout_box.height + expand * 2.0,
-                    color: c,
-                });
-            }
-        } else {
-            ops.push(RenderOp::BoxShadow {
-                x: layout_box.x,
-                y: layout_box.y,
-                width: layout_box.width,
-                height: layout_box.height,
-                color: shadow_color,
-                offset_x,
-                offset_y,
-                blur,
-            });
-        }
+        ops.push(RenderOp::BoxShadow {
+            x: layout_box.x,
+            y: layout_box.y,
+            width: layout_box.width,
+            height: layout_box.height,
+            color: shadow_color,
+            offset_x,
+            offset_y,
+            blur,
+        });
     }
 
     // Paint the background if this is not a text node.
-    let bg_color = if let Some(ref f) = css_filter {
-        apply_filter_to_color(multiply_alpha(extract_background_color(&layout_box.style), opacity), f)
-    } else {
-        multiply_alpha(extract_background_color(&layout_box.style), opacity)
-    };
+    let bg_color = multiply_alpha(extract_background_color(&layout_box.style), opacity);
     if bg_color.a > 0.0 {
         let radius = extract_border_radius(&layout_box.style, layout_box.width, layout_box.height);
         if radius.iter().any(|&r| r > 0.0) {
@@ -476,78 +383,18 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     // Paint background-image (url() or linear-gradient).
     if let Some(bg_image) = extract_background_image_value(&layout_box.style) {
         if bg_image.starts_with("url(") {
+            // Background image from URL.
             if let Some(url) = extract_css_url(&bg_image) {
                 if let Some(decoded) = images.get(&url) {
                     if decoded.len() >= 8 {
                         let iw = u32::from_le_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]);
                         let ih = u32::from_le_bytes([decoded[4], decoded[5], decoded[6], decoded[7]]);
                         let px = decoded[8..].to_vec();
-                        let img_w = iw as f32;
-                        let img_h = ih as f32;
-
-                        let bg_repeat = extract_background_repeat(&layout_box.style);
-                        let (pos_x, pos_y) = extract_background_position(&layout_box.style);
-                        let (size_w, size_h) = extract_background_size(
-                            &layout_box.style, layout_box.width, layout_box.height, img_w, img_h,
-                        );
-
-                        // Calculate the positioned origin of the background image.
-                        let origin_x = layout_box.x + (layout_box.width - size_w) * pos_x;
-                        let origin_y = layout_box.y + (layout_box.height - size_h) * pos_y;
-
-                        match bg_repeat {
-                            "no-repeat" => {
-                                ops.push(RenderOp::DrawImage {
-                                    x: origin_x, y: origin_y,
-                                    width: size_w, height: size_h,
-                                    img_width: iw, img_height: ih, pixels: px,
-                                });
-                            }
-                            "repeat-x" => {
-                                if size_w > 0.0 {
-                                    let mut cx = layout_box.x;
-                                    while cx < layout_box.x + layout_box.width {
-                                        ops.push(RenderOp::DrawImage {
-                                            x: cx, y: origin_y,
-                                            width: size_w, height: size_h,
-                                            img_width: iw, img_height: ih, pixels: px.clone(),
-                                        });
-                                        cx += size_w;
-                                    }
-                                }
-                            }
-                            "repeat-y" => {
-                                if size_h > 0.0 {
-                                    let mut cy = layout_box.y;
-                                    while cy < layout_box.y + layout_box.height {
-                                        ops.push(RenderOp::DrawImage {
-                                            x: origin_x, y: cy,
-                                            width: size_w, height: size_h,
-                                            img_width: iw, img_height: ih, pixels: px.clone(),
-                                        });
-                                        cy += size_h;
-                                    }
-                                }
-                            }
-                            _ => {
-                                // "repeat" — tile in both directions
-                                if size_w > 0.0 && size_h > 0.0 {
-                                    let mut cy = layout_box.y;
-                                    while cy < layout_box.y + layout_box.height {
-                                        let mut cx = layout_box.x;
-                                        while cx < layout_box.x + layout_box.width {
-                                            ops.push(RenderOp::DrawImage {
-                                                x: cx, y: cy,
-                                                width: size_w, height: size_h,
-                                                img_width: iw, img_height: ih, pixels: px.clone(),
-                                            });
-                                            cx += size_w;
-                                        }
-                                        cy += size_h;
-                                    }
-                                }
-                            }
-                        }
+                        ops.push(RenderOp::DrawImage {
+                            x: layout_box.x, y: layout_box.y,
+                            width: layout_box.width, height: layout_box.height,
+                            img_width: iw, img_height: ih, pixels: px,
+                        });
                     }
                 }
             }
@@ -560,152 +407,36 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         }
     }
 
-    // Paint text content (including space-only nodes for inter-element spacing).
+    // Paint text content.
     if let LayoutContent::Text(ref text) = layout_box.content {
-        if !text.is_empty() {
+        if !text.trim().is_empty() {
             let font_size = extract_font_size(&layout_box.style);
-            let text_color = {
-                let c = multiply_alpha(extract_text_color(&layout_box.style), opacity);
-                if let Some(ref f) = css_filter { apply_filter_to_color(c, f) } else { c }
-            };
+            let text_color = multiply_alpha(extract_text_color(&layout_box.style), opacity);
             let font_weight = extract_font_weight(&layout_box.style);
             let font_style = extract_font_style(&layout_box.style);
             let font_family = extract_font_family(&layout_box.style);
-            let letter_spacing = extract_letter_spacing(&layout_box.style);
-            let mut transformed_text = apply_text_transform(text, &layout_box.style);
-            // Apply text-overflow: ellipsis if needed.
-            if has_text_overflow_ellipsis(&layout_box.style) && layout_box.width > 0.0 {
-                transformed_text = truncate_with_ellipsis(&transformed_text, font_size, layout_box.width);
-            }
+            let transformed_text = apply_text_transform(text, &layout_box.style);
+            ops.push(RenderOp::DrawText {
+                x: layout_box.x,
+                y: layout_box.y + font_size, // baseline offset
+                text: transformed_text.clone(),
+                font_size,
+                color: text_color,
+                font_weight,
+                font_style,
+                font_family,
+            });
 
-            // Check for multi-style segment data from the layout engine.
-            // Only use segments if text-transform didn't change the byte
-            // length (uppercase/lowercase can shift offsets for non-ASCII).
-            let has_transform = transformed_text.len() != text.len();
-            let segments_str = if has_transform {
-                None
-            } else {
-                layout_box.style.properties.iter()
-                    .find(|(k, _)| k == "nova-text-segments")
-                    .and_then(|(_, v)| if let StyleValue::Str(s) = v { Some(s.clone()) } else { None })
-            };
-
-            if let Some(seg_str) = segments_str {
-                // Multi-style merged node: emit one DrawText per segment
-                // with the correct color, weight, and x-offset.
-                for seg in seg_str.split(';') {
-                    let parts: Vec<&str> = seg.split(':').collect();
-                    if parts.len() >= 6 {
-                        let start: usize = parts[0].parse().unwrap_or(0);
-                        let end: usize = parts[1].parse().unwrap_or(0);
-                        let x_off: f32 = parts[2].parse().unwrap_or(0.0);
-                        let seg_color_str = parts[3];
-                        let seg_weight_str = parts[4];
-                        let seg_texdec = parts[5];
-                        // 7th field: href (may contain colons, so rejoin everything after field 6).
-                        let seg_href = if parts.len() > 6 {
-                            parts[6..].join(":")
-                        } else {
-                            String::new()
-                        };
-                        let has_href = !seg_href.is_empty();
-
-                        if start < end && end <= transformed_text.len() {
-                            let seg_text = &transformed_text[start..end];
-                            let seg_color = if !seg_color_str.is_empty() {
-                                let c = parse_color_string(seg_color_str).unwrap_or(text_color);
-                                let c = multiply_alpha(c, opacity);
-                                if let Some(ref f) = css_filter { apply_filter_to_color(c, f) } else { c }
-                            } else {
-                                text_color
-                            };
-                            let seg_weight = if !seg_weight_str.is_empty() {
-                                match seg_weight_str {
-                                    "bold" => Some(700u16),
-                                    "bolder" => Some(700),
-                                    "lighter" => Some(300),
-                                    "normal" => Some(400),
-                                    _ => seg_weight_str.parse::<u16>().ok().or(font_weight),
-                                }
-                            } else {
-                                font_weight
-                            };
-
-                            ops.push(RenderOp::DrawText {
-                                x: layout_box.x + x_off,
-                                y: layout_box.y + font_size,
-                                text: seg_text.to_string(),
-                                font_size,
-                                color: seg_color,
-                                font_weight: seg_weight,
-                                font_style: font_style.clone(),
-                                font_family: font_family.clone(),
-                                letter_spacing,
-                            });
-
-                            // Per-segment underline: draw if text-decoration
-                            // says underline OR the segment is a link (links
-                            // always get an underline so they remain
-                            // distinguishable even when the site overrides
-                            // color/decoration).
-                            let seg_width = if end < transformed_text.len() {
-                                estimate_text_width(seg_text, font_size)
-                            } else {
-                                layout_box.width - x_off
-                            };
-                            if seg_texdec.contains("underline") || has_href {
-                                ops.push(RenderOp::FillRect {
-                                    x: layout_box.x + x_off,
-                                    y: layout_box.y + font_size + 2.0,
-                                    width: seg_width,
-                                    height: 1.0,
-                                    color: seg_color,
-                                });
-                            }
-
-                            // Emit a Link op for segments that carry an href
-                            // so the segment is clickable.
-                            if has_href {
-                                ops.push(RenderOp::Link {
-                                    x: layout_box.x + x_off,
-                                    y: layout_box.y,
-                                    width: seg_width,
-                                    height: font_size + 4.0,
-                                    url: seg_href,
-                                });
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Single-style text node: emit one DrawText as before.
-                ops.push(RenderOp::DrawText {
+            // Draw underline if text-decoration: underline is set.
+            if has_text_decoration_underline(&layout_box.style) {
+                let underline_y = layout_box.y + font_size + 2.0;
+                ops.push(RenderOp::FillRect {
                     x: layout_box.x,
-                    y: layout_box.y + font_size, // baseline offset
-                    text: transformed_text.clone(),
-                    font_size,
+                    y: underline_y,
+                    width: layout_box.width,
+                    height: 1.0,
                     color: text_color,
-                    font_weight,
-                    font_style,
-                    font_family,
-                    letter_spacing,
                 });
-
-                // Draw underline if text-decoration: underline is set,
-                // or if this text node is a link (href present) so links
-                // remain visually distinguishable even when the site
-                // overrides color/decoration.
-                let is_link = extract_href(&layout_box.style).is_some();
-                if has_text_decoration_underline(&layout_box.style) || is_link {
-                    let underline_y = layout_box.y + font_size + 2.0;
-                    ops.push(RenderOp::FillRect {
-                        x: layout_box.x,
-                        y: underline_y,
-                        width: layout_box.width,
-                        height: 1.0,
-                        color: text_color,
-                    });
-                }
             }
         }
     }
@@ -738,33 +469,12 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                 font_weight: None,
                 font_style: None,
                 font_family: None,
-                letter_spacing: None,
             });
         }
     }
 
     // Emit FormField op for interactive form elements.
     if let Some((field_type, value)) = extract_form_field(&layout_box.style) {
-        // If this is a text input with an empty value, show placeholder text in gray.
-        let placeholder = extract_placeholder(&layout_box.style);
-        if value.is_empty() && !placeholder.is_empty()
-            && matches!(field_type.as_str(), "text" | "email" | "search" | "url" | "tel" | "password" | "textarea")
-        {
-            let font_size = extract_font_size(&layout_box.style);
-            let placeholder_color = multiply_alpha(Color::rgb(0.6, 0.6, 0.6), opacity);
-            ops.push(RenderOp::DrawText {
-                x: layout_box.x + 4.0,
-                y: layout_box.y + font_size,
-                text: placeholder.clone(),
-                font_size,
-                color: placeholder_color,
-                font_weight: None,
-                font_style: Some("italic".to_string()),
-                font_family: None,
-                letter_spacing: None,
-            });
-        }
-
         ops.push(RenderOp::FormField {
             x: layout_box.x,
             y: layout_box.y,
@@ -775,30 +485,6 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         });
     }
 
-    // Render iframe placeholder.
-    if let Some(iframe_src) = layout_box.style.properties.iter()
-        .find(|(k, _)| k == "nova-iframe-src")
-        .and_then(|(_, v)| if let StyleValue::Str(s) = v { Some(s.as_str()) } else { None })
-    {
-        let font_size = 11.0;
-        let label = if iframe_src.len() > 60 {
-            format!("[iframe: {}...]", &iframe_src[..57])
-        } else {
-            format!("[iframe: {iframe_src}]")
-        };
-        ops.push(RenderOp::DrawText {
-            x: layout_box.x + 4.0,
-            y: layout_box.y + font_size + 2.0,
-            text: label,
-            font_size,
-            color: Color::rgb(0.5, 0.5, 0.5),
-            font_weight: None,
-            font_style: Some("italic".to_string()),
-            font_family: None,
-            letter_spacing: None,
-        });
-    }
-
     // Paint CSS borders — supports per-side or shorthand borders.
     let borders = extract_borders_per_side(&layout_box.style);
     let bx = layout_box.x;
@@ -806,28 +492,24 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     let bw = layout_box.width;
     let bh = layout_box.height;
     // Top border
-    if let Some((w, color, ref style)) = borders.top {
-        let c = multiply_alpha(color, opacity);
-        let color = if let Some(ref f) = css_filter { apply_filter_to_color(c, f) } else { c };
-        emit_border_ops(ops, bx, by, bw, w, color, style, true);
+    if let Some((w, color)) = borders.top {
+        let color = multiply_alpha(color, opacity);
+        ops.push(RenderOp::FillRect { x: bx, y: by, width: bw, height: w, color });
     }
     // Bottom border
-    if let Some((w, color, ref style)) = borders.bottom {
-        let c = multiply_alpha(color, opacity);
-        let color = if let Some(ref f) = css_filter { apply_filter_to_color(c, f) } else { c };
-        emit_border_ops(ops, bx, by + bh - w, bw, w, color, style, true);
+    if let Some((w, color)) = borders.bottom {
+        let color = multiply_alpha(color, opacity);
+        ops.push(RenderOp::FillRect { x: bx, y: by + bh - w, width: bw, height: w, color });
     }
     // Left border
-    if let Some((w, color, ref style)) = borders.left {
-        let c = multiply_alpha(color, opacity);
-        let color = if let Some(ref f) = css_filter { apply_filter_to_color(c, f) } else { c };
-        emit_border_ops(ops, bx, by, w, bh, color, style, false);
+    if let Some((w, color)) = borders.left {
+        let color = multiply_alpha(color, opacity);
+        ops.push(RenderOp::FillRect { x: bx, y: by, width: w, height: bh, color });
     }
     // Right border
-    if let Some((w, color, ref style)) = borders.right {
-        let c = multiply_alpha(color, opacity);
-        let color = if let Some(ref f) = css_filter { apply_filter_to_color(c, f) } else { c };
-        emit_border_ops(ops, bx + bw - w, by, w, bh, color, style, false);
+    if let Some((w, color)) = borders.right {
+        let color = multiply_alpha(color, opacity);
+        ops.push(RenderOp::FillRect { x: bx + bw - w, y: by, width: w, height: bh, color });
     }
 
     // Emit a Link op if this box has an href (i.e., it is an <a> element).
@@ -843,34 +525,9 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         }
     }
 
-    // Apply CSS clip-path: inset(...) if present.
-    let clip_path_inset = extract_clip_path(&layout_box.style);
-    if let Some((top, right, bottom, left)) = clip_path_inset {
-        ops.push(RenderOp::PushClip {
-            x: layout_box.x + left,
-            y: layout_box.y + top,
-            width: (layout_box.width - left - right).max(0.0),
-            height: (layout_box.height - top - bottom).max(0.0),
-        });
-    }
-
     // Check whether this box clips its overflow.
     let clips_overflow = has_overflow_clip(&layout_box.style);
-
-    // Check if this is a scrollable container (overflow: auto/scroll with overflowing content).
-    let is_scroll_container = is_overflow_scroll(&layout_box.style);
-    let content_height = layout_box.children.iter()
-        .map(|c| c.y + c.height - layout_box.y)
-        .fold(0.0_f32, f32::max);
-    if is_scroll_container && content_height > layout_box.height {
-        ops.push(RenderOp::ScrollContainerStart {
-            x: layout_box.x,
-            y: layout_box.y,
-            width: layout_box.width,
-            height: layout_box.height,
-            content_height,
-        });
-    } else if clips_overflow {
+    if clips_overflow {
         ops.push(RenderOp::PushClip {
             x: layout_box.x,
             y: layout_box.y,
@@ -879,109 +536,33 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         });
     }
 
-    // Recurse into children. Children that create stacking contexts are
-    // painted in z-index order; other children paint in DOM order.
+    // Recurse into children, sorted by z_index (stable sort preserves DOM order
+    // for equal z-index values, which matches CSS stacking context semantics).
     let mut child_indices: Vec<usize> = (0..layout_box.children.len()).collect();
     child_indices.sort_by_key(|&i| layout_box.children[i].z_index);
     for i in child_indices {
-        let child = &layout_box.children[i];
-        let is_stacking_ctx = creates_stacking_context(&child.style);
-        if is_stacking_ctx {
-            // Isolate this child's painting in a save/restore block.
-            ops.push(RenderOp::Save);
-        }
-        paint_box(child, ops, images);
-        if is_stacking_ctx {
-            ops.push(RenderOp::Restore);
-        }
+        paint_box(&layout_box.children[i], ops, images);
     }
 
-    if is_scroll_container && content_height > layout_box.height {
-        ops.push(RenderOp::ScrollContainerEnd);
-    } else if clips_overflow {
+    if clips_overflow {
         ops.push(RenderOp::PopClip);
     }
 
-    if clip_path_inset.is_some() {
-        ops.push(RenderOp::PopClip);
+    if needs_transform {
+        ops.push(RenderOp::TransformEnd);
     }
 
-    if is_sticky || is_fixed {
-        ops.push(RenderOp::StickyEnd);
-    }
-
-    if needs_translate {
+    if needs_translate_only {
         ops.push(RenderOp::Restore);
     }
-}
 
-/// Check if the style requests text-overflow: ellipsis.
-fn has_text_overflow_ellipsis(style: &nova_mod_api::content::StyleMap) -> bool {
-    let mut has_ellipsis = false;
-    let mut has_overflow_hidden = false;
-
-    for (key, value) in &style.properties {
-        match key.as_str() {
-            "text-overflow" => {
-                if let StyleValue::Keyword(k) | StyleValue::Str(k) = value {
-                    if k.trim() == "ellipsis" {
-                        has_ellipsis = true;
-                    }
-                }
-            }
-            "overflow" | "overflow-x" => {
-                if let StyleValue::Keyword(k) | StyleValue::Str(k) = value {
-                    if matches!(k.trim(), "hidden" | "clip") {
-                        has_overflow_hidden = true;
-                    }
-                }
-            }
-            _ => {}
-        }
+    if is_fixed {
+        ops.push(RenderOp::FixedPositionEnd);
     }
 
-    has_ellipsis && has_overflow_hidden
-}
-
-/// Truncate text and append "..." if it exceeds the given width.
-///
-/// Uses character width estimation. Not exact but good enough for visible
-/// truncation.
-fn truncate_with_ellipsis(text: &str, font_size: f32, max_width: f32) -> String {
-    let ellipsis = "...";
-    let ellipsis_width = estimate_text_width(ellipsis, font_size);
-
-    if max_width <= ellipsis_width {
-        return ellipsis.to_string();
+    if is_sticky {
+        ops.push(RenderOp::StickyEnd);
     }
-
-    let available = max_width - ellipsis_width;
-    let mut current_width = 0.0;
-    let mut truncated = String::new();
-
-    for ch in text.chars() {
-        let char_width = estimate_char_width(ch, font_size);
-        if current_width + char_width > available {
-            truncated.push_str(ellipsis);
-            return truncated;
-        }
-        current_width += char_width;
-        truncated.push(ch);
-    }
-
-    // Text fits — no truncation needed.
-    text.to_string()
-}
-
-/// Estimate the width of a single character at a given font size.
-fn estimate_char_width(_ch: char, font_size: f32) -> f32 {
-    // Rough approximation: average character width ≈ 0.6 * font_size.
-    font_size * 0.6
-}
-
-/// Estimate the width of a string at a given font size.
-fn estimate_text_width(text: &str, font_size: f32) -> f32 {
-    text.chars().count() as f32 * font_size * 0.6
 }
 
 /// Return `true` if the style map requests overflow clipping
@@ -995,22 +576,6 @@ fn has_overflow_clip(style: &nova_mod_api::content::StyleMap) -> bool {
                 _ => continue,
             };
             if matches!(clip_val, "hidden" | "scroll" | "auto") {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Return `true` if the style requests scrollable overflow (`overflow: auto` or `overflow: scroll`).
-fn is_overflow_scroll(style: &nova_mod_api::content::StyleMap) -> bool {
-    for (key, value) in &style.properties {
-        if key == "overflow" || key == "overflow-y" {
-            let val = match value {
-                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
-                _ => continue,
-            };
-            if matches!(val, "scroll" | "auto") {
                 return true;
             }
         }
@@ -1275,8 +840,6 @@ fn parse_color_string(s: &str) -> Option<Color> {
         parse_hex_color(s)
     } else if s.starts_with("rgb") {
         parse_rgb_color(s)
-    } else if s.starts_with("hsl") {
-        parse_hsl_color(s)
     } else {
         // Try named colour first, then fall back to bare hex (no '#' prefix).
         parse_named_color(s).or_else(|| {
@@ -1345,75 +908,6 @@ fn parse_rgb_color(s: &str) -> Option<Color> {
     } else {
         None
     }
-}
-
-/// Parse an HSL/HSLA color string into a Color.
-fn parse_hsl_color(s: &str) -> Option<Color> {
-    let inner = s
-        .trim_start_matches("hsla(")
-        .trim_start_matches("hsl(")
-        .trim_end_matches(')');
-
-    let parts: Vec<&str> = if inner.contains(',') {
-        inner.split(',').map(str::trim).collect()
-    } else {
-        let slash_parts: Vec<&str> = inner.splitn(2, '/').collect();
-        let mut hsl: Vec<&str> = slash_parts[0].split_whitespace().collect();
-        if slash_parts.len() > 1 {
-            hsl.push(slash_parts[1].trim());
-        }
-        hsl
-    };
-
-    if parts.len() < 3 {
-        return None;
-    }
-
-    let h = {
-        let s = parts[0].trim();
-        let val = if let Some(v) = s.strip_suffix("deg") {
-            v.trim().parse::<f32>().ok()?
-        } else if let Some(v) = s.strip_suffix("rad") {
-            v.trim().parse::<f32>().ok()?.to_degrees()
-        } else if let Some(v) = s.strip_suffix("turn") {
-            v.trim().parse::<f32>().ok()? * 360.0
-        } else {
-            s.parse::<f32>().ok()?
-        };
-        ((val % 360.0) + 360.0) % 360.0
-    };
-    let s_val = parts[1].trim().trim_end_matches('%').trim().parse::<f32>().ok()? / 100.0;
-    let l = parts[2].trim().trim_end_matches('%').trim().parse::<f32>().ok()? / 100.0;
-    let a = if parts.len() >= 4 {
-        let a_str = parts[3].trim();
-        if let Some(pct) = a_str.strip_suffix('%') {
-            pct.trim().parse::<f32>().unwrap_or(100.0) / 100.0
-        } else {
-            a_str.parse::<f32>().unwrap_or(1.0)
-        }
-    } else {
-        1.0
-    };
-
-    // HSL to RGB conversion
-    let (r, g, b) = if s_val == 0.0 {
-        (l, l, l)
-    } else {
-        let q = if l < 0.5 { l * (1.0 + s_val) } else { l + s_val - l * s_val };
-        let p = 2.0 * l - q;
-        let h_norm = h / 360.0;
-        let hue2rgb = |p: f32, q: f32, mut t: f32| -> f32 {
-            if t < 0.0 { t += 1.0; }
-            if t > 1.0 { t -= 1.0; }
-            if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
-            if t < 1.0 / 2.0 { return q; }
-            if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
-            p
-        };
-        (hue2rgb(p, q, h_norm + 1.0/3.0), hue2rgb(p, q, h_norm), hue2rgb(p, q, h_norm - 1.0/3.0))
-    };
-
-    Some(Color::rgba(r, g, b, a))
 }
 
 fn parse_named_color(s: &str) -> Option<Color> {
@@ -1487,30 +981,6 @@ fn extract_font_weight(style: &nova_mod_api::content::StyleMap) -> Option<u16> {
     None
 }
 
-/// Extract the CSS `letter-spacing` from a style map.
-///
-/// Returns `Some(px)` if a pixel value is set, `None` for `normal` or absent.
-fn extract_letter_spacing(style: &nova_mod_api::content::StyleMap) -> Option<f32> {
-    for (key, value) in &style.properties {
-        if key == "letter-spacing" {
-            match value {
-                StyleValue::Px(px) => return Some(*px),
-                StyleValue::Keyword(k) | StyleValue::Str(k) => {
-                    if k.trim() == "normal" {
-                        return None;
-                    }
-                    if let Some(px) = k.strip_suffix("px").and_then(|s| s.trim().parse::<f32>().ok()) {
-                        return Some(px);
-                    }
-                }
-                StyleValue::Number(n) => return Some(*n),
-                _ => {}
-            }
-        }
-    }
-    None
-}
-
 /// Extract the CSS font-style from a style map.
 ///
 /// Returns `Some("italic")` or `Some("oblique")` if set, `None` otherwise.
@@ -1562,67 +1032,12 @@ fn extract_font_family(style: &nova_mod_api::content::StyleMap) -> Option<String
     None
 }
 
-/// Emit border render ops, handling dashed/dotted styles.
-///
-/// For `dashed` borders, emits a series of short `FillRect` dashes.
-/// For `dotted` borders, emits square dots.
-/// All other styles (solid, double, groove, etc.) render as solid.
-fn emit_border_ops(
-    ops: &mut Vec<RenderOp>,
-    x: f32, y: f32, width: f32, height: f32,
-    color: Color, style: &str, is_horizontal: bool,
-) {
-    match style {
-        "dashed" => {
-            let dash_len = if is_horizontal { height.max(3.0) * 3.0 } else { width.max(3.0) * 3.0 };
-            let gap_len = dash_len;
-            let total = if is_horizontal { width } else { height };
-            let mut offset = 0.0;
-            while offset < total {
-                let len = dash_len.min(total - offset);
-                if is_horizontal {
-                    ops.push(RenderOp::FillRect {
-                        x: x + offset, y, width: len, height, color,
-                    });
-                } else {
-                    ops.push(RenderOp::FillRect {
-                        x, y: y + offset, width, height: len, color,
-                    });
-                }
-                offset += dash_len + gap_len;
-            }
-        }
-        "dotted" => {
-            let dot_size = if is_horizontal { height.max(1.0) } else { width.max(1.0) };
-            let gap = dot_size;
-            let total = if is_horizontal { width } else { height };
-            let mut offset = 0.0;
-            while offset < total {
-                if is_horizontal {
-                    ops.push(RenderOp::FillRect {
-                        x: x + offset, y, width: dot_size, height, color,
-                    });
-                } else {
-                    ops.push(RenderOp::FillRect {
-                        x, y: y + offset, width, height: dot_size, color,
-                    });
-                }
-                offset += dot_size + gap;
-            }
-        }
-        _ => {
-            // solid, double, groove, ridge, etc. — render as solid.
-            ops.push(RenderOp::FillRect { x, y, width, height, color });
-        }
-    }
-}
-
-/// Per-side border info: `(width, color, style)`.
+/// Per-side border info.
 struct BorderSides {
-    top: Option<(f32, Color, String)>,
-    right: Option<(f32, Color, String)>,
-    bottom: Option<(f32, Color, String)>,
-    left: Option<(f32, Color, String)>,
+    top: Option<(f32, Color)>,
+    right: Option<(f32, Color)>,
+    bottom: Option<(f32, Color)>,
+    left: Option<(f32, Color)>,
 }
 
 /// Extract per-side CSS border properties from a style map.
@@ -1660,14 +1075,14 @@ fn extract_borders_per_side(style: &nova_mod_api::content::StyleMap) -> BorderSi
         let _ = (target_width, target_color); // suppress unused
     }
 
-    let make_side = |i: usize| -> Option<(f32, Color, String)> {
+    let make_side = |i: usize| -> Option<(f32, Color)> {
         let style_val = side_style[i].as_deref().or(sh_style.as_deref()).unwrap_or("none");
         if style_val == "none" || style_val == "hidden" {
             return None;
         }
         let w = side_width[i].or(sh_width).unwrap_or(1.0);
         let c = side_color[i].or(sh_color).unwrap_or(Color::BLACK);
-        if w > 0.0 { Some((w, c, style_val.to_string())) } else { None }
+        if w > 0.0 { Some((w, c)) } else { None }
     };
 
     BorderSides {
@@ -1712,18 +1127,6 @@ fn extract_form_field(style: &nova_mod_api::content::StyleMap) -> Option<(String
     field_type.map(|ft| (ft, value))
 }
 
-/// Extract the placeholder text from a style map (set by mod-layout for form inputs).
-fn extract_placeholder(style: &nova_mod_api::content::StyleMap) -> String {
-    for (key, value) in &style.properties {
-        if key == "nova-placeholder" {
-            if let StyleValue::Str(s) | StyleValue::Keyword(s) = value {
-                return s.clone();
-            }
-        }
-    }
-    String::new()
-}
-
 /// Check if the element has `position: sticky`.
 fn is_position_sticky(style: &nova_mod_api::content::StyleMap) -> bool {
     for (key, value) in &style.properties {
@@ -1734,24 +1137,6 @@ fn is_position_sticky(style: &nova_mod_api::content::StyleMap) -> bool {
         }
     }
     false
-}
-
-/// Extract the `top` value for a sticky element (defaults to 0).
-fn extract_sticky_top(style: &nova_mod_api::content::StyleMap) -> f32 {
-    for (key, value) in &style.properties {
-        if key == "top" {
-            match value {
-                StyleValue::Px(px) => return *px,
-                StyleValue::Str(s) | StyleValue::Keyword(s) => {
-                    if let Some(px) = parse_length_px(s) {
-                        return px;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    0.0
 }
 
 /// Check if the element has `position: fixed`.
@@ -1766,8 +1151,8 @@ fn is_position_fixed(style: &nova_mod_api::content::StyleMap) -> bool {
     false
 }
 
-/// Extract the `top` value for a fixed-position element (defaults to 0).
-fn extract_fixed_top(style: &nova_mod_api::content::StyleMap) -> f32 {
+/// Extract the `top` value for a sticky element (defaults to 0).
+fn extract_sticky_top(style: &nova_mod_api::content::StyleMap) -> f32 {
     for (key, value) in &style.properties {
         if key == "top" {
             match value {
@@ -1794,131 +1179,6 @@ fn extract_font_size(style: &nova_mod_api::content::StyleMap) -> f32 {
         }
     }
     16.0
-}
-
-/// Extract the `background-repeat` CSS value. Defaults to "repeat".
-fn extract_background_repeat(style: &nova_mod_api::content::StyleMap) -> &'static str {
-    for (key, value) in &style.properties {
-        if key == "background-repeat" {
-            let val = match value {
-                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
-                _ => continue,
-            };
-            return match val.trim() {
-                "no-repeat" => "no-repeat",
-                "repeat-x" => "repeat-x",
-                "repeat-y" => "repeat-y",
-                "repeat" => "repeat",
-                _ => "repeat",
-            };
-        }
-    }
-    "repeat"
-}
-
-/// Extract the `background-position` CSS value as (x_fraction, y_fraction) in 0.0-1.0.
-/// Defaults to (0.0, 0.0) (top-left).
-fn extract_background_position(style: &nova_mod_api::content::StyleMap) -> (f32, f32) {
-    for (key, value) in &style.properties {
-        if key == "background-position" {
-            let val = match value {
-                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
-                _ => continue,
-            };
-            let val = val.trim();
-            let parts: Vec<&str> = val.split_whitespace().collect();
-
-            let parse_pos = |s: &str| -> f32 {
-                match s {
-                    "left" | "top" => 0.0,
-                    "center" => 0.5,
-                    "right" | "bottom" => 1.0,
-                    _ => {
-                        if let Some(pct) = s.strip_suffix('%') {
-                            pct.trim().parse::<f32>().unwrap_or(0.0) / 100.0
-                        } else {
-                            0.0
-                        }
-                    }
-                }
-            };
-
-            return match parts.len() {
-                1 => {
-                    let v = parse_pos(parts[0]);
-                    (v, v)
-                }
-                _ => {
-                    (parse_pos(parts[0]), parse_pos(parts[1]))
-                }
-            };
-        }
-    }
-    (0.0, 0.0)
-}
-
-/// Extract the `background-size` CSS value.
-/// Returns the computed (width, height) in pixels for the background image.
-/// Special values `cover` and `contain` are resolved against the box and image dimensions.
-fn extract_background_size(
-    style: &nova_mod_api::content::StyleMap,
-    box_w: f32,
-    box_h: f32,
-    img_w: f32,
-    img_h: f32,
-) -> (f32, f32) {
-    for (key, value) in &style.properties {
-        if key == "background-size" {
-            let val = match value {
-                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
-                _ => continue,
-            };
-            let val = val.trim();
-            match val {
-                "cover" => {
-                    if img_w <= 0.0 || img_h <= 0.0 { return (box_w, box_h); }
-                    let ratio_w = box_w / img_w;
-                    let ratio_h = box_h / img_h;
-                    let scale = ratio_w.max(ratio_h);
-                    return (img_w * scale, img_h * scale);
-                }
-                "contain" => {
-                    if img_w <= 0.0 || img_h <= 0.0 { return (box_w, box_h); }
-                    let ratio_w = box_w / img_w;
-                    let ratio_h = box_h / img_h;
-                    let scale = ratio_w.min(ratio_h);
-                    return (img_w * scale, img_h * scale);
-                }
-                "auto" => {
-                    return (img_w, img_h);
-                }
-                _ => {
-                    let parts: Vec<&str> = val.split_whitespace().collect();
-                    let parse_size = |s: &str, reference: f32, img_dim: f32| -> f32 {
-                        if s == "auto" { return img_dim; }
-                        if let Some(pct) = s.strip_suffix('%') {
-                            return pct.trim().parse::<f32>().unwrap_or(100.0) / 100.0 * reference;
-                        }
-                        parse_length_px(s).unwrap_or(img_dim)
-                    };
-                    match parts.len() {
-                        1 => {
-                            let w = parse_size(parts[0], box_w, img_w);
-                            let h = if img_w > 0.0 { w * img_h / img_w } else { img_h };
-                            return (w, h);
-                        }
-                        _ => {
-                            return (
-                                parse_size(parts[0], box_w, img_w),
-                                parse_size(parts[1], box_h, img_h),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-    (img_w, img_h)
 }
 
 /// Extract `background-image` CSS value from a style map.
@@ -2086,142 +1346,6 @@ fn interpolate_gradient(stops: &[(f32, Color)], t: f32) -> Color {
         }
     }
     stops.last().unwrap().1
-}
-
-// ---------------------------------------------------------------------------
-// CSS filter support
-// ---------------------------------------------------------------------------
-
-/// Represents color transform effects from CSS `filter`.
-struct FilterEffect {
-    grayscale: bool,
-    brightness: f32,
-    invert: bool,
-}
-
-/// Extract CSS filter effects from style and return an opacity multiplier
-/// and color transform.
-fn extract_css_filter(style: &nova_mod_api::content::StyleMap) -> (f32, Option<FilterEffect>) {
-    for (key, value) in &style.properties {
-        if key == "filter" {
-            let s = match value {
-                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
-                _ => continue,
-            };
-            if s.trim() == "none" { return (1.0, None); }
-
-            let mut opacity_mult = 1.0_f32;
-            let mut grayscale = false;
-            let mut brightness = 1.0_f32;
-            let mut invert = false;
-
-            // Parse filter functions
-            let mut remaining = s;
-            while let Some(paren) = remaining.find('(') {
-                let func = remaining[..paren].trim();
-                let func = func.rsplit_once(|c: char| c.is_whitespace()).map(|(_, n)| n).unwrap_or(func);
-                let after = &remaining[paren + 1..];
-                let Some(close) = after.find(')') else { break };
-                let arg = &after[..close];
-                remaining = &after[close + 1..];
-
-                match func {
-                    "opacity" => {
-                        if let Some(v) = arg.trim().strip_suffix('%') {
-                            opacity_mult *= v.trim().parse::<f32>().unwrap_or(100.0) / 100.0;
-                        } else if let Ok(v) = arg.trim().parse::<f32>() {
-                            opacity_mult *= v;
-                        }
-                    }
-                    "brightness" => {
-                        if let Some(v) = arg.trim().strip_suffix('%') {
-                            brightness = v.trim().parse::<f32>().unwrap_or(100.0) / 100.0;
-                        } else if let Ok(v) = arg.trim().parse::<f32>() {
-                            brightness = v;
-                        }
-                    }
-                    "grayscale" => {
-                        if let Some(v) = arg.trim().strip_suffix('%') {
-                            if v.trim().parse::<f32>().unwrap_or(0.0) > 50.0 { grayscale = true; }
-                        } else if let Ok(v) = arg.trim().parse::<f32>() {
-                            if v > 0.5 { grayscale = true; }
-                        }
-                    }
-                    "invert" => {
-                        if let Some(v) = arg.trim().strip_suffix('%') {
-                            if v.trim().parse::<f32>().unwrap_or(0.0) > 50.0 { invert = true; }
-                        } else if let Ok(v) = arg.trim().parse::<f32>() {
-                            if v > 0.5 { invert = true; }
-                        }
-                    }
-                    _ => {} // blur, drop-shadow, etc. — skip for now
-                }
-            }
-
-            let effect = if grayscale || brightness != 1.0 || invert {
-                Some(FilterEffect { grayscale, brightness, invert })
-            } else {
-                None
-            };
-            return (opacity_mult, effect);
-        }
-    }
-    (1.0, None)
-}
-
-/// Apply a `FilterEffect` to a color (invert, brightness, grayscale).
-fn apply_filter_to_color(color: Color, filter: &FilterEffect) -> Color {
-    let mut r = color.r;
-    let mut g = color.g;
-    let mut b = color.b;
-
-    if filter.invert {
-        r = 1.0 - r;
-        g = 1.0 - g;
-        b = 1.0 - b;
-    }
-
-    r *= filter.brightness;
-    g *= filter.brightness;
-    b *= filter.brightness;
-
-    if filter.grayscale {
-        let gray = r * 0.299 + g * 0.587 + b * 0.114;
-        r = gray;
-        g = gray;
-        b = gray;
-    }
-
-    Color::rgba(r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0), color.a)
-}
-
-// ---------------------------------------------------------------------------
-// CSS clip-path support
-// ---------------------------------------------------------------------------
-
-/// Extract a `clip-path: inset(...)` value and return `(top, right, bottom, left)` insets in px.
-fn extract_clip_path(style: &nova_mod_api::content::StyleMap) -> Option<(f32, f32, f32, f32)> {
-    for (key, value) in &style.properties {
-        if key == "clip-path" {
-            let s = match value {
-                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
-                _ => continue,
-            };
-            if let Some(inner) = s.strip_prefix("inset(").and_then(|s| s.strip_suffix(')')) {
-                let parts: Vec<f32> = inner.split_whitespace()
-                    .filter_map(|p| p.strip_suffix("px").and_then(|n| n.parse().ok())
-                        .or_else(|| p.parse().ok()))
-                    .collect();
-                match parts.len() {
-                    1 => return Some((parts[0], parts[0], parts[0], parts[0])),
-                    2 => return Some((parts[0], parts[1], parts[0], parts[1])),
-                    4 => return Some((parts[0], parts[1], parts[2], parts[3])),
-                    _ => {}
-                }
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -2432,22 +1556,11 @@ mod tests {
         let mut ops = Vec::new();
         paint_box(&layout, &mut ops, &HashMap::new());
 
-        // With blur > 0, box-shadow is now rendered as multiple FillRect ops
-        // (concentric expanding rects) before the background FillRect.
-        // The first FillRect should be a shadow rect (small alpha), and the
-        // background FillRect (white, alpha=1) should come after all shadow rects.
-        let first_fill = ops.iter().position(|op| matches!(op, RenderOp::FillRect { .. }));
-        assert!(first_fill.is_some(), "should emit FillRect ops for shadow blur");
-        // The background (white, alpha ~1.0) should exist somewhere after the shadow rects.
-        let bg_pos = ops.iter().position(|op| {
-            if let RenderOp::FillRect { color, .. } = op {
-                color.a > 0.9 && color.r > 0.9 && color.g > 0.9 && color.b > 0.9
-            } else {
-                false
-            }
-        });
+        let shadow_pos = ops.iter().position(|op| matches!(op, RenderOp::BoxShadow { .. }));
+        let bg_pos = ops.iter().position(|op| matches!(op, RenderOp::FillRect { .. }));
+        assert!(shadow_pos.is_some(), "should emit a BoxShadow op");
         assert!(bg_pos.is_some(), "should emit a FillRect for the background");
-        assert!(first_fill.unwrap() < bg_pos.unwrap(), "shadow rects must come before background");
+        assert!(shadow_pos.unwrap() < bg_pos.unwrap(), "shadow must come before background");
     }
 
     #[test]
@@ -2568,14 +1681,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_hsl_color_in_painter() {
-        let c = parse_color_string("hsl(0, 100%, 50%)").unwrap();
-        assert!((c.r - 1.0).abs() < 0.01); // red
-        assert!(c.g < 0.01);
-        assert!(c.b < 0.01);
-    }
-
-    #[test]
     fn font_family_passed_in_draw_text_op() {
         let mut style = StyleMap::default();
         style.properties.push((
@@ -2601,154 +1706,109 @@ mod tests {
         assert!(has_family, "DrawText should carry font_family = Some(\"CustomFont\")");
     }
 
+    // ── Phase 4: CSS Positioning + Transforms tests ────────────────────
+
     #[test]
-    fn background_repeat_no_repeat() {
+    fn fixed_position_emits_fixed_ops() {
         let mut style = StyleMap::default();
-        style.properties.push(("background-repeat".into(), StyleValue::Keyword("no-repeat".into())));
-        assert_eq!(extract_background_repeat(&style), "no-repeat");
-    }
+        style.properties.push(("position".into(), StyleValue::Keyword("fixed".into())));
+        style.properties.push(("background-color".into(), StyleValue::Str("blue".into())));
 
-    #[test]
-    fn background_position_center() {
-        let mut style = StyleMap::default();
-        style.properties.push(("background-position".into(), StyleValue::Keyword("center".into())));
-        let (x, y) = extract_background_position(&style);
-        assert!((x - 0.5).abs() < 0.01);
-        assert!((y - 0.5).abs() < 0.01);
-    }
-
-    #[test]
-    fn background_size_contain() {
-        let mut style = StyleMap::default();
-        style.properties.push(("background-size".into(), StyleValue::Keyword("contain".into())));
-        let (w, h) = extract_background_size(&style, 200.0, 100.0, 400.0, 200.0);
-        // contain: min(200/400, 100/200) = 0.5, so 200x100
-        assert!((w - 200.0).abs() < 0.01);
-        assert!((h - 100.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn background_size_cover() {
-        let mut style = StyleMap::default();
-        style.properties.push(("background-size".into(), StyleValue::Keyword("cover".into())));
-        let (w, h) = extract_background_size(&style, 200.0, 100.0, 100.0, 100.0);
-        // cover: max(200/100, 100/100) = 2.0, so 200x200
-        assert!((w - 200.0).abs() < 0.01);
-        assert!((h - 200.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn text_overflow_ellipsis_truncates() {
-        let result = truncate_with_ellipsis("Hello, World! This is a very long text", 16.0, 100.0);
-        assert!(result.ends_with("..."), "should end with ellipsis: {result}");
-        assert!(result.len() < "Hello, World! This is a very long text".len());
-    }
-
-    #[test]
-    fn text_overflow_short_text_unchanged() {
-        let result = truncate_with_ellipsis("Hi", 16.0, 200.0);
-        assert_eq!(result, "Hi");
-    }
-
-    // --- Stacking context tests ---
-
-    #[test]
-    fn stacking_context_detected_for_opacity() {
-        let mut style = StyleMap::default();
-        style.properties.push(("opacity".into(), StyleValue::Number(0.5)));
-        assert!(creates_stacking_context(&style));
-    }
-
-    #[test]
-    fn stacking_context_not_created_for_static_z_index() {
-        let mut style = StyleMap::default();
-        style.properties.push(("z-index".into(), StyleValue::Number(5.0)));
-        // No position set (default is static) — should NOT create stacking context.
-        assert!(!creates_stacking_context(&style));
-    }
-
-    #[test]
-    fn stacking_context_for_positioned_z_index() {
-        let mut style = StyleMap::default();
-        style.properties.push(("z-index".into(), StyleValue::Number(5.0)));
-        style.properties.push(("position".into(), StyleValue::Keyword("relative".into())));
-        assert!(creates_stacking_context(&style));
-    }
-
-    #[test]
-    fn segments_produce_colored_draw_text() {
-        // A text node with nova-text-segments should produce multiple DrawText
-        // ops with different colors.
-        let mut style = StyleMap::default();
-        style.properties.push(("font-size".into(), StyleValue::Px(16.0)));
-        style.properties.push(("color".into(), StyleValue::Str("#000000".into())));
-        // Segments: "Hello " (0:6) is black, "world" (6:11) is blue.
-        style.properties.push((
-            "nova-text-segments".into(),
-            StyleValue::Str("0:6:0:#000000::;6:11:50:#0000ee::underline".into()),
-        ));
         let layout = LayoutBox {
-            x: 0.0, y: 0.0, width: 200.0, height: 20.0,
-            content: LayoutContent::Text("Hello world".into()),
+            x: 0.0, y: 0.0, width: 800.0, height: 50.0,
+            content: LayoutContent::Block,
             style,
             children: vec![],
             z_index: 0,
         };
         let mut ops = Vec::new();
         paint_box(&layout, &mut ops, &HashMap::new());
-
-        // Should have at least 2 DrawText ops (one per segment).
-        let draw_texts: Vec<_> = ops.iter().filter(|op| matches!(op, RenderOp::DrawText { .. })).collect();
         assert!(
-            draw_texts.len() >= 2,
-            "should have at least 2 DrawText ops for 2 segments, got {}",
-            draw_texts.len()
+            ops.iter().any(|op| matches!(op, RenderOp::FixedPosition { .. })),
+            "position: fixed should emit FixedPosition op"
         );
-
-        // Check that one of them has blue color.
-        let has_blue = ops.iter().any(|op| {
-            if let RenderOp::DrawText { color, .. } = op {
-                color.b > 0.8 && color.r < 0.1 && color.g < 0.1
-            } else {
-                false
-            }
-        });
-        assert!(has_blue, "one DrawText should have blue color for the link segment");
-
-        // Check that there's an underline (FillRect) for the link segment.
-        let has_underline = ops.iter().any(|op| matches!(op, RenderOp::FillRect { .. }));
-        assert!(has_underline, "should have FillRect for underline");
+        assert!(
+            ops.iter().any(|op| matches!(op, RenderOp::FixedPositionEnd)),
+            "position: fixed should emit FixedPositionEnd op"
+        );
     }
 
     #[test]
-    fn single_style_link_text_has_color() {
-        // A text node with only link color (no segments needed) should use that color.
+    fn transform_translate_emits_transform_op() {
         let mut style = StyleMap::default();
-        style.properties.push(("font-size".into(), StyleValue::Px(16.0)));
-        style.properties.push(("color".into(), StyleValue::Str("#0000ee".into())));
-        style.properties.push(("text-decoration".into(), StyleValue::Keyword("underline".into())));
+        style.properties.push(("transform".into(), StyleValue::Str("translate(10px, 20px) scale(2)".into())));
+        style.properties.push(("background-color".into(), StyleValue::Str("red".into())));
+
         let layout = LayoutBox {
-            x: 0.0, y: 0.0, width: 200.0, height: 20.0,
-            content: LayoutContent::Text("Link Text".into()),
+            x: 0.0, y: 0.0, width: 100.0, height: 50.0,
+            content: LayoutContent::Block,
             style,
             children: vec![],
             z_index: 0,
         };
         let mut ops = Vec::new();
         paint_box(&layout, &mut ops, &HashMap::new());
+        assert!(
+            ops.iter().any(|op| matches!(op, RenderOp::Transform { .. })),
+            "non-identity transform should emit Transform op"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, RenderOp::TransformEnd)),
+            "transform should emit TransformEnd op"
+        );
+    }
 
-        // Check that the DrawText has blue color.
-        let has_blue = ops.iter().any(|op| {
-            if let RenderOp::DrawText { color, .. } = op {
-                color.b > 0.8 && color.r < 0.1 && color.g < 0.1
-            } else {
-                false
-            }
-        });
-        assert!(has_blue, "DrawText should have blue color for link text");
+    #[test]
+    fn transform_matrix_identity() {
+        let t = CssTransform::default();
+        let m = t.to_matrix();
+        // Identity: [1, 0, 0, 1, 0, 0]
+        assert!((m[0] - 1.0).abs() < 0.001);
+        assert!((m[1] - 0.0).abs() < 0.001);
+        assert!((m[2] - 0.0).abs() < 0.001);
+        assert!((m[3] - 1.0).abs() < 0.001);
+        assert!((m[4] - 0.0).abs() < 0.001);
+        assert!((m[5] - 0.0).abs() < 0.001);
+    }
 
-        // Check underline.
-        let has_underline = ops.iter().any(|op| matches!(op, RenderOp::FillRect { .. }));
-        assert!(has_underline, "should have FillRect for underline");
+    #[test]
+    fn transform_matrix_translate() {
+        let t = CssTransform { translate_x: 10.0, translate_y: 20.0, ..CssTransform::default() };
+        let m = t.to_matrix();
+        assert!((m[4] - 10.0).abs() < 0.001, "tx should be 10, got {}", m[4]);
+        assert!((m[5] - 20.0).abs() < 0.001, "ty should be 20, got {}", m[5]);
+    }
+
+    #[test]
+    fn transform_matrix_scale() {
+        let t = CssTransform { scale_x: 2.0, scale_y: 3.0, ..CssTransform::default() };
+        let m = t.to_matrix();
+        assert!((m[0] - 2.0).abs() < 0.001, "a should be 2 for scaleX=2, got {}", m[0]);
+        assert!((m[3] - 3.0).abs() < 0.001, "d should be 3 for scaleY=3, got {}", m[3]);
+    }
+
+    #[test]
+    fn transform_matrix_rotate_90() {
+        let t = CssTransform { rotate_deg: 90.0, ..CssTransform::default() };
+        let m = t.to_matrix();
+        // rotate(90deg): a=cos(90)=0, b=sin(90)=1, c=-sin(90)=-1, d=cos(90)=0
+        assert!(m[0].abs() < 0.001, "a should be ~0 for 90deg rotation, got {}", m[0]);
+        assert!((m[1] - 1.0).abs() < 0.001, "b should be ~1 for 90deg rotation, got {}", m[1]);
+        assert!((m[2] + 1.0).abs() < 0.001, "c should be ~-1 for 90deg rotation, got {}", m[2]);
+        assert!(m[3].abs() < 0.001, "d should be ~0 for 90deg rotation, got {}", m[3]);
+    }
+
+    #[test]
+    fn parse_transform_scale_xy() {
+        let t = parse_transform("scaleX(2) scaleY(0.5)").unwrap();
+        assert!((t.scale_x - 2.0).abs() < 0.001);
+        assert!((t.scale_y - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_transform_matrix_function() {
+        let t = parse_transform("matrix(1, 0, 0, 1, 50, 100)").unwrap();
+        assert!((t.translate_x - 50.0).abs() < 0.001);
+        assert!((t.translate_y - 100.0).abs() < 0.001);
     }
 }

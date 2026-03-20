@@ -20,7 +20,9 @@ use winit::{
 use nova_core::NovaCore;
 use nova_mod_api::{Color, RenderCommands, RenderOp, TypedData, Viewport};
 
+use crate::history::HistoryStack;
 use crate::renderer::Framebuffer;
+use crate::tab::{Tab, TabManager};
 
 /// Height of the URL bar area in logical pixels.
 const URL_BAR_HEIGHT: f32 = 40.0;
@@ -30,6 +32,15 @@ const URL_BAR_FONT_SIZE: f32 = 14.0;
 const URL_BAR_PADDING: f32 = 8.0;
 /// Height of the text input field inside the URL bar.
 const URL_INPUT_HEIGHT: f32 = 28.0;
+
+/// Height of the tab bar area in logical pixels.
+const TAB_BAR_HEIGHT: f32 = 30.0;
+/// Width of the back navigation button.
+const BACK_BUTTON_WIDTH: f32 = 30.0;
+/// Width of the forward navigation button.
+const FORWARD_BUTTON_WIDTH: f32 = 30.0;
+/// Total height of the chrome area (URL bar + tab bar).
+const CHROME_HEIGHT: f32 = URL_BAR_HEIGHT + TAB_BAR_HEIGHT;
 
 /// Pixels scrolled per mouse wheel tick.
 const SCROLL_STEP: f32 = 40.0;
@@ -44,12 +55,17 @@ const PAGE_SCROLL_FRACTION: f32 = 0.9;
 
 /// A rectangular region on the page that is clickable (e.g. a link).
 #[derive(Debug, Clone)]
-struct HitRegion {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    url: String,
+pub struct HitRegion {
+    /// X position in page coordinates.
+    pub x: f32,
+    /// Y position in page coordinates.
+    pub y: f32,
+    /// Width of the hit region.
+    pub width: f32,
+    /// Height of the hit region.
+    pub height: f32,
+    /// URL this region links to.
+    pub url: String,
 }
 
 impl HitRegion {
@@ -59,39 +75,21 @@ impl HitRegion {
     }
 }
 
-/// A scrollable container region on the page.
-#[derive(Debug, Clone)]
-struct ScrollRegion {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    content_height: f32,
-    scroll_offset: f32,
-}
-
-impl ScrollRegion {
-    /// Test whether a point (in page coordinates) falls inside this region.
-    fn contains(&self, px: f32, py: f32) -> bool {
-        px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
-    }
-
-    /// Clamp scroll offset to valid range.
-    fn clamp_scroll(&mut self) {
-        let max = (self.content_height - self.height).max(0.0);
-        self.scroll_offset = self.scroll_offset.clamp(0.0, max);
-    }
-}
-
 /// An interactive form field region on the page.
 #[derive(Debug, Clone)]
-struct FormFieldRegion {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    value: String,
-    field_type: String,
+pub struct FormFieldRegion {
+    /// X position in page coordinates.
+    pub x: f32,
+    /// Y position in page coordinates.
+    pub y: f32,
+    /// Width of the form field.
+    pub width: f32,
+    /// Height of the form field.
+    pub height: f32,
+    /// Current value of the field.
+    pub value: String,
+    /// Type of the field (e.g., "text", "password").
+    pub field_type: String,
 }
 
 impl FormFieldRegion {
@@ -110,11 +108,6 @@ struct GpuState {
     blit_pipeline: wgpu::RenderPipeline,
     blit_bind_group_layout: wgpu::BindGroupLayout,
     blit_sampler: wgpu::Sampler,
-    /// Cached framebuffer texture — reused across frames to avoid re-creating
-    /// the GPU texture every frame. Re-created only when the framebuffer size changes.
-    cached_fb_texture: Option<wgpu::Texture>,
-    /// Cached bind group corresponding to `cached_fb_texture`.
-    cached_bind_group: Option<wgpu::BindGroup>,
 }
 
 /// The browser window application.
@@ -122,10 +115,13 @@ pub struct BrowserWindow {
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
     framebuffer: Framebuffer,
-    render_commands: RenderCommands,
     title: String,
     width: u32,
     height: u32,
+
+    // -- Tab management --
+    /// Manages all open tabs and the active tab.
+    tab_manager: TabManager,
 
     // -- URL bar state --
     /// Current text in the URL bar.
@@ -143,27 +139,11 @@ pub struct BrowserWindow {
     /// URL to navigate to when the user presses Enter. Returned from `run()`.
     pending_navigation: Option<String>,
 
-    // -- Scrolling state --
-    /// Current vertical scroll offset in pixels (0 = top of page).
-    scroll_y: f32,
-    /// Current horizontal scroll offset in pixels (0 = left of page).
-    scroll_x: f32,
-    /// Total height of the rendered content in pixels.
-    content_height: f32,
-    /// Total width of the rendered content in pixels.
-    content_width: f32,
-    /// Per-container scroll regions (from `ScrollContainerStart` ops).
-    scroll_regions: Vec<ScrollRegion>,
-
     // -- Form field interaction state --
-    /// Interactive form field regions extracted from `RenderOp::FormField` ops.
-    form_fields: Vec<FormFieldRegion>,
     /// Index of the currently focused form field, or None.
     focused_field: Option<usize>,
 
     // -- Link interaction state --
-    /// Clickable link regions extracted from `RenderOp::Link` ops.
-    hit_regions: Vec<HitRegion>,
     /// URL of the last clicked link (for diagnostics / future navigation).
     last_clicked_url: Option<String>,
 
@@ -174,14 +154,6 @@ pub struct BrowserWindow {
     tokio_handle: tokio::runtime::Handle,
     /// Viewport dimensions for navigation.
     viewport: Viewport,
-
-    // -- Animation state --
-    /// When `true`, the window requests periodic redraws (~60 fps) for animations.
-    /// Set this to `true` when the page contains CSS animations or transitions.
-    needs_animation: bool,
-    /// Instant when the last page load completed. Used to drive a 2-second
-    /// animation window after navigation (e.g. fade-in, smooth scrollbar).
-    page_load_time: Option<std::time::Instant>,
 }
 
 impl BrowserWindow {
@@ -199,7 +171,6 @@ impl BrowserWindow {
     ) -> Self {
         let hit_regions = Self::extract_hit_regions(&commands);
         let form_fields = Self::extract_form_fields(&commands);
-        let scroll_regions = Self::extract_scroll_regions(&commands);
         let content_height = Self::compute_content_height(&commands);
         let content_width = Self::compute_content_width(&commands);
         let fb = Framebuffer::new(width, height);
@@ -210,14 +181,30 @@ impl BrowserWindow {
             scale_factor: 1.0,
         };
 
+        let initial_tab = Tab {
+            id: 0,
+            url: initial_url.to_string(),
+            title: initial_url.to_string(),
+            render_commands: commands,
+            scroll_y: 0.0,
+            scroll_x: 0.0,
+            content_height,
+            content_width,
+            hit_regions,
+            form_fields,
+            history: HistoryStack::new(initial_url),
+        };
+
+        let tab_manager = TabManager::new(initial_tab);
+
         Self {
             window: None,
             gpu: None,
             framebuffer: fb,
-            render_commands: commands,
             title: title.to_string(),
             width,
             height,
+            tab_manager,
             url_bar_text: initial_url.to_string(),
             url_bar_focused: false,
             url_bar_cursor: initial_url.len(),
@@ -225,20 +212,11 @@ impl BrowserWindow {
             cursor_x: 0.0,
             cursor_y: 0.0,
             pending_navigation: None,
-            scroll_y: 0.0,
-            scroll_x: 0.0,
-            content_height,
-            content_width,
-            scroll_regions,
-            form_fields,
             focused_field: None,
-            hit_regions,
             last_clicked_url: None,
             core,
             tokio_handle,
             viewport,
-            needs_animation: false,
-            page_load_time: None,
         }
     }
 
@@ -257,35 +235,6 @@ impl BrowserWindow {
                         width: *width,
                         height: *height,
                         url: url.clone(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    /// Extract scroll container regions from render commands.
-    fn extract_scroll_regions(commands: &RenderCommands) -> Vec<ScrollRegion> {
-        commands
-            .ops
-            .iter()
-            .filter_map(|op| {
-                if let RenderOp::ScrollContainerStart {
-                    x,
-                    y,
-                    width,
-                    height,
-                    content_height,
-                } = op
-                {
-                    Some(ScrollRegion {
-                        x: *x,
-                        y: *y,
-                        width: *width,
-                        height: *height,
-                        content_height: *content_height,
-                        scroll_offset: 0.0,
                     })
                 } else {
                     None
@@ -351,14 +300,14 @@ impl BrowserWindow {
         max_x
     }
 
-    /// Clamp `scroll_y` to the valid range `[0, max_scroll]`.
+    /// Clamp scroll offsets of the active tab to valid ranges.
     fn clamp_scroll(&mut self) {
-        let page_viewport = (self.height as f32 - URL_BAR_HEIGHT).max(0.0);
-        let max_scroll = (self.content_height - page_viewport).max(0.0);
-        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
-        // Clamp horizontal scroll.
-        let max_scroll_x = (self.content_width - self.width as f32).max(0.0);
-        self.scroll_x = self.scroll_x.clamp(0.0, max_scroll_x);
+        let tab = self.tab_manager.active_tab_mut();
+        let page_viewport = (self.height as f32 - CHROME_HEIGHT).max(0.0);
+        let max_scroll = (tab.content_height - page_viewport).max(0.0);
+        tab.scroll_y = tab.scroll_y.clamp(0.0, max_scroll);
+        let max_scroll_x = (tab.content_width - self.width as f32).max(0.0);
+        tab.scroll_x = tab.scroll_x.clamp(0.0, max_scroll_x);
     }
 
     // -- Link interaction helpers -------------------------------------------
@@ -369,15 +318,16 @@ impl BrowserWindow {
     /// Window coordinates are translated to page coordinates by subtracting
     /// the URL bar offset and adding the scroll offset.
     fn hit_test(&self, win_x: f64, win_y: f64) -> Option<&str> {
-        // Only test if the cursor is below the URL bar.
-        if (win_y as f32) <= URL_BAR_HEIGHT {
+        // Only test if the cursor is below the chrome area.
+        if (win_y as f32) <= CHROME_HEIGHT {
             return None;
         }
 
-        let page_x = win_x as f32 + self.scroll_x;
-        let page_y = (win_y as f32 - URL_BAR_HEIGHT) + self.scroll_y;
+        let tab = self.tab_manager.active_tab();
+        let page_x = win_x as f32 + tab.scroll_x;
+        let page_y = (win_y as f32 - CHROME_HEIGHT) + tab.scroll_y;
 
-        for region in &self.hit_regions {
+        for region in &tab.hit_regions {
             if region.contains(page_x, page_y) {
                 return Some(&region.url);
             }
@@ -535,42 +485,46 @@ impl BrowserWindow {
             blit_pipeline: pipeline,
             blit_bind_group_layout: bind_group_layout,
             blit_sampler: sampler,
-            cached_fb_texture: None,
-            cached_bind_group: None,
         });
 
         info!("GPU initialized, surface format: {:?}", format);
         Ok(())
     }
 
-    /// Render the full frame: URL bar + scrolled page content + scrollbar.
+    /// Render the full frame: URL bar + tab bar + scrolled page content + scrollbar.
     fn rebuild_framebuffer(&mut self) {
         self.framebuffer.reset(self.width, self.height);
 
-        // Render page content shifted down by the URL bar and by scroll offset.
+        let tab = self.tab_manager.active_tab();
+
+        // Render page content shifted down by the chrome area and by scroll offset.
         self.framebuffer.render_scrolled(
-            &self.render_commands,
-            URL_BAR_HEIGHT,
-            self.scroll_x,
-            self.scroll_y,
-            self.content_height,
+            &tab.render_commands,
+            CHROME_HEIGHT,
+            tab.scroll_x,
+            tab.scroll_y,
+            tab.content_height,
         );
 
         // Draw focus ring on the focused form field (if any).
         if let Some(idx) = self.focused_field {
-            if let Some(field) = self.form_fields.get(idx) {
-                let fx = field.x - self.scroll_x;
-                let fy = field.y + URL_BAR_HEIGHT - self.scroll_y;
+            let tab = self.tab_manager.active_tab();
+            if let Some(field) = tab.form_fields.get(idx) {
+                let fx = field.x - tab.scroll_x;
+                let fy = field.y + CHROME_HEIGHT - tab.scroll_y;
                 let focus_color = Color { r: 0.26, g: 0.52, b: 0.96, a: 1.0 };
                 self.framebuffer.stroke_rect(fx - 1.0, fy - 1.0, field.width + 2.0, field.height + 2.0, focus_color, 2.0);
             }
         }
 
-        // Draw the URL bar on top (overwrites the top region, not affected by scroll).
+        // Draw the chrome on top (URL bar + tab bar, not affected by scroll).
         self.draw_url_bar();
+        self.draw_tab_bar();
     }
 
     /// Draw the URL bar chrome at the top of the framebuffer.
+    ///
+    /// Includes back/forward navigation buttons before the URL input field.
     fn draw_url_bar(&mut self) {
         let w = self.width as f32;
 
@@ -594,10 +548,48 @@ impl BrowserWindow {
         self.framebuffer
             .fill_rect(0.0, URL_BAR_HEIGHT - 1.0, w, 1.0, border_color);
 
+        // -- Back / Forward buttons --
+        let can_back = self.tab_manager.active_tab().history.can_go_back();
+        let can_fwd = self.tab_manager.active_tab().history.can_go_forward();
+
+        let btn_y = (URL_BAR_HEIGHT - URL_INPUT_HEIGHT) / 2.0;
+        let btn_h = URL_INPUT_HEIGHT;
+
+        // Back button.
+        let back_color = if can_back {
+            Color { r: 0.2, g: 0.2, b: 0.2, a: 1.0 }
+        } else {
+            Color { r: 0.7, g: 0.7, b: 0.7, a: 1.0 }
+        };
+        self.framebuffer.draw_text(
+            URL_BAR_PADDING + 6.0,
+            btn_y + (btn_h - URL_BAR_FONT_SIZE) / 2.0,
+            "\u{25C0}",
+            URL_BAR_FONT_SIZE,
+            back_color,
+            None, None, None,
+        );
+
+        // Forward button.
+        let fwd_color = if can_fwd {
+            Color { r: 0.2, g: 0.2, b: 0.2, a: 1.0 }
+        } else {
+            Color { r: 0.7, g: 0.7, b: 0.7, a: 1.0 }
+        };
+        self.framebuffer.draw_text(
+            URL_BAR_PADDING + BACK_BUTTON_WIDTH + 6.0,
+            btn_y + (btn_h - URL_BAR_FONT_SIZE) / 2.0,
+            "\u{25B6}",
+            URL_BAR_FONT_SIZE,
+            fwd_color,
+            None, None, None,
+        );
+
         // -- Input field rectangle --
-        let input_x = URL_BAR_PADDING;
+        let nav_buttons_width = BACK_BUTTON_WIDTH + FORWARD_BUTTON_WIDTH;
+        let input_x = URL_BAR_PADDING + nav_buttons_width;
         let input_y = (URL_BAR_HEIGHT - URL_INPUT_HEIGHT) / 2.0;
-        let input_w = w - URL_BAR_PADDING * 2.0;
+        let input_w = w - URL_BAR_PADDING * 2.0 - nav_buttons_width;
 
         // White background for input field.
         self.framebuffer.fill_rect(
@@ -666,7 +658,7 @@ impl BrowserWindow {
         }
 
         self.framebuffer
-            .draw_text(text_x, text_y, &self.url_bar_text, URL_BAR_FONT_SIZE, text_color, None, None, None, None);
+            .draw_text(text_x, text_y, &self.url_bar_text, URL_BAR_FONT_SIZE, text_color, None, None, None);
 
         // -- Cursor (vertical line at the cursor position) --
         if self.url_bar_focused && !self.url_bar_select_all {
@@ -683,13 +675,77 @@ impl BrowserWindow {
         }
     }
 
+    /// Draw the tab bar between the URL bar and the page content.
+    fn draw_tab_bar(&mut self) {
+        let w = self.width as f32;
+        let tab_bar_y = URL_BAR_HEIGHT;
+
+        // Tab bar background.
+        let tab_bg = Color { r: 0.88, g: 0.88, b: 0.88, a: 1.0 };
+        self.framebuffer.fill_rect(0.0, tab_bar_y, w, TAB_BAR_HEIGHT, tab_bg);
+
+        // Bottom border.
+        let border_color = Color { r: 0.75, g: 0.75, b: 0.75, a: 1.0 };
+        self.framebuffer.fill_rect(0.0, tab_bar_y + TAB_BAR_HEIGHT - 1.0, w, 1.0, border_color);
+
+        let tab_count = self.tab_manager.tab_count();
+        let active_idx = self.tab_manager.active_index();
+        let max_tab_width: f32 = 180.0;
+        let tab_font_size: f32 = 12.0;
+
+        // Reserve space for the "+" button.
+        let plus_btn_width: f32 = 30.0;
+        let available_width = w - plus_btn_width;
+        let tab_width = (available_width / tab_count as f32).min(max_tab_width);
+
+        for (i, tab) in self.tab_manager.tabs().iter().enumerate() {
+            let tx = i as f32 * tab_width;
+            let ty = tab_bar_y;
+
+            // Active tab is lighter.
+            if i == active_idx {
+                let active_bg = Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+                self.framebuffer.fill_rect(tx, ty, tab_width, TAB_BAR_HEIGHT - 1.0, active_bg);
+            }
+
+            // Tab border (right side).
+            let sep = Color { r: 0.75, g: 0.75, b: 0.75, a: 1.0 };
+            self.framebuffer.fill_rect(tx + tab_width - 1.0, ty + 4.0, 1.0, TAB_BAR_HEIGHT - 8.0, sep);
+
+            // Tab title (truncated).
+            let title_text = if tab.title.len() > 20 {
+                format!("{}...", &tab.title[..17])
+            } else {
+                tab.title.clone()
+            };
+            let text_color = Color { r: 0.13, g: 0.13, b: 0.13, a: 1.0 };
+            let text_y = ty + (TAB_BAR_HEIGHT - tab_font_size) / 2.0;
+            self.framebuffer.draw_text(
+                tx + 6.0, text_y, &title_text, tab_font_size, text_color, None, None, None,
+            );
+
+            // Close button (x) — only if more than one tab.
+            if tab_count > 1 {
+                let close_x = tx + tab_width - 18.0;
+                let close_color = Color { r: 0.5, g: 0.5, b: 0.5, a: 1.0 };
+                self.framebuffer.draw_text(
+                    close_x, text_y, "\u{00D7}", tab_font_size, close_color, None, None, None,
+                );
+            }
+        }
+
+        // "+" button to add a new tab.
+        let plus_x = tab_count as f32 * tab_width;
+        let plus_color = Color { r: 0.4, g: 0.4, b: 0.4, a: 1.0 };
+        let plus_y = tab_bar_y + (TAB_BAR_HEIGHT - 14.0) / 2.0;
+        self.framebuffer.draw_text(
+            plus_x + 8.0, plus_y, "+", 14.0, plus_color, None, None, None,
+        );
+    }
+
     /// Upload the framebuffer to GPU and render it.
-    ///
-    /// Uses a cached GPU texture to avoid re-creating it every frame.
-    /// The pixel data is only re-uploaded when the framebuffer's `dirty` flag
-    /// is set (i.e. when the software renderer has produced new content).
-    fn render_frame(&mut self) {
-        let gpu = match &mut self.gpu {
+    fn render_frame(&self) {
+        let gpu = match &self.gpu {
             Some(g) => g,
             None => return,
         };
@@ -706,41 +762,38 @@ impl BrowserWindow {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let fb_width = self.framebuffer.width;
-        let fb_height = self.framebuffer.height;
-        let texture_size = wgpu::Extent3d {
-            width: fb_width,
-            height: fb_height,
-            depth_or_array_layers: 1,
-        };
-
-        // Check whether the cached texture needs to be (re-)created.
-        // This happens on the first frame or when the framebuffer size changes.
-        let needs_new_texture = match &gpu.cached_fb_texture {
-            Some(tex) => tex.width() != fb_width || tex.height() != fb_height,
-            None => true,
-        };
-
-        if needs_new_texture {
-            let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        // Create a texture from the framebuffer.
+        let fb_texture = gpu.device.create_texture_with_data(
+            &gpu.queue,
+            &wgpu::TextureDescriptor {
                 label: Some("framebuffer-texture"),
-                size: texture_size,
+                size: wgpu::Extent3d {
+                    width: self.framebuffer.width,
+                    height: self.framebuffer.height,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
-            });
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &self.framebuffer.pixels,
+        );
 
-            let tex_view = tex.create_view(&Default::default());
-            let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let fb_view = fb_texture.create_view(&Default::default());
+
+        let bind_group = gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("blit-bind-group"),
                 layout: &gpu.blit_bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&tex_view),
+                        resource: wgpu::BindingResource::TextureView(&fb_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -748,31 +801,6 @@ impl BrowserWindow {
                     },
                 ],
             });
-
-            gpu.cached_fb_texture = Some(tex);
-            gpu.cached_bind_group = Some(bind_group);
-            // Force upload since we have a brand-new texture.
-            self.framebuffer.dirty = true;
-        }
-
-        // Only re-upload pixel data when the framebuffer content has changed.
-        if self.framebuffer.dirty {
-            if let Some(tex) = &gpu.cached_fb_texture {
-                gpu.queue.write_texture(
-                    tex.as_image_copy(),
-                    &self.framebuffer.pixels,
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(fb_width * 4),
-                        rows_per_image: Some(fb_height),
-                    },
-                    texture_size,
-                );
-            }
-            self.framebuffer.dirty = false;
-        }
-
-        let bind_group = gpu.cached_bind_group.as_ref().unwrap();
 
         let mut encoder =
             gpu.device
@@ -795,7 +823,7 @@ impl BrowserWindow {
             });
 
             pass.set_pipeline(&gpu.blit_pipeline);
-            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..6, 0..1); // fullscreen quad = 2 triangles = 6 vertices
         }
 
@@ -896,28 +924,46 @@ impl BrowserWindow {
         false
     }
 
-    /// Handle a mouse click for URL bar focus/unfocus.
+    /// Handle a mouse click in the URL bar area (including back/forward buttons).
     fn handle_mouse_click(&mut self, x: f64, y: f64) {
         let input_y_start = ((URL_BAR_HEIGHT - URL_INPUT_HEIGHT) / 2.0) as f64;
         let input_y_end = input_y_start + URL_INPUT_HEIGHT as f64;
 
-        if y >= input_y_start && y <= input_y_end && x >= URL_BAR_PADDING as f64 {
+        let nav_buttons_width = (BACK_BUTTON_WIDTH + FORWARD_BUTTON_WIDTH) as f64;
+        let input_x_start = URL_BAR_PADDING as f64 + nav_buttons_width;
+
+        // Check back button click.
+        if y >= input_y_start && y <= input_y_end
+            && x >= URL_BAR_PADDING as f64
+            && x < URL_BAR_PADDING as f64 + BACK_BUTTON_WIDTH as f64
+        {
+            self.navigate_back();
+            return;
+        }
+
+        // Check forward button click.
+        if y >= input_y_start && y <= input_y_end
+            && x >= URL_BAR_PADDING as f64 + BACK_BUTTON_WIDTH as f64
+            && x < input_x_start
+        {
+            self.navigate_forward();
+            return;
+        }
+
+        if y >= input_y_start && y <= input_y_end && x >= input_x_start {
             // Clicked inside the URL bar input field.
             if !self.url_bar_focused {
-                // First click: focus and select all.
                 self.url_bar_focused = true;
                 self.url_bar_select_all = true;
                 self.url_bar_cursor = self.url_bar_text.len();
             } else {
-                // Already focused: position cursor based on click x.
                 self.url_bar_select_all = false;
-                let text_x = URL_BAR_PADDING as f64 + 6.0;
+                let text_x = input_x_start + 6.0;
                 let approx_char_w = URL_BAR_FONT_SIZE as f64 * 0.6;
                 let char_pos = ((x - text_x) / approx_char_w).round().max(0.0) as usize;
                 self.url_bar_cursor = char_pos.min(self.url_bar_text.len());
             }
         } else {
-            // Clicked outside the URL bar.
             self.url_bar_focused = false;
             self.url_bar_select_all = false;
         }
@@ -933,16 +979,30 @@ impl BrowserWindow {
 
     /// Navigate to a new URL without closing the window.
     /// Fetches the page, re-runs the pipeline, and updates the display.
+    /// Pushes the new URL onto the active tab's history stack.
     fn navigate_in_place(&mut self, url: &str) {
-        info!("Navigating in-place to: {url}");
+        self.navigate_to_url(url, true);
+    }
+
+    /// Navigate to a URL, optionally pushing to history.
+    ///
+    /// When `push_history` is `true`, the URL is added to the tab's
+    /// history stack (normal navigation). When `false`, it is used for
+    /// back/forward navigation where the history position is already set.
+    fn navigate_to_url(&mut self, url: &str, push_history: bool) {
+        info!("Navigating to: {url} (push_history={push_history})");
+
+        // Save current scroll position before navigating.
+        {
+            let tab = self.tab_manager.active_tab_mut();
+            tab.history.current_mut().scroll_y = tab.scroll_y;
+        }
 
         let core = self.core.clone();
         let viewport = self.viewport;
         let url_owned = url.to_string();
         let handle = self.tokio_handle.clone();
 
-        // Run navigation in a separate thread to avoid blocking the winit event loop
-        // and to avoid the "block_on inside tokio" panic.
         let result = std::thread::spawn(move || {
             handle.block_on(async {
                 core.navigate(&url_owned, viewport).await
@@ -954,29 +1014,37 @@ impl BrowserWindow {
 
         match result {
             Ok(TypedData::RenderCommands(cmds)) => {
-                info!("In-place navigation successful! {} render ops", cmds.ops.len());
-                self.hit_regions = Self::extract_hit_regions(&cmds);
-                self.form_fields = Self::extract_form_fields(&cmds);
-                self.scroll_regions = Self::extract_scroll_regions(&cmds);
+                info!("Navigation successful! {} render ops", cmds.ops.len());
+
+                let hit_regions = Self::extract_hit_regions(&cmds);
+                let form_fields = Self::extract_form_fields(&cmds);
+                let content_height = Self::compute_content_height(&cmds);
+                let content_width = Self::compute_content_width(&cmds);
+
+                let tab = self.tab_manager.active_tab_mut();
+                tab.hit_regions = hit_regions;
+                tab.form_fields = form_fields;
+                tab.content_height = content_height;
+                tab.content_width = content_width;
+                tab.render_commands = cmds;
+                tab.scroll_y = 0.0;
+                tab.scroll_x = 0.0;
+                tab.url = url.to_string();
+                tab.title = url.to_string();
+
+                if push_history {
+                    tab.history.push(url);
+                }
+
                 self.focused_field = None;
-                self.content_height = Self::compute_content_height(&cmds);
-                self.content_width = Self::compute_content_width(&cmds);
-                self.render_commands = cmds;
-                self.scroll_y = 0.0;
-                self.scroll_x = 0.0;
                 self.url_bar_focused = false;
                 self.url_bar_select_all = false;
                 self.url_bar_text = url.to_string();
                 self.url_bar_cursor = self.url_bar_text.len();
 
-                // Update window title.
                 if let Some(w) = &self.window {
                     w.set_title(&format!("NOVA - {}", self.url_bar_text));
                 }
-
-                // Start a 2-second animation window for fade-in / smooth rendering.
-                self.page_load_time = Some(std::time::Instant::now());
-                self.needs_animation = true;
 
                 self.request_redraw();
             }
@@ -988,6 +1056,107 @@ impl BrowserWindow {
                 error!("Navigation failed: {e}");
                 self.request_redraw();
             }
+        }
+    }
+
+    /// Navigate back in the active tab's history.
+    fn navigate_back(&mut self) {
+        let url = {
+            let tab = self.tab_manager.active_tab_mut();
+            tab.history.current_mut().scroll_y = tab.scroll_y;
+            tab.history.back().map(|e| e.url.clone())
+        };
+        if let Some(url) = url {
+            info!("Navigating back to: {url}");
+            self.navigate_to_url(&url, false);
+            // Restore scroll position from history.
+            let scroll_y = self.tab_manager.active_tab().history.current().scroll_y;
+            self.tab_manager.active_tab_mut().scroll_y = scroll_y;
+            self.clamp_scroll();
+            self.request_redraw();
+        }
+    }
+
+    /// Navigate forward in the active tab's history.
+    fn navigate_forward(&mut self) {
+        let url = {
+            let tab = self.tab_manager.active_tab_mut();
+            tab.history.current_mut().scroll_y = tab.scroll_y;
+            tab.history.forward().map(|e| e.url.clone())
+        };
+        if let Some(url) = url {
+            info!("Navigating forward to: {url}");
+            self.navigate_to_url(&url, false);
+            let scroll_y = self.tab_manager.active_tab().history.current().scroll_y;
+            self.tab_manager.active_tab_mut().scroll_y = scroll_y;
+            self.clamp_scroll();
+            self.request_redraw();
+        }
+    }
+
+    /// Open a new tab and navigate to a URL.
+    fn open_new_tab(&mut self, url: &str) {
+        info!("Opening new tab: {url}");
+        let commands = RenderCommands { ops: vec![], fonts: vec![] };
+        self.tab_manager.new_tab(url, commands);
+        self.focused_field = None;
+
+        // Navigate the new tab.
+        self.navigate_to_url(url, false);
+    }
+
+    /// Handle a click in the tab bar area.
+    fn handle_tab_bar_click(&mut self, x: f64, _y: f64) {
+        let tab_count = self.tab_manager.tab_count();
+        let max_tab_width: f32 = 180.0;
+        let plus_btn_width: f32 = 30.0;
+        let available_width = self.width as f32 - plus_btn_width;
+        let tab_width = (available_width / tab_count as f32).min(max_tab_width);
+
+        let click_x = x as f32;
+
+        // Check if the "+" button was clicked.
+        let plus_x = tab_count as f32 * tab_width;
+        if click_x >= plus_x && click_x < plus_x + plus_btn_width {
+            self.open_new_tab("http://example.com");
+            return;
+        }
+
+        // Check which tab was clicked.
+        for i in 0..tab_count {
+            let tx = i as f32 * tab_width;
+            if click_x >= tx && click_x < tx + tab_width {
+                // Check if the close button was clicked.
+                let close_x = tx + tab_width - 18.0;
+                if tab_count > 1 && click_x >= close_x && click_x < close_x + 14.0 {
+                    self.tab_manager.close_tab(i);
+                    self.sync_from_active_tab();
+                    self.request_redraw();
+                    return;
+                }
+
+                // Switch to the clicked tab.
+                if i != self.tab_manager.active_index() {
+                    self.tab_manager.switch_to(i);
+                    self.sync_from_active_tab();
+                    self.request_redraw();
+                }
+                return;
+            }
+        }
+    }
+
+    /// Sync window state from the active tab (URL bar, etc.).
+    fn sync_from_active_tab(&mut self) {
+        let tab = self.tab_manager.active_tab();
+        self.url_bar_text = tab.url.clone();
+        self.url_bar_cursor = self.url_bar_text.len();
+        self.url_bar_focused = false;
+        self.url_bar_select_all = false;
+        self.focused_field = None;
+
+        if let Some(w) = &self.window {
+            w.set_title(&format!("NOVA - {}", tab.url));
         }
     }
 }
@@ -1037,32 +1206,7 @@ impl ApplicationHandler for BrowserWindow {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                // Expire the animation window after 2 seconds.
-                if let Some(load_time) = self.page_load_time {
-                    if load_time.elapsed().as_secs_f32() > 2.0 {
-                        self.needs_animation = false;
-                        self.page_load_time = None;
-                    }
-                }
-
-                // During animation, rebuild the framebuffer each frame so that
-                // time-varying effects (scrollbar fade, future opacity
-                // interpolation) are visible.
-                if self.needs_animation {
-                    self.rebuild_framebuffer();
-                }
-
                 self.render_frame();
-
-                // If animation mode is active, schedule the next frame at ~60 fps.
-                if self.needs_animation {
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(
-                        std::time::Instant::now() + std::time::Duration::from_millis(16),
-                    ));
-                }
             }
             WindowEvent::Resized(new_size) => {
                 if let Some(gpu) = &mut self.gpu {
@@ -1072,10 +1216,6 @@ impl ApplicationHandler for BrowserWindow {
 
                     self.width = gpu.config.width;
                     self.height = gpu.config.height;
-
-                    // Update the viewport so subsequent navigations use the new size.
-                    self.viewport.width = self.width as f32;
-                    self.viewport.height = self.height as f32;
 
                     // Re-clamp scroll and re-render at the new size.
                     self.clamp_scroll();
@@ -1093,93 +1233,135 @@ impl ApplicationHandler for BrowserWindow {
                     MouseScrollDelta::PixelDelta(pos) => (-pos.x as f32, -pos.y as f32),
                 };
 
-                // Check if the cursor is inside a scroll container.
-                // If so, route the scroll event to that container instead
-                // of the global scroll offset.
-                let page_x = self.cursor_x as f32 + self.scroll_x;
-                let page_y = (self.cursor_y as f32 - URL_BAR_HEIGHT) + self.scroll_y;
-                let mut handled_by_container = false;
-
-                if (self.cursor_y as f32) > URL_BAR_HEIGHT {
-                    for region in &mut self.scroll_regions {
-                        if region.contains(page_x, page_y) && region.content_height > region.height
-                        {
-                            if dy.abs() > 0.01 {
-                                region.scroll_offset += dy;
-                                region.clamp_scroll();
-                                handled_by_container = true;
-                            }
-                            break;
-                        }
-                    }
+                let mut changed = false;
+                let tab = self.tab_manager.active_tab_mut();
+                if dy.abs() > 0.01 {
+                    tab.scroll_y += dy;
+                    changed = true;
                 }
-
-                if handled_by_container {
+                if dx.abs() > 0.01 {
+                    tab.scroll_x += dx;
+                    changed = true;
+                }
+                if changed {
+                    self.clamp_scroll();
                     self.request_redraw();
-                } else {
-                    let mut changed = false;
-                    if dy.abs() > 0.01 {
-                        self.scroll_y += dy;
-                        changed = true;
-                    }
-                    if dx.abs() > 0.01 {
-                        self.scroll_x += dx;
-                        changed = true;
-                    }
-                    if changed {
-                        self.clamp_scroll();
-                        self.request_redraw();
-                    }
                 }
             }
 
             // ── Keyboard input ─────────────────────────────────────
             WindowEvent::KeyboardInput { event, .. } => {
-                // First try the URL bar.
+                // Check for modifier-based shortcuts first.
+                if event.state == ElementState::Pressed {
+                    let modifiers_state = event.physical_key;
+                    let _ = modifiers_state; // used by match below
+
+                    // Ctrl+T — new tab.
+                    if event.logical_key == Key::Character("t".into())
+                        && event.repeat == false
+                    {
+                        // Check if Ctrl is held via the text field: if Ctrl is held,
+                        // event.text is usually None for letter keys.
+                        if event.text.is_none() || event.text.as_ref().map(|t| t.as_str()) == Some("\x14") {
+                            self.open_new_tab("http://example.com");
+                            return;
+                        }
+                    }
+                    // Ctrl+W — close current tab.
+                    if event.logical_key == Key::Character("w".into())
+                        && event.repeat == false
+                    {
+                        if event.text.is_none() || event.text.as_ref().map(|t| t.as_str()) == Some("\x17") {
+                            let idx = self.tab_manager.active_index();
+                            self.tab_manager.close_tab(idx);
+                            self.sync_from_active_tab();
+                            self.request_redraw();
+                            return;
+                        }
+                    }
+                    // Ctrl+Tab — next tab (note: Tab key with Ctrl).
+                    if event.logical_key == Key::Named(NamedKey::Tab) {
+                        // We can't easily detect Ctrl here in winit 0.30 without
+                        // ModifiersState tracking, but Tab alone in page context
+                        // can be used. We'll use the text presence heuristic.
+                        if event.text.is_none() {
+                            self.tab_manager.next_tab();
+                            self.sync_from_active_tab();
+                            self.request_redraw();
+                            return;
+                        }
+                    }
+
+                    // Alt+Left — back.
+                    if event.logical_key == Key::Named(NamedKey::ArrowLeft)
+                        && event.text.is_none()
+                    {
+                        self.navigate_back();
+                        return;
+                    }
+                    // Alt+Right — forward.
+                    if event.logical_key == Key::Named(NamedKey::ArrowRight)
+                        && event.text.is_none()
+                    {
+                        self.navigate_forward();
+                        return;
+                    }
+                }
+
+                // URL bar input.
                 if self.url_bar_focused {
                     self.handle_url_bar_key(&event);
                     self.request_redraw();
                     return;
                 }
 
+                // Backspace — navigate back (when URL bar not focused).
+                if event.state == ElementState::Pressed
+                    && event.logical_key == Key::Named(NamedKey::Backspace)
+                {
+                    self.navigate_back();
+                    return;
+                }
+
                 // Page scrolling (only when URL bar is not focused).
                 if event.state == ElementState::Pressed {
-                    let page_viewport = (self.height as f32 - URL_BAR_HEIGHT).max(0.0);
+                    let page_viewport = (self.height as f32 - CHROME_HEIGHT).max(0.0);
+                    let tab = self.tab_manager.active_tab_mut();
                     let scrolled = match event.logical_key {
                         Key::Named(NamedKey::ArrowDown) => {
-                            self.scroll_y += ARROW_SCROLL_STEP;
+                            tab.scroll_y += ARROW_SCROLL_STEP;
                             true
                         }
                         Key::Named(NamedKey::ArrowUp) => {
-                            self.scroll_y -= ARROW_SCROLL_STEP;
+                            tab.scroll_y -= ARROW_SCROLL_STEP;
                             true
                         }
                         Key::Named(NamedKey::ArrowRight) => {
-                            self.scroll_x += ARROW_SCROLL_STEP;
+                            tab.scroll_x += ARROW_SCROLL_STEP;
                             true
                         }
                         Key::Named(NamedKey::ArrowLeft) => {
-                            self.scroll_x -= ARROW_SCROLL_STEP;
+                            tab.scroll_x -= ARROW_SCROLL_STEP;
                             true
                         }
                         Key::Named(NamedKey::PageDown) => {
-                            self.scroll_y += page_viewport * PAGE_SCROLL_FRACTION;
+                            tab.scroll_y += page_viewport * PAGE_SCROLL_FRACTION;
                             true
                         }
                         Key::Named(NamedKey::PageUp) => {
-                            self.scroll_y -= page_viewport * PAGE_SCROLL_FRACTION;
+                            tab.scroll_y -= page_viewport * PAGE_SCROLL_FRACTION;
                             true
                         }
                         Key::Named(NamedKey::Home) => {
-                            self.scroll_y = 0.0;
+                            tab.scroll_y = 0.0;
                             true
                         }
                         Key::Named(NamedKey::End) => {
-                            self.scroll_y = self.content_height;
+                            tab.scroll_y = tab.content_height;
                             true
                         }
                         Key::Named(NamedKey::Space) => {
-                            self.scroll_y += page_viewport * PAGE_SCROLL_FRACTION;
+                            tab.scroll_y += page_viewport * PAGE_SCROLL_FRACTION;
                             true
                         }
                         _ => false,
@@ -1212,7 +1394,12 @@ impl ApplicationHandler for BrowserWindow {
                 if (cy as f32) < URL_BAR_HEIGHT {
                     self.handle_mouse_click(cx, cy);
                     self.request_redraw();
-                } else {
+                }
+                // Check if click is in the tab bar area.
+                else if (cy as f32) < CHROME_HEIGHT {
+                    self.handle_tab_bar_click(cx, cy);
+                }
+                else {
                     // Unfocus URL bar when clicking in the page area.
                     if self.url_bar_focused {
                         self.url_bar_focused = false;
@@ -1221,10 +1408,11 @@ impl ApplicationHandler for BrowserWindow {
                     }
 
                     // Check for form field clicks — focus the field.
-                    let page_x = cx as f32 + self.scroll_x;
-                    let page_y = (cy as f32 - URL_BAR_HEIGHT) + self.scroll_y;
+                    let tab = self.tab_manager.active_tab();
+                    let page_x = cx as f32 + tab.scroll_x;
+                    let page_y = (cy as f32 - CHROME_HEIGHT) + tab.scroll_y;
                     let mut clicked_field = None;
-                    for (i, field) in self.form_fields.iter().enumerate() {
+                    for (i, field) in tab.form_fields.iter().enumerate() {
                         if field.contains(page_x, page_y) {
                             clicked_field = Some(i);
                             break;
@@ -1233,11 +1421,9 @@ impl ApplicationHandler for BrowserWindow {
                     if let Some(idx) = clicked_field {
                         self.focused_field = Some(idx);
                         self.request_redraw();
-                    } else {
-                        if self.focused_field.is_some() {
-                            self.focused_field = None;
-                            self.request_redraw();
-                        }
+                    } else if self.focused_field.is_some() {
+                        self.focused_field = None;
+                        self.request_redraw();
                     }
 
                     // Check for link clicks — navigate in place.

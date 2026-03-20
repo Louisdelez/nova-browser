@@ -66,28 +66,6 @@ thread_local! {
     };
 }
 
-/// Get font ascent and descent metrics for a given font size.
-///
-/// Returns `(ascent, descent)` where ascent is the distance from baseline to top
-/// (positive) and descent is the distance from baseline to bottom (positive).
-/// Falls back to approximate values based on font size.
-fn font_metrics(font_size: f32) -> (f32, f32) {
-    LAYOUT_FONT.with(|font| {
-        if let Some(font) = font {
-            let metrics = font.horizontal_line_metrics(font_size);
-            if let Some(m) = metrics {
-                let ascent = m.ascent;
-                let descent = -m.descent; // fontdue returns negative descent
-                return (ascent, descent);
-            }
-        }
-        // Fallback: typical ratios for Latin fonts.
-        let ascent = font_size * 0.8;
-        let descent = font_size * 0.2;
-        (ascent, descent)
-    })
-}
-
 /// Measure the width of a string using fontdue, or fall back to estimation.
 fn measure_text_width(text: &str, font_size: f32) -> f32 {
     LAYOUT_FONT.with(|font| {
@@ -104,34 +82,6 @@ fn measure_text_width(text: &str, font_size: f32) -> f32 {
             text.len() as f32 * CHAR_WIDTH_AT_16PX * scale
         }
     })
-}
-
-/// Measure text width accounting for synthetic bold widening.
-///
-/// When the renderer draws bold text it blits the glyph a second time shifted
-/// 1 px to the right.  This makes each character visually ~1 px wider, but
-/// `fontdue::Font::rasterize` does not include that extra pixel in
-/// `advance_width`.  To keep layout and rendering in sync we add 1 px per
-/// character when `is_bold` is true.
-fn measure_text_width_with_weight(text: &str, font_size: f32, is_bold: bool) -> f32 {
-    let base = measure_text_width(text, font_size);
-    if is_bold {
-        base + text.chars().count() as f32 * 1.0
-    } else {
-        base
-    }
-}
-
-/// Check whether a style slice indicates bold weight (font-weight >= 700).
-fn style_is_bold(style: &[(String, StyleValue)]) -> bool {
-    style.iter()
-        .find(|(k, _)| k == "font-weight")
-        .map(|(_, v)| match v {
-            StyleValue::Keyword(k) | StyleValue::Str(k) => k == "bold" || k == "700" || k == "800" || k == "900",
-            StyleValue::Number(n) => *n >= 700.0,
-            _ => false,
-        })
-        .unwrap_or(false)
 }
 
 use nova_mod_api::{
@@ -254,7 +204,7 @@ fn compute_layout(dom: &DomNode, viewport: &Viewport) -> Result<LayoutBox, NovaE
     let mut taffy = TaffyTree::<NodeContext>::new();
 
     // Build the Taffy tree, returning the root node id.
-    let root_id = add_node(&mut taffy, dom, viewport.width, DEFAULT_FONT_SIZE, &[], 0)?;
+    let root_id = add_node(&mut taffy, dom, viewport.width, DEFAULT_FONT_SIZE, &[])?;
 
     // Compute layout at the viewport size.
     taffy
@@ -270,11 +220,10 @@ fn compute_layout(dom: &DomNode, viewport: &Viewport) -> Result<LayoutBox, NovaE
     // Extract the resulting layout tree.
     let mut layout_box = build_layout_box(&taffy, root_id, 0.0, 0.0);
 
-    // Post-process: reflow inline content around floated elements.
-    apply_float_reflow(&mut layout_box);
-
-    // Post-process: equalize column widths in table elements.
-    apply_table_layout(&mut layout_box);
+    // Post-processing: apply CSS positioning (relative, absolute, fixed)
+    // and sort children by z-index for correct paint order.
+    apply_positioning_recursive(&mut layout_box, viewport);
+    sort_by_z_index_recursive(&mut layout_box);
 
     Ok(layout_box)
 }
@@ -304,14 +253,13 @@ fn add_node(
     available_width: f32,
     parent_font_size: f32,
     parent_style_props: &[(String, StyleValue)],
-    depth: usize,
 ) -> Result<NodeId, NovaError> {
     match node {
         DomNode::Document { children } => {
             // The document root is a block container spanning the full width.
             let child_ids = children
                 .iter()
-                .map(|c| add_node(taffy, c, available_width, DEFAULT_FONT_SIZE, &[], depth + 1))
+                .map(|c| add_node(taffy, c, available_width, DEFAULT_FONT_SIZE, &[]))
                 .collect::<Result<Vec<_>, _>>()?;
 
             let style = Style {
@@ -343,30 +291,10 @@ fn add_node(
             children,
             attributes,
         } => {
-            // Skip elements that produce no visible output.
-            if matches!(tag.as_str(), "script" | "style" | "template" | "noscript" | "iframe") {
-                let ctx = NodeContext { content: LayoutContent::Block, style: StyleMap::default() };
-                return taffy
-                    .new_leaf_with_context(Style { display: Display::None, ..Style::DEFAULT }, ctx)
-                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
-            }
-
-            // Depth limit: very deeply nested elements get simplified to avoid
-            // expensive layout computation on pages like Wikipedia.
-            if depth > 50 {
-                let ctx = NodeContext {
-                    content: LayoutContent::Block,
-                    style: StyleMap::default(),
-                };
-                return taffy
-                    .new_leaf_with_context(Style { display: Display::None, ..Style::DEFAULT }, ctx)
-                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
-            }
-
             // ── Form elements → sized leaf nodes with placeholder text ──
             if matches!(tag.as_str(), "input" | "button" | "select" | "textarea") {
                 let font_size = resolve_font_size(tag, attributes, parent_font_size);
-                let line_height = resolve_line_height_from_attrs(attributes, font_size);
+                let line_height = font_size * LINE_HEIGHT_FACTOR;
                 let display = resolve_display(tag, attributes);
                 let lp = parse_layout_props(attributes);
 
@@ -501,10 +429,6 @@ fn add_node(
                 };
                 props.push(("nova-form-type".into(), StyleValue::Str(form_type)));
                 props.push(("nova-form-value".into(), StyleValue::Str(label.clone())));
-                // Propagate placeholder attribute for the painter to render.
-                if let Some(ph) = attributes.iter().find(|(k, _)| k == "placeholder") {
-                    props.push(("nova-placeholder".into(), StyleValue::Str(ph.1.clone())));
-                }
 
                 let ctx = NodeContext {
                     content: LayoutContent::Block,
@@ -527,49 +451,17 @@ fn add_node(
                     .map(|(_, v)| v.clone())
                     .unwrap_or_default();
 
-                // Get dimensions from HTML attributes.
-                let attr_w: f32 = attributes
+                // Determine image dimensions from attributes or defaults.
+                let img_w: f32 = attributes
                     .iter()
                     .find(|(k, _)| k == "width")
                     .and_then(|(_, v)| v.parse().ok())
-                    .unwrap_or(0.0);
-                let attr_h: f32 = attributes
+                    .unwrap_or(150.0);
+                let img_h: f32 = attributes
                     .iter()
                     .find(|(k, _)| k == "height")
                     .and_then(|(_, v)| v.parse().ok())
-                    .unwrap_or(0.0);
-
-                // Check CSS dimensions from data-nova-style.
-                let lp = parse_layout_props(attributes);
-                let css_w = lp.width.and_then(|d| match d {
-                    Dimension::Length(px) => Some(px),
-                    Dimension::Percent(p) => Some(p * available_width),
-                    _ => None,
-                });
-                let css_max_w = lp.max_width.and_then(|d| match d {
-                    Dimension::Length(px) => Some(px),
-                    Dimension::Percent(p) => Some(p * available_width),
-                    _ => None,
-                });
-
-                let mut img_w = css_w.unwrap_or(if attr_w > 0.0 { attr_w } else { 150.0 });
-                let mut img_h = if attr_h > 0.0 { attr_h } else { 80.0 };
-
-                // Apply max-width constraint (common: max-width: 100%).
-                if let Some(max_w) = css_max_w {
-                    if img_w > max_w {
-                        let ratio = max_w / img_w;
-                        img_w = max_w;
-                        img_h *= ratio; // Maintain aspect ratio.
-                    }
-                }
-
-                // Never exceed available width.
-                if img_w > available_width {
-                    let ratio = available_width / img_w;
-                    img_w = available_width;
-                    img_h *= ratio;
-                }
+                    .unwrap_or(80.0);
 
                 let ctx = NodeContext {
                     content: LayoutContent::Image { src },
@@ -580,196 +472,8 @@ fn add_node(
                         Style {
                             display: Display::Flex,
                             size: Size {
-                                width: Dimension::Length(img_w),
+                                width: Dimension::Length(img_w.min(available_width)),
                                 height: Dimension::Length(img_h),
-                            },
-                            ..Style::DEFAULT
-                        },
-                        ctx,
-                    )
-                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
-            }
-
-            // <svg> elements are treated as inline images with their viewBox dimensions.
-            if tag == "svg" {
-                let svg_w: f32 = attributes.iter()
-                    .find(|(k, _)| k == "width")
-                    .and_then(|(_, v)| v.trim_end_matches("px").parse().ok())
-                    .or_else(|| attributes.iter()
-                        .find(|(k, _)| k == "viewBox")
-                        .and_then(|(_, v)| {
-                            let parts: Vec<f32> = v.split_whitespace().filter_map(|p| p.parse().ok()).collect();
-                            parts.get(2).copied()
-                        }))
-                    .unwrap_or(100.0);
-                let svg_h: f32 = attributes.iter()
-                    .find(|(k, _)| k == "height")
-                    .and_then(|(_, v)| v.trim_end_matches("px").parse().ok())
-                    .or_else(|| attributes.iter()
-                        .find(|(k, _)| k == "viewBox")
-                        .and_then(|(_, v)| {
-                            let parts: Vec<f32> = v.split_whitespace().filter_map(|p| p.parse().ok()).collect();
-                            parts.get(3).copied()
-                        }))
-                    .unwrap_or(100.0);
-
-                let ctx = NodeContext {
-                    content: LayoutContent::Block,
-                    style: StyleMap::default(),
-                };
-                return taffy
-                    .new_leaf_with_context(
-                        Style {
-                            display: Display::Flex,
-                            size: Size {
-                                width: Dimension::Length(svg_w.min(available_width)),
-                                height: Dimension::Length(svg_h),
-                            },
-                            ..Style::DEFAULT
-                        },
-                        ctx,
-                    )
-                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
-            }
-
-            // <canvas> elements show a blank rectangle with their specified dimensions.
-            if tag == "canvas" {
-                let canvas_w: f32 = attributes.iter()
-                    .find(|(k, _)| k == "width")
-                    .and_then(|(_, v)| v.parse().ok())
-                    .unwrap_or(300.0);
-                let canvas_h: f32 = attributes.iter()
-                    .find(|(k, _)| k == "height")
-                    .and_then(|(_, v)| v.parse().ok())
-                    .unwrap_or(150.0);
-
-                let props = vec![
-                    ("background-color".into(), StyleValue::Str("#000".to_string())),
-                ];
-                let ctx = NodeContext {
-                    content: LayoutContent::Block,
-                    style: StyleMap { properties: props },
-                };
-                return taffy
-                    .new_leaf_with_context(
-                        Style {
-                            display: Display::Flex,
-                            size: Size {
-                                width: Dimension::Length(canvas_w.min(available_width)),
-                                height: Dimension::Length(canvas_h),
-                            },
-                            ..Style::DEFAULT
-                        },
-                        ctx,
-                    )
-                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
-            }
-
-            // <video> elements show a black rectangle placeholder.
-            if tag == "video" {
-                let vid_w: f32 = attributes.iter()
-                    .find(|(k, _)| k == "width")
-                    .and_then(|(_, v)| v.parse().ok())
-                    .unwrap_or(320.0);
-                let vid_h: f32 = attributes.iter()
-                    .find(|(k, _)| k == "height")
-                    .and_then(|(_, v)| v.parse().ok())
-                    .unwrap_or(240.0);
-
-                let props = vec![
-                    ("background-color".into(), StyleValue::Str("#000".to_string())),
-                ];
-                let ctx = NodeContext {
-                    content: LayoutContent::Block,
-                    style: StyleMap { properties: props },
-                };
-                return taffy
-                    .new_leaf_with_context(
-                        Style {
-                            display: Display::Flex,
-                            size: Size {
-                                width: Dimension::Length(vid_w.min(available_width)),
-                                height: Dimension::Length(vid_h),
-                            },
-                            ..Style::DEFAULT
-                        },
-                        ctx,
-                    )
-                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
-            }
-
-            // <audio> elements show a small gray bar placeholder.
-            if tag == "audio" {
-                let ctx = NodeContext {
-                    content: LayoutContent::Block,
-                    style: StyleMap { properties: vec![
-                        ("background-color".into(), StyleValue::Str("#f0f0f0".to_string())),
-                    ]},
-                };
-                return taffy
-                    .new_leaf_with_context(
-                        Style {
-                            display: Display::Flex,
-                            size: Size {
-                                width: Dimension::Length(300.0_f32.min(available_width)),
-                                height: Dimension::Length(54.0),
-                            },
-                            ..Style::DEFAULT
-                        },
-                        ctx,
-                    )
-                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
-            }
-
-            // <iframe> elements render as sized boxes with a placeholder.
-            if tag == "iframe" {
-                let iframe_w: f32 = attributes.iter()
-                    .find(|(k, _)| k == "width")
-                    .and_then(|(_, v)| v.trim_end_matches("px").parse().ok())
-                    .unwrap_or(300.0);
-                let iframe_h: f32 = attributes.iter()
-                    .find(|(k, _)| k == "height")
-                    .and_then(|(_, v)| v.trim_end_matches("px").parse().ok())
-                    .unwrap_or(150.0);
-                let src = attributes.iter()
-                    .find(|(k, _)| k == "src")
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_default();
-
-                // Apply CSS dimensions if set.
-                let lp = parse_layout_props(attributes);
-                let final_w = lp.width.and_then(|d| match d {
-                    Dimension::Length(px) => Some(px),
-                    Dimension::Percent(p) => Some(p * available_width),
-                    _ => None,
-                }).unwrap_or(iframe_w).min(available_width);
-                let final_h = lp.height.and_then(|d| match d {
-                    Dimension::Length(px) => Some(px),
-                    _ => None,
-                }).unwrap_or(iframe_h);
-
-                let mut props = vec![
-                    ("background-color".into(), StyleValue::Str("#f8f8f8".to_string())),
-                    ("border-style".into(), StyleValue::Keyword("solid".into())),
-                    ("border-width".into(), StyleValue::Px(1.0)),
-                    ("border-color".into(), StyleValue::Str("#ccc".to_string())),
-                ];
-                // Store the src URL for the painter to display.
-                if !src.is_empty() {
-                    props.push(("nova-iframe-src".into(), StyleValue::Str(src)));
-                }
-
-                let ctx = NodeContext {
-                    content: LayoutContent::Block,
-                    style: StyleMap { properties: props },
-                };
-                return taffy
-                    .new_leaf_with_context(
-                        Style {
-                            display: Display::Flex,
-                            size: Size {
-                                width: Dimension::Length(final_w),
-                                height: Dimension::Length(final_h),
                             },
                             ..Style::DEFAULT
                         },
@@ -832,7 +536,7 @@ fn add_node(
                         // Parse the value into a StyleValue.
                         if let Some(px) = val.strip_suffix("px").and_then(|s| s.parse::<f32>().ok()) {
                             props.push((prop, StyleValue::Px(px)));
-                        } else if val.starts_with("rgb") || val.starts_with('#') || val.starts_with("hsl") {
+                        } else if val.starts_with("rgb") || val.starts_with('#') {
                             // Store as string — the painter will parse colors.
                             props.push((prop, StyleValue::Str(val.to_string())));
                         } else {
@@ -851,23 +555,16 @@ fn add_node(
             }
 
             // ── Inline Formatting Context ──────────────────────────
-            // For block-like containers (block, table-cell, list-item),
-            // group consecutive inline children into inline formatting
-            // contexts so they flow together, wrap across lines, and
-            // share baselines.  This is critical for correct colored
-            // segments: the IFC merges adjacent inline items (with
-            // potentially different styles) into a single Taffy node
-            // and encodes per-segment style data for the painter.
-            let use_ifc = matches!(
-                display.as_str(),
-                "block" | "table-cell" | "list-item" | "table-caption"
-            );
-            let child_ids = if use_ifc {
-                build_children_with_ifc(taffy, children, available_width, font_size, &props, depth)?
+            // For block containers, group consecutive inline children
+            // into inline formatting contexts so they flow together,
+            // wrap across lines, and share baselines.
+            // Only apply IFC for block containers (not flex, grid, or table).
+            let child_ids = if display == "block" {
+                build_children_with_ifc(taffy, children, available_width, font_size, &props)?
             } else {
                 children
                     .iter()
-                    .map(|c| add_node(taffy, c, available_width, font_size, &props, depth + 1))
+                    .map(|c| add_node(taffy, c, available_width, font_size, &props))
                     .collect::<Result<Vec<_>, _>>()?
             };
             let taffy_style = build_taffy_style(&display, tag, attributes);
@@ -902,21 +599,19 @@ fn add_node(
             let mut text_props = vec![
                 ("font-size".into(), StyleValue::Px(font_size)),
             ];
-            // Inherit color, background-color, text-decoration, and line-height from parent.
+            // Inherit color, background-color, and text-decoration from parent.
             for (key, value) in parent_style_props {
                 if key == "color" || key == "background-color" || key == "text-decoration"
                     || key == "text-align" || key == "font-weight" || key == "font-style"
-                    || key == "font-family" || key == "text-transform"
-                    || key == "line-height" || key == "letter-spacing"
-                    || key == "white-space" || key == "overflow"
-                    || key == "href" {
+                    || key == "white-space" || key == "overflow" {
                     text_props.push((key.clone(), value.clone()));
                 }
             }
 
-            let line_height = resolve_line_height(&text_props, font_size);
-            let bold = style_is_bold(&text_props);
-            let space_width = measure_text_width_with_weight(" ", font_size, bold).max(1.0);
+            let line_height = font_size * LINE_HEIGHT_FACTOR;
+            // Use a standard web-metric space width (≈ 0.25 em) instead of
+            // fontdue's rasterize advance_width which tends to be too large.
+            let space_width = (font_size * 0.25).max(1.0);
 
             // Split the text into individual words.  When there are multiple
             // words we create one leaf node per word (plus thin "space" nodes
@@ -944,7 +639,7 @@ fn add_node(
             // Single word → return a single sized leaf (no wrapper needed).
             if words.len() == 1 {
                 let word = words[0];
-                let w = measure_text_width_with_weight(word, font_size, bold).min(available_width);
+                let w = measure_text_width(word, font_size).min(available_width);
                 let ctx = NodeContext {
                     content: LayoutContent::Text(word.to_string()),
                     style: StyleMap { properties: text_props },
@@ -991,7 +686,7 @@ fn add_node(
                     word_ids.push(space_id);
                 }
 
-                let w = measure_text_width_with_weight(word, font_size, bold).min(available_width);
+                let w = measure_text_width(word, font_size).min(available_width);
                 let word_ctx = NodeContext {
                     content: LayoutContent::Text(word.to_string()),
                     style: StyleMap { properties: text_props.clone() },
@@ -1109,7 +804,6 @@ fn build_children_with_ifc(
     available_width: f32,
     parent_font_size: f32,
     parent_style_props: &[(String, StyleValue)],
-    depth: usize,
 ) -> Result<Vec<NodeId>, NovaError> {
     let mut result = Vec::new();
 
@@ -1130,7 +824,7 @@ fn build_children_with_ifc(
             result.extend(line_ids);
         } else {
             // Block child — process normally, with margin collapsing.
-            let node_id = add_node(taffy, &children[i], available_width, parent_font_size, parent_style_props, depth + 1)?;
+            let node_id = add_node(taffy, &children[i], available_width, parent_font_size, parent_style_props)?;
 
             // Margin collapsing: if the previous child was also a block,
             // reduce the current child's top margin to simulate CSS margin collapse.
@@ -1200,30 +894,7 @@ fn flatten_inline_content(
     for node in nodes {
         flatten_node_recursive(node, font_size, parent_style_props, &mut items);
     }
-
-    // Post-process: ensure there is a space between two adjacent Word items.
-    // In HTML, inline elements separated by whitespace in the source should have
-    // inter-element spacing, but the flattening can lose those spaces when text
-    // nodes don't start/end with whitespace.
-    let space_width = measure_text_width(" ", font_size).max(1.0);
-    let mut fixed = Vec::with_capacity(items.len() + items.len() / 4);
-    for item in items {
-        if let InlineItem::Word { ref text, .. } = item {
-            if text != "\n" {
-                if let Some(InlineItem::Word { text: prev, .. }) = fixed.last() {
-                    if prev != "\n" {
-                        // Two consecutive words with no space — insert one.
-                        fixed.push(InlineItem::Space {
-                            width: space_width,
-                            style: parent_style_props.to_vec(),
-                        });
-                    }
-                }
-            }
-        }
-        fixed.push(item);
-    }
-    fixed
+    items
 }
 
 /// Recursively flatten a single DOM node into inline items.
@@ -1235,7 +906,7 @@ fn flatten_node_recursive(
 ) {
     match node {
         DomNode::Text(text) => {
-            let space_width = measure_text_width(" ", font_size).max(1.0);
+            let space_width = (font_size * 0.25).max(1.0);
 
             // Check white-space property to decide how to split text.
             let white_space = style_props.iter()
@@ -1337,7 +1008,6 @@ fn flatten_node_recursive(
                     // "normal": collapse whitespace, allow wrapping.
                     let had_items = !items.is_empty();
                     let starts_with_space = text.starts_with(char::is_whitespace);
-                    let ends_with_space = text.ends_with(char::is_whitespace);
                     let words: Vec<&str> = text.split_whitespace().collect();
                     for (i, word) in words.iter().enumerate() {
                         if i > 0 || (i == 0 && had_items && starts_with_space) {
@@ -1355,16 +1025,6 @@ fn flatten_node_recursive(
                             width: w,
                             style: style_props.to_vec(),
                         });
-                    }
-                    // If the text ends with whitespace, add a trailing space so the
-                    // next text node's content doesn't merge with ours.
-                    if ends_with_space && !words.is_empty() {
-                        if !matches!(items.last(), Some(InlineItem::Space { .. })) {
-                            items.push(InlineItem::Space {
-                                width: space_width,
-                                style: style_props.to_vec(),
-                            });
-                        }
                     }
                 }
             }
@@ -1405,20 +1065,12 @@ fn flatten_node_recursive(
                                     existing.1 = StyleValue::Px(px);
                                 }
                             }
+                        } else if let Some(px) = val.strip_suffix("px").and_then(|s| s.parse::<f32>().ok()) {
+                            child_props.push((prop, StyleValue::Px(px)));
+                        } else if val.starts_with("rgb") || val.starts_with('#') {
+                            child_props.push((prop, StyleValue::Str(val.to_string())));
                         } else {
-                            let sv = if let Some(px) = val.strip_suffix("px").and_then(|s| s.parse::<f32>().ok()) {
-                                StyleValue::Px(px)
-                            } else if val.starts_with("rgb") || val.starts_with('#') || val.starts_with("hsl") {
-                                StyleValue::Str(val.to_string())
-                            } else {
-                                StyleValue::Keyword(val.to_string())
-                            };
-                            // Update existing property or add new one.
-                            if let Some(existing) = child_props.iter_mut().find(|(k, _)| *k == prop) {
-                                existing.1 = sv;
-                            } else {
-                                child_props.push((prop, sv));
-                            }
+                            child_props.push((prop, StyleValue::Keyword(val.to_string())));
                         }
                     }
                 }
@@ -1456,104 +1108,30 @@ fn layout_inline_run(
         return Ok(Vec::new());
     }
 
-    let line_height = resolve_line_height(parent_style_props, parent_font_size);
-
-    // Check for word-break / overflow-wrap properties.
-    let word_break = parent_style_props.iter()
-        .find(|(k, _)| k == "word-break")
-        .and_then(|(_, v)| match v {
-            StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.as_str()),
-            _ => None,
-        })
-        .unwrap_or("normal");
-    let overflow_wrap = parent_style_props.iter()
-        .find(|(k, _)| k == "overflow-wrap" || k == "word-wrap")
-        .and_then(|(_, v)| match v {
-            StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.as_str()),
-            _ => None,
-        })
-        .unwrap_or("normal");
-    let _break_all = word_break == "break-all";
-    let _break_word = overflow_wrap == "break-word" || overflow_wrap == "anywhere";
+    let line_height = parent_font_size * LINE_HEIGHT_FACTOR;
 
     // 2. Break items into lines.
-    let mut lines: Vec<Vec<InlineItem>> = Vec::new();
+    let mut lines: Vec<Vec<&InlineItem>> = Vec::new();
     let mut current_line: Vec<&InlineItem> = Vec::new();
     let mut current_width: f32 = 0.0;
-    // Overflow fragments generated by character-level breaking.
-    let mut overflow_fragments: Vec<InlineItem> = Vec::new();
 
     for item in &items {
         match item {
-            InlineItem::Word { text, width, style } => {
+            InlineItem::Word { text, width, .. } => {
                 if text == "\n" {
                     // Forced line break (<br>).
-                    let mut line: Vec<InlineItem> = current_line.drain(..).cloned().collect();
-                    line.extend(overflow_fragments.drain(..));
-                    lines.push(line);
+                    lines.push(std::mem::take(&mut current_line));
                     current_width = 0.0;
                     continue;
                 }
                 // Check if this word fits on the current line.
                 if current_width + *width > available_width && current_width > 0.0 {
-                    // Word doesn't fit — break it at character boundaries if
-                    // it's wider than the available width. This prevents text
-                    // from overflowing containers, matching real browser behavior.
-                    if *width > available_width {
-                        // Break the long word at character boundaries.
-                        let mut remaining = text.as_str();
-                        let mut first = true;
-                        while !remaining.is_empty() {
-                            let space_left = if first { available_width - current_width } else { available_width };
-                            let mut fit_end = 0;
-                            let mut fit_width = 0.0;
-                            for (i, ch) in remaining.char_indices() {
-                                let ch_w = measure_text_width(&remaining[i..i+ch.len_utf8()], parent_font_size);
-                                if fit_width + ch_w > space_left && fit_end > 0 {
-                                    break;
-                                }
-                                fit_width += ch_w;
-                                fit_end = i + ch.len_utf8();
-                            }
-                            if fit_end == 0 && !remaining.is_empty() {
-                                // At least one character per line.
-                                let ch = remaining.chars().next().unwrap();
-                                fit_end = ch.len_utf8();
-                                fit_width = measure_text_width(&remaining[..fit_end], parent_font_size);
-                            }
-                            let fragment = &remaining[..fit_end];
-                            let frag_item = InlineItem::Word {
-                                text: fragment.to_string(),
-                                width: fit_width,
-                                style: style.clone(),
-                            };
-                            if first {
-                                // Add to current line and push.
-                                let mut line: Vec<InlineItem> = current_line.drain(..).cloned().collect();
-                                line.extend(overflow_fragments.drain(..));
-                                line.push(frag_item);
-                                lines.push(line);
-                                first = false;
-                            } else if fit_end < remaining.len() {
-                                // Full line of characters.
-                                lines.push(vec![frag_item]);
-                            } else {
-                                // Last fragment — becomes start of new current line.
-                                overflow_fragments.push(frag_item);
-                            }
-                            remaining = &remaining[fit_end..];
-                            current_width = 0.0;
-                        }
-                        continue;
-                    }
-                    // Normal wrap to new line.
+                    // Wrap to new line.
                     // Remove trailing space from current line.
                     if let Some(InlineItem::Space { .. }) = current_line.last() {
                         current_line.pop();
                     }
-                    let mut line: Vec<InlineItem> = current_line.drain(..).cloned().collect();
-                    line.extend(overflow_fragments.drain(..));
-                    lines.push(line);
+                    lines.push(std::mem::take(&mut current_line));
                     current_width = 0.0;
                 }
                 current_line.push(item);
@@ -1567,9 +1145,7 @@ fn layout_inline_run(
             }
             InlineItem::Image { width, .. } => {
                 if current_width + *width > available_width && current_width > 0.0 {
-                    let mut line: Vec<InlineItem> = current_line.drain(..).cloned().collect();
-                    line.extend(overflow_fragments.drain(..));
-                    lines.push(line);
+                    lines.push(std::mem::take(&mut current_line));
                     current_width = 0.0;
                 }
                 current_line.push(item);
@@ -1577,153 +1153,64 @@ fn layout_inline_run(
             }
         }
     }
-    if !current_line.is_empty() || !overflow_fragments.is_empty() {
-        let mut line: Vec<InlineItem> = current_line.drain(..).cloned().collect();
-        line.extend(overflow_fragments.drain(..));
-        lines.push(line);
+    if !current_line.is_empty() {
+        lines.push(current_line);
     }
 
     // 3. Create Taffy nodes for each line box.
-    //
-    // KEY DESIGN: Instead of one Taffy node per word, we merge consecutive
-    // text items (words + spaces) that share the same style into a single
-    // combined text node.  This means the renderer draws "This domain is
-    // for use" as ONE DrawText call instead of 6 separate ones, eliminating
-    // measurement drift that causes words to overlap or stick together.
     let mut line_box_ids = Vec::new();
     for line in &lines {
         let mut item_ids = Vec::new();
         let mut max_height = line_height;
 
-        // Merge ALL consecutive text/space items on a line into ONE
-        // Taffy node, regardless of style differences.  This eliminates
-        // measurement drift between separately-positioned text nodes.
-        // Style information for each segment is encoded in a custom
-        // `nova-text-segments` property so the painter can emit
-        // per-segment DrawText ops with the correct colors/weights.
-        let mut i = 0;
-        while i < line.len() {
-            match &line[i] {
-                InlineItem::Word { style, .. } | InlineItem::Space { style, .. } => {
-                    let first_style = style.clone();
-                    let mut run_text = String::new();
-                    let mut j = i;
-                    // Collect (byte_start, byte_end, style) for each segment.
-                    let mut segments: Vec<(usize, usize, Vec<(String, StyleValue)>)> = Vec::new();
+        for &item in line {
+            match item {
+                InlineItem::Word { text, width, style } => {
+                    let fs = style.iter()
+                        .find(|(k, _)| k == "font-size")
+                        .and_then(|(_, v)| if let StyleValue::Px(px) = v { Some(*px) } else { None })
+                        .unwrap_or(parent_font_size);
+                    let lh = fs * LINE_HEIGHT_FACTOR;
+                    max_height = max_height.max(lh);
 
-                    while j < line.len() {
-                        match &line[j] {
-                            InlineItem::Word { text, style: s, .. } => {
-                                let start = run_text.len();
-                                run_text.push_str(text);
-                                segments.push((start, run_text.len(), s.clone()));
-                                j += 1;
-                            }
-                            InlineItem::Space { style: s, .. } => {
-                                let start = run_text.len();
-                                run_text.push(' ');
-                                segments.push((start, run_text.len(), s.clone()));
-                                j += 1;
-                            }
-                            InlineItem::Image { .. } => break,
-                        }
-                    }
-
-                    if !run_text.is_empty() {
-                        let fs = first_style.iter()
-                            .find(|(k, _)| k == "font-size")
-                            .and_then(|(_, v)| if let StyleValue::Px(px) = v { Some(*px) } else { None })
-                            .unwrap_or(parent_font_size);
-                        let lh = resolve_line_height(&first_style, fs);
-                        max_height = max_height.max(lh);
-
-                        let is_bold = style_is_bold(&first_style);
-                        let measured_width = measure_text_width_with_weight(&run_text, fs, is_bold);
-
-                        // Build segment data with pre-computed x-offsets so
-                        // the painter doesn't need its own font metrics.
-                        // Format: "start:end:xoff:color:weight:texdec:href"
-                        let mut segment_data = Vec::new();
-                        let mut all_same_style = true;
-                        for (idx, (start, end, seg_style)) in segments.iter().enumerate() {
-                            // Compute x-offset = width of run_text[..start].
-                            let x_off = if *start == 0 {
-                                0.0
-                            } else {
-                                measure_text_width_with_weight(&run_text[..*start], fs, is_bold)
-                            };
-                            let color = seg_style.iter()
-                                .find(|(k, _)| k == "color")
-                                .map(|(_, v)| match v {
-                                    StyleValue::Str(s) | StyleValue::Keyword(s) => s.clone(),
-                                    StyleValue::Color(c) => format!("#{:02x}{:02x}{:02x}{:02x}", c.r, c.g, c.b, (c.a * 255.0) as u8),
-                                    _ => String::new(),
-                                })
-                                .unwrap_or_default();
-                            let weight = seg_style.iter()
-                                .find(|(k, _)| k == "font-weight")
-                                .map(|(_, v)| match v {
-                                    StyleValue::Keyword(s) | StyleValue::Str(s) => s.clone(),
-                                    StyleValue::Number(n) => format!("{n}"),
-                                    _ => String::new(),
-                                })
-                                .unwrap_or_default();
-                            let texdec = seg_style.iter()
-                                .find(|(k, _)| k == "text-decoration")
-                                .map(|(_, v)| match v {
-                                    StyleValue::Keyword(s) | StyleValue::Str(s) => s.clone(),
-                                    _ => String::new(),
-                                })
-                                .unwrap_or_default();
-                            let href = seg_style.iter()
-                                .find(|(k, _)| k == "href")
-                                .map(|(_, v)| match v {
-                                    StyleValue::Str(s) => s.clone(),
-                                    _ => String::new(),
-                                })
-                                .unwrap_or_default();
-                            segment_data.push(format!("{start}:{end}:{x_off}:{color}:{weight}:{texdec}:{href}"));
-                            // Check if this segment differs from the first.
-                            if idx > 0 && all_same_style {
-                                if !styles_compatible_for_merge(&first_style, seg_style) {
-                                    all_same_style = false;
-                                }
-                            }
-                        }
-
-                        let mut props = first_style;
-                        // Only attach segment data when styles actually differ;
-                        // single-style lines skip the overhead.
-                        if !all_same_style && !segment_data.is_empty() {
-                            debug!(
-                                segments = %segment_data.join(";"),
-                                text = %run_text,
-                                "IFC: attaching nova-text-segments for multi-style line"
-                            );
-                            props.push(("nova-text-segments".into(), StyleValue::Str(segment_data.join(";"))));
-                        }
-
-                        let ctx = NodeContext {
-                            content: LayoutContent::Text(run_text),
-                            style: StyleMap { properties: props },
-                        };
-                        let id = taffy
-                            .new_leaf_with_context(
-                                Style {
-                                    display: Display::Flex,
-                                    flex_shrink: 0.0,
-                                    size: Size {
-                                        width: Dimension::Length(measured_width),
-                                        height: Dimension::Length(lh),
-                                    },
-                                    ..Style::DEFAULT
+                    let ctx = NodeContext {
+                        content: LayoutContent::Text(text.clone()),
+                        style: StyleMap { properties: style.clone() },
+                    };
+                    let id = taffy
+                        .new_leaf_with_context(
+                            Style {
+                                display: Display::Flex,
+                                size: Size {
+                                    width: Dimension::Length(*width),
+                                    height: Dimension::Length(lh),
                                 },
-                                ctx,
-                            )
-                            .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
-                        item_ids.push(id);
-                    }
-                    i = j;
+                                ..Style::DEFAULT
+                            },
+                            ctx,
+                        )
+                        .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
+                    item_ids.push(id);
+                }
+                InlineItem::Space { width, style } => {
+                    let ctx = NodeContext {
+                        content: LayoutContent::Text(" ".to_string()),
+                        style: StyleMap { properties: style.clone() },
+                    };
+                    let id = taffy
+                        .new_leaf_with_context(
+                            Style {
+                                display: Display::Flex,
+                                size: Size {
+                                    width: Dimension::Length(*width),
+                                    height: Dimension::Length(line_height),
+                                },
+                                ..Style::DEFAULT
+                            },
+                            ctx,
+                        )
+                        .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
+                    item_ids.push(id);
                 }
                 InlineItem::Image { src, width, height } => {
                     max_height = max_height.max(*height);
@@ -1745,7 +1232,6 @@ fn layout_inline_run(
                         )
                         .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
                     item_ids.push(id);
-                    i += 1;
                 }
             }
         }
@@ -1793,34 +1279,6 @@ fn layout_inline_run(
     }
 
     Ok(line_box_ids)
-}
-
-/// Check if two style property lists are compatible for merging into a
-/// single text run.  Two runs are compatible if they share the same font
-/// size, color, font-weight, font-style, font-family, and text-decoration.
-fn styles_compatible_for_merge(a: &[(String, StyleValue)], b: &[(String, StyleValue)]) -> bool {
-    let get = |props: &[(String, StyleValue)], key: &str| -> Option<String> {
-        props.iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| match v {
-                StyleValue::Px(px) => format!("{px}"),
-                StyleValue::Keyword(k) | StyleValue::Str(k) => k.clone(),
-                StyleValue::Number(n) => format!("{n}"),
-                StyleValue::Color(c) => format!("{},{},{},{}", c.r, c.g, c.b, c.a),
-                StyleValue::Percent(p) => format!("{p}%"),
-            })
-    };
-
-    static MERGE_KEYS: &[&str] = &[
-        "font-size", "color", "font-weight", "font-style",
-        "font-family", "text-decoration", "href",
-    ];
-    for &key in MERGE_KEYS {
-        if get(a, key) != get(b, key) {
-            return false;
-        }
-    }
-    true
 }
 
 // ── Box model helpers ──────────────────────────────────────────────────
@@ -1905,246 +1363,147 @@ fn build_layout_box(
     }
 }
 
-// ── Float reflow post-processing ────────────────────────────────────────
+// ── CSS Positioning post-processing ─────────────────────────────────────
 
-/// Post-process a layout tree to reflow inline content around floated elements.
+/// CSS `position` value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CssPosition {
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+}
+
+/// Parse the `position` property from a `StyleMap`.
+fn parse_css_position(style: &StyleMap) -> CssPosition {
+    for (key, value) in &style.properties {
+        if key == "position" {
+            let val = match value {
+                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
+                _ => continue,
+            };
+            return match val {
+                "relative" => CssPosition::Relative,
+                "absolute" => CssPosition::Absolute,
+                "fixed" => CssPosition::Fixed,
+                "sticky" => CssPosition::Static, // sticky is handled separately at render time
+                _ => CssPosition::Static,
+            };
+        }
+    }
+    CssPosition::Static
+}
+
+/// Extract a CSS inset property (`top`, `left`, `right`, `bottom`) as pixels.
 ///
-/// This implements a simplified version of CSS float behavior:
-/// - `float: left` elements are positioned at the left edge
-/// - `float: right` elements are positioned at the right edge
-/// - Subsequent inline/text content narrows to avoid the float
-fn apply_float_reflow(layout_box: &mut LayoutBox) {
-    // Collect float regions from direct children.
-    let mut left_floats: Vec<(f32, f32, f32, f32)> = Vec::new(); // (x, y, width, height)
-    let mut right_floats: Vec<(f32, f32, f32, f32)> = Vec::new();
+/// Returns `None` if the property is not set or is `auto`.
+fn extract_inset_px(style: &StyleMap, prop: &str) -> Option<f32> {
+    for (key, value) in &style.properties {
+        if key == prop {
+            match value {
+                StyleValue::Px(px) => return Some(*px),
+                StyleValue::Keyword(s) | StyleValue::Str(s) => {
+                    let s = s.trim();
+                    if s == "auto" {
+                        return None;
+                    }
+                    if let Some(px) = s.strip_suffix("px").and_then(|v| v.trim().parse::<f32>().ok()) {
+                        return Some(px);
+                    }
+                    if let Some(v) = s.parse::<f32>().ok() {
+                        return Some(v);
+                    }
+                }
+                StyleValue::Number(n) => return Some(*n),
+                _ => {}
+            }
+        }
+    }
+    None
+}
 
-    for child in &layout_box.children {
-        let float_val = child
-            .style
-            .properties
-            .iter()
-            .find(|(k, _)| k == "float")
-            .and_then(|(_, v)| match v {
-                StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.as_str()),
-                _ => None,
-            });
-        match float_val {
-            Some("left") => {
-                left_floats.push((child.x, child.y, child.width, child.height));
+/// Recursively apply CSS positioning offsets to layout boxes.
+///
+/// For `position: relative`: offsets the box from its normal flow position
+/// using `top`/`left` (with `bottom`/`right` as alternatives).
+///
+/// For `position: absolute` or `position: fixed`: the box is already laid
+/// out by Taffy with `Position::Absolute`, but we need to ensure the
+/// position is correct relative to the containing block. We re-apply
+/// `top`/`left`/`right`/`bottom` offsets here.
+fn apply_positioning_recursive(layout_box: &mut LayoutBox, viewport: &Viewport) {
+    let position = parse_css_position(&layout_box.style);
+
+    match position {
+        CssPosition::Relative => {
+            // Relative: offset from normal flow position.
+            let top = extract_inset_px(&layout_box.style, "top");
+            let left = extract_inset_px(&layout_box.style, "left");
+            let bottom = extract_inset_px(&layout_box.style, "bottom");
+            let right = extract_inset_px(&layout_box.style, "right");
+
+            // `top` takes priority over `bottom`, `left` over `right`.
+            if let Some(t) = top {
+                layout_box.y += t;
+            } else if let Some(b) = bottom {
+                layout_box.y -= b;
             }
-            Some("right") => {
-                // Position float at the right edge.
-                right_floats.push((child.x, child.y, child.width, child.height));
+            if let Some(l) = left {
+                layout_box.x += l;
+            } else if let Some(r) = right {
+                layout_box.x -= r;
             }
-            _ => {}
+        }
+        CssPosition::Absolute | CssPosition::Fixed => {
+            // Absolute/fixed positioning is already handled by Taffy
+            // (we set Position::Absolute in build_taffy_style), but we
+            // store the position type in the style so the painter can
+            // emit FixedPosition ops for fixed elements.
+            //
+            // For fixed elements, we need to adjust coordinates to be
+            // relative to the viewport origin (0, 0) rather than the
+            // containing block. We do this by setting x/y directly
+            // from the inset properties if they are specified.
+            if position == CssPosition::Fixed {
+                let top = extract_inset_px(&layout_box.style, "top");
+                let left = extract_inset_px(&layout_box.style, "left");
+                let right = extract_inset_px(&layout_box.style, "right");
+                let bottom = extract_inset_px(&layout_box.style, "bottom");
+
+                if let Some(t) = top {
+                    layout_box.y = t;
+                } else if let Some(b) = bottom {
+                    layout_box.y = viewport.height - layout_box.height - b;
+                }
+                if let Some(l) = left {
+                    layout_box.x = l;
+                } else if let Some(r) = right {
+                    layout_box.x = viewport.width - layout_box.width - r;
+                }
+            }
+        }
+        CssPosition::Static => {
+            // No positioning offset needed.
         }
     }
 
-    if left_floats.is_empty() && right_floats.is_empty() {
-        // No floats — just recurse into children.
-        for child in &mut layout_box.children {
-            apply_float_reflow(child);
-        }
-        return;
-    }
-
-    // Reposition float:right elements to the right edge.
+    // Recurse into children.
     for child in &mut layout_box.children {
-        let float_val = child
-            .style
-            .properties
-            .iter()
-            .find(|(k, _)| k == "float")
-            .and_then(|(_, v)| match v {
-                StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.as_str()),
-                _ => None,
-            });
-        if float_val == Some("right") {
-            child.x = layout_box.x + layout_box.width - child.width;
-        }
-    }
-
-    // Narrow non-float children that overlap with float regions.
-    let container_x = layout_box.x;
-    let container_w = layout_box.width;
-
-    for child in &mut layout_box.children {
-        let is_float = child.style.properties.iter().any(|(k, v)| {
-            k == "float"
-                && matches!(v, StyleValue::Keyword(k) | StyleValue::Str(k) if k != "none")
-        });
-        if is_float {
-            continue;
-        }
-
-        // Check overlap with left floats.
-        let mut left_indent = 0.0_f32;
-        for &(fx, fy, fw, fh) in &left_floats {
-            if child.y < fy + fh && child.y + child.height > fy {
-                left_indent = left_indent.max(fx + fw - container_x);
-            }
-        }
-
-        // Check overlap with right floats.
-        let mut right_indent = 0.0_f32;
-        for &(_fx, fy, fw, fh) in &right_floats {
-            if child.y < fy + fh && child.y + child.height > fy {
-                right_indent = right_indent.max(fw);
-            }
-        }
-
-        if left_indent > 0.0 || right_indent > 0.0 {
-            child.x = container_x + left_indent;
-            child.width = (container_w - left_indent - right_indent).max(0.0);
-        }
-
-        // Recurse.
-        apply_float_reflow(child);
+        apply_positioning_recursive(child, viewport);
     }
 }
 
-// ── Table layout post-processing ────────────────────────────────────────
-
-/// Post-process table elements to equalize column widths.
+/// Recursively sort children by z-index within each stacking context.
 ///
-/// For elements with `display: table` (or `<table>` tags), this calculates
-/// equal column widths and repositions cells accordingly. It also handles
-/// colspan by merging cells across multiple columns.
-fn apply_table_layout(layout_box: &mut LayoutBox) {
-    let display = layout_box
-        .style
-        .properties
-        .iter()
-        .find(|(k, _)| k == "display")
-        .and_then(|(_, v)| match v {
-            StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.as_str()),
-            _ => None,
-        })
-        .unwrap_or("");
+/// Stable sort preserves DOM order for equal z-index values, matching
+/// CSS stacking context semantics.
+fn sort_by_z_index_recursive(layout_box: &mut LayoutBox) {
+    // Sort children by z-index.
+    layout_box.children.sort_by_key(|child| child.z_index);
 
-    let is_table = display == "table" || display == "block";
-
-    // Check if this looks like a table (has table-row children).
-    let has_table_rows = layout_box.children.iter().any(|child| {
-        child.style.properties.iter().any(|(k, v)| {
-            k == "display"
-                && matches!(v, StyleValue::Keyword(d) | StyleValue::Str(d) if d == "table-row")
-        })
-    });
-
-    if is_table && has_table_rows {
-        // Count max columns across rows.
-        let max_cols = layout_box
-            .children
-            .iter()
-            .filter(|child| {
-                child.style.properties.iter().any(|(k, v)| {
-                    k == "display"
-                        && matches!(v, StyleValue::Keyword(d) | StyleValue::Str(d) if d == "table-row")
-                })
-            })
-            .map(|row| row.children.len())
-            .max()
-            .unwrap_or(0);
-
-        if max_cols > 0 {
-            let table_width = layout_box.width;
-
-            // Calculate content-based column widths.
-            let mut col_widths: Vec<f32> = vec![0.0; max_cols];
-            for row in &layout_box.children {
-                let is_row = row.style.properties.iter().any(|(k, v)| {
-                    k == "display"
-                        && matches!(v, StyleValue::Keyword(d) | StyleValue::Str(d) if d == "table-row")
-                });
-                if !is_row {
-                    continue;
-                }
-                for (i, cell) in row.children.iter().enumerate() {
-                    if i < max_cols {
-                        col_widths[i] = col_widths[i].max(cell.width);
-                    }
-                }
-            }
-
-            // If total content width < table width, distribute extra space
-            // proportionally. If wider, shrink proportionally.
-            let total_content: f32 = col_widths.iter().sum();
-            if total_content < table_width && total_content > 0.0 {
-                let extra = table_width - total_content;
-                for w in &mut col_widths {
-                    *w += extra * (*w / total_content);
-                }
-            } else if total_content > table_width && total_content > 0.0 {
-                let ratio = table_width / total_content;
-                for w in &mut col_widths {
-                    *w *= ratio;
-                }
-            }
-
-            // Reposition cells in each row using content-based column widths.
-            let mut row_y = layout_box.y;
-            for row in &mut layout_box.children {
-                let is_row = row.style.properties.iter().any(|(k, v)| {
-                    k == "display"
-                        && matches!(v, StyleValue::Keyword(d) | StyleValue::Str(d) if d == "table-row")
-                });
-                if !is_row {
-                    row_y += row.height;
-                    continue;
-                }
-
-                row.x = layout_box.x;
-                row.y = row_y;
-                row.width = table_width;
-
-                let mut cell_x = layout_box.x;
-                let mut max_cell_height = 0.0_f32;
-
-                for (i, cell) in row.children.iter_mut().enumerate() {
-                    // Check for colspan attribute.
-                    let colspan = cell
-                        .style
-                        .properties
-                        .iter()
-                        .find(|(k, _)| k == "colspan")
-                        .and_then(|(_, v)| match v {
-                            StyleValue::Number(n) => Some(*n as usize),
-                            StyleValue::Keyword(s) | StyleValue::Str(s) => {
-                                s.parse::<usize>().ok()
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or(1)
-                        .max(1);
-
-                    // Sum column widths for colspan.
-                    let cell_w: f32 = (0..colspan)
-                        .filter_map(|c| col_widths.get(i + c))
-                        .sum();
-                    cell.x = cell_x;
-                    cell.y = row_y;
-                    cell.width = cell_w;
-                    cell_x += cell_w;
-                    max_cell_height = max_cell_height.max(cell.height);
-                }
-
-                // Equalize row height.
-                row.height = max_cell_height;
-                for cell in &mut row.children {
-                    cell.height = max_cell_height;
-                }
-                row_y += max_cell_height;
-            }
-
-            // Update table height.
-            layout_box.height = row_y - layout_box.y;
-        }
-    }
-
-    // Recurse into all children.
+    // Recurse into children.
     for child in &mut layout_box.children {
-        apply_table_layout(child);
+        sort_by_z_index_recursive(child);
     }
 }
 
@@ -2184,15 +1543,6 @@ struct LayoutProps {
     z_index: Option<i32>,
     /// CSS `float` property: "left" | "right" | "none".
     float: Option<String>,
-    // ── Border widths ────────────────────────────────────────────────
-    /// CSS `border-top-width` in px.
-    border_top: Option<f32>,
-    /// CSS `border-right-width` in px.
-    border_right: Option<f32>,
-    /// CSS `border-bottom-width` in px.
-    border_bottom: Option<f32>,
-    /// CSS `border-left-width` in px.
-    border_left: Option<f32>,
     // ── CSS Grid properties ────────────────────────────────────────────
     /// Parsed `grid-template-columns` track list.
     grid_template_columns: Option<Vec<TrackSizingFunction>>,
@@ -2204,24 +1554,6 @@ struct LayoutProps {
     grid_column: Option<(i16, i16)>,
     /// `grid-row: start / end` (1-based, converted to 0-based line index).
     grid_row: Option<(i16, i16)>,
-    /// Parsed `grid-auto-rows` track sizes for implicitly-created rows.
-    grid_auto_rows: Option<Vec<NonRepeatedTrackSizingFunction>>,
-    /// Parsed `grid-auto-columns` track sizes for implicitly-created columns.
-    grid_auto_columns: Option<Vec<NonRepeatedTrackSizingFunction>>,
-    /// CSS `flex-wrap`: "nowrap" | "wrap" | "wrap-reverse"
-    flex_wrap: Option<String>,
-    /// CSS `align-items`
-    align_items: Option<String>,
-    /// CSS `justify-content`
-    justify_content: Option<String>,
-    /// CSS `flex-grow`
-    flex_grow: Option<f32>,
-    /// CSS `flex-shrink`
-    flex_shrink: Option<f32>,
-    /// CSS `flex-basis`
-    flex_basis: Option<Dimension>,
-    /// CSS `align-self`
-    align_self: Option<String>,
 }
 
 /// Parse a CSS value into `LengthPercentageAuto`.
@@ -2267,17 +1599,7 @@ fn parse_dimension(val: &str) -> Option<Dimension> {
     // Handle calc() expressions.
     if val.starts_with("calc(") {
         if let Some(inner) = val.strip_prefix("calc(").and_then(|s| s.strip_suffix(')')) {
-            // Try pure-px evaluation first (no percentage or viewport units).
-            if !inner.contains('%') && !inner.contains("vw") && !inner.contains("vh") {
-                if let Some(px) = mod_css_engine::values::eval_calc(inner, 0.0) {
-                    return Some(Dimension::Length(px));
-                }
-            }
-            // For mixed units (e.g. `100% - 20px`), evaluate with a reference
-            // width of 1280px as a reasonable default. A proper implementation
-            // would defer calc resolution to layout time when the parent width
-            // is known.
-            if let Some(px) = mod_css_engine::values::eval_calc(inner, 1280.0) {
+            if let Some(px) = mod_css_engine::values::eval_calc(inner, 0.0) {
                 return Some(Dimension::Length(px));
             }
         }
@@ -2442,26 +1764,6 @@ fn parse_gap_value(s: &str) -> Option<f32> {
         return Some(pct); // Store as percent; used as px approximation.
     }
     None
-}
-
-/// Parse a CSS border-width value like `1px`, `thin`, `medium`, `thick`.
-fn parse_border_width_value(s: &str) -> Option<f32> {
-    let s = s.trim();
-    match s {
-        "thin" => Some(1.0),
-        "medium" => Some(3.0),
-        "thick" => Some(5.0),
-        "0" | "none" => Some(0.0),
-        _ => {
-            if let Some(px) = s.strip_suffix("px").and_then(|n| n.trim().parse::<f32>().ok()) {
-                Some(px)
-            } else if let Some(em) = s.strip_suffix("em").and_then(|n| n.trim().parse::<f32>().ok()) {
-                Some(em * 16.0)
-            } else {
-                s.parse::<f32>().ok()
-            }
-        }
-    }
 }
 
 /// Parse `grid-column` / `grid-row` shorthand: `start / end`.
@@ -2661,118 +1963,11 @@ fn parse_layout_props(attributes: &[(String, String)]) -> LayoutProps {
                         props.gap = Some((row, px));
                     }
                 }
-                "grid-auto-rows" => {
-                    if let Some(tracks) = parse_track_list(val) {
-                        props.grid_auto_rows = Some(tracks.into_iter().map(|t| match t {
-                            TrackSizingFunction::Single(nr) => nr,
-                            _ => NonRepeatedTrackSizingFunction { min: MinTrackSizingFunction::Auto, max: MaxTrackSizingFunction::Auto },
-                        }).collect());
-                    }
-                }
-                "grid-auto-columns" => {
-                    if let Some(tracks) = parse_track_list(val) {
-                        props.grid_auto_columns = Some(tracks.into_iter().map(|t| match t {
-                            TrackSizingFunction::Single(nr) => nr,
-                            _ => NonRepeatedTrackSizingFunction { min: MinTrackSizingFunction::Auto, max: MaxTrackSizingFunction::Auto },
-                        }).collect());
-                    }
-                }
                 "grid-column" => {
                     props.grid_column = parse_grid_line_span(val);
                 }
                 "grid-row" => {
                     props.grid_row = parse_grid_line_span(val);
-                }
-
-                // ── Border widths ────────────────────────────────────
-                "border-width" => {
-                    if let Some(px) = parse_border_width_value(val) {
-                        props.border_top = Some(px);
-                        props.border_right = Some(px);
-                        props.border_bottom = Some(px);
-                        props.border_left = Some(px);
-                    }
-                }
-                "border-top-width" => {
-                    props.border_top = parse_border_width_value(val);
-                }
-                "border-right-width" => {
-                    props.border_right = parse_border_width_value(val);
-                }
-                "border-bottom-width" => {
-                    props.border_bottom = parse_border_width_value(val);
-                }
-                "border-left-width" => {
-                    props.border_left = parse_border_width_value(val);
-                }
-
-                // ── Flex properties ───────────────────────────────────
-                "flex-wrap" => props.flex_wrap = Some(val.to_string()),
-                "align-items" => props.align_items = Some(val.to_string()),
-                "justify-content" => props.justify_content = Some(val.to_string()),
-                "flex-grow" => {
-                    if let Ok(v) = val.parse::<f32>() {
-                        props.flex_grow = Some(v);
-                    }
-                }
-                "flex-shrink" => {
-                    if let Ok(v) = val.parse::<f32>() {
-                        props.flex_shrink = Some(v);
-                    }
-                }
-                "flex-basis" => props.flex_basis = parse_dimension(val),
-                "align-self" => props.align_self = Some(val.to_string()),
-
-                // ── `flex` shorthand ──────────────────────────────────
-                // Supports: `flex: none`, `flex: <grow>`, `flex: <grow> <shrink>`,
-                // `flex: <grow> <shrink> <basis>`, and `flex: <grow> <basis>`.
-                "flex" => {
-                    let parts: Vec<&str> = val.split_whitespace().collect();
-                    match parts.len() {
-                        1 => {
-                            if parts[0] == "none" {
-                                // flex: none → 0 0 auto
-                                props.flex_grow = Some(0.0);
-                                props.flex_shrink = Some(0.0);
-                                props.flex_basis = Some(Dimension::Auto);
-                            } else if parts[0] == "auto" {
-                                // flex: auto → 1 1 auto
-                                props.flex_grow = Some(1.0);
-                                props.flex_shrink = Some(1.0);
-                                props.flex_basis = Some(Dimension::Auto);
-                            } else if let Ok(grow) = parts[0].parse::<f32>() {
-                                // flex: <number> → <number> 1 0
-                                props.flex_grow = Some(grow);
-                                props.flex_shrink = Some(1.0);
-                                props.flex_basis = Some(Dimension::Length(0.0));
-                            }
-                        }
-                        2 => {
-                            if let Ok(grow) = parts[0].parse::<f32>() {
-                                if let Ok(shrink) = parts[1].parse::<f32>() {
-                                    // flex: <grow> <shrink>
-                                    props.flex_grow = Some(grow);
-                                    props.flex_shrink = Some(shrink);
-                                    props.flex_basis = Some(Dimension::Length(0.0));
-                                } else if let Some(basis) = parse_dimension(parts[1]) {
-                                    // flex: <grow> <basis>
-                                    props.flex_grow = Some(grow);
-                                    props.flex_shrink = Some(1.0);
-                                    props.flex_basis = Some(basis);
-                                }
-                            }
-                        }
-                        3 => {
-                            if let (Ok(grow), Ok(shrink)) =
-                                (parts[0].parse::<f32>(), parts[1].parse::<f32>())
-                            {
-                                props.flex_grow = Some(grow);
-                                props.flex_shrink = Some(shrink);
-                                props.flex_basis = parse_dimension(parts[2]).or(Some(Dimension::Auto));
-                            }
-                        }
-                        _ => {}
-                    }
                 }
 
                 _ => {}
@@ -2805,71 +2000,6 @@ fn resolve_display(tag: &str, attributes: &[(String, String)]) -> String {
 
     // User-agent defaults.
     display_for_tag(tag).to_string()
-}
-
-/// Resolve CSS `line-height` from a style properties list.
-///
-/// Returns the line height in pixels. Supports:
-/// - `<number>` (unitless multiplier of font-size)
-/// - `<n>px` (absolute pixel value)
-/// - `<n>%` (percentage of font-size)
-/// - `normal` / fallback → `font_size * LINE_HEIGHT_FACTOR`
-fn resolve_line_height(style_props: &[(String, StyleValue)], font_size: f32) -> f32 {
-    for (key, value) in style_props {
-        if key == "line-height" {
-            match value {
-                StyleValue::Px(px) => return *px,
-                StyleValue::Number(n) => return *n * font_size,
-                StyleValue::Percent(pct) => return pct / 100.0 * font_size,
-                StyleValue::Keyword(k) | StyleValue::Str(k) => {
-                    let k = k.trim();
-                    if k == "normal" {
-                        return font_size * LINE_HEIGHT_FACTOR;
-                    }
-                    if let Some(px) = k.strip_suffix("px").and_then(|s| s.trim().parse::<f32>().ok()) {
-                        return px;
-                    }
-                    if let Some(pct) = k.strip_suffix('%').and_then(|s| s.trim().parse::<f32>().ok()) {
-                        return pct / 100.0 * font_size;
-                    }
-                    // Try unitless number (e.g. "1.5").
-                    if let Ok(n) = k.parse::<f32>() {
-                        return n * font_size;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    font_size * LINE_HEIGHT_FACTOR
-}
-
-/// Resolve `line-height` from `data-nova-style` attribute string.
-fn resolve_line_height_from_attrs(attributes: &[(String, String)], font_size: f32) -> f32 {
-    for attr_name in &["data-nova-style", "style"] {
-        if let Some(style_attr) = attributes.iter().find(|(k, _)| k == *attr_name) {
-            for decl in style_attr.1.split(';') {
-                let parts: Vec<&str> = decl.splitn(2, ':').collect();
-                if parts.len() == 2 && parts[0].trim() == "line-height" {
-                    let val = parts[1].trim();
-                    if val == "normal" {
-                        return font_size * LINE_HEIGHT_FACTOR;
-                    }
-                    if let Some(px) = val.strip_suffix("px").and_then(|s| s.trim().parse::<f32>().ok()) {
-                        return px;
-                    }
-                    if let Some(pct) = val.strip_suffix('%').and_then(|s| s.trim().parse::<f32>().ok()) {
-                        return pct / 100.0 * font_size;
-                    }
-                    // Unitless multiplier.
-                    if let Ok(n) = val.parse::<f32>() {
-                        return n * font_size;
-                    }
-                }
-            }
-        }
-    }
-    font_size * LINE_HEIGHT_FACTOR
 }
 
 /// Resolve font-size from data-nova-style, tag defaults, or parent inheritance.
@@ -2919,22 +2049,6 @@ fn build_taffy_style(
         left: lp.padding_left.unwrap_or(LengthPercentage::Length(0.0)),
     };
 
-    // Build border rect from parsed border widths.
-    let border = Rect {
-        top: LengthPercentage::Length(lp.border_top.unwrap_or(0.0)),
-        right: LengthPercentage::Length(lp.border_right.unwrap_or(0.0)),
-        bottom: LengthPercentage::Length(lp.border_bottom.unwrap_or(0.0)),
-        left: LengthPercentage::Length(lp.border_left.unwrap_or(0.0)),
-    };
-
-    // Determine box-sizing. When `border-box`, Taffy already includes
-    // padding and border in the size (Taffy's default behaviour with the
-    // `border` and `padding` fields), so we use `BoxSizing::BorderBox`.
-    let box_sizing = match lp.box_sizing.as_deref() {
-        Some("border-box") => taffy::BoxSizing::BorderBox,
-        _ => taffy::BoxSizing::ContentBox,
-    };
-
     // When both horizontal margins are `auto`, centre the element via
     // `align_self: Center` (the Taffy-idiomatic way to express `margin: 0 auto`).
     let center_via_auto_margin = matches!(
@@ -2981,29 +2095,14 @@ fn build_taffy_style(
         lp.margin_left.unwrap_or(LengthPercentageAuto::Length(0.0))
     };
 
-    // Flex item properties (for children of flex containers).
-    let item_flex_grow = lp.flex_grow;
-    let item_flex_shrink = lp.flex_shrink;
-    let item_flex_basis = lp.flex_basis;
-    let item_align_self = match lp.align_self.as_deref() {
-        Some("center") => Some(AlignSelf::Center),
-        Some("flex-start") | Some("start") => Some(AlignSelf::FlexStart),
-        Some("flex-end") | Some("end") => Some(AlignSelf::FlexEnd),
-        Some("stretch") => Some(AlignSelf::Stretch),
-        Some("baseline") => Some(AlignSelf::Baseline),
-        _ => None,
-    };
-
     match display {
         "none" => Style {
             display: Display::None,
             ..Style::DEFAULT
         },
 
-        "grid" | "inline-grid" => {
+        "grid" => {
             // Map CSS grid properties to Taffy Grid style.
-            // inline-grid containers shrink-wrap instead of filling 100% width.
-            let is_inline_grid = display == "inline-grid";
             let columns = lp.grid_template_columns.clone().unwrap_or_default();
             let rows = lp.grid_template_rows.clone().unwrap_or_default();
             let (row_gap, col_gap) = lp.gap.unwrap_or((0.0, 0.0));
@@ -3016,55 +2115,22 @@ fn build_taffy_style(
             let row_start = lp.grid_row.map(|(s, _)| s);
             let row_end = lp.grid_row.map(|(_, e)| e);
 
-            // Flex item properties when this grid container is itself a flex/grid child.
-            let grid_flex_grow = item_flex_grow.unwrap_or(0.0);
-            let grid_flex_shrink = item_flex_shrink.unwrap_or(1.0);
-            let default_grid_width = if is_inline_grid {
-                Dimension::Auto
-            } else {
-                Dimension::Percent(1.0)
-            };
-            let grid_width = if let Some(basis) = item_flex_basis {
-                basis
-            } else {
-                lp.width.unwrap_or(default_grid_width)
-            };
-            let grid_align_self = if item_align_self.is_some() {
-                item_align_self
-            } else if center_via_auto_margin {
-                Some(AlignSelf::Center)
-            } else if is_inline_grid {
-                Some(AlignSelf::FlexStart)
-            } else {
-                None
-            };
-
             Style {
                 display: Display::Grid,
                 position: taffy_position,
                 inset,
-                flex_grow: grid_flex_grow,
-                flex_shrink: grid_flex_shrink,
                 size: Size {
-                    width: grid_width,
-                    height: lp.height.unwrap_or(Dimension::Auto),
-                },
-                min_size: Size {
-                    width: lp.min_width.unwrap_or(Dimension::Auto),
-                    height: lp.min_height.unwrap_or(Dimension::Auto),
+                    width: lp.width.unwrap_or(Dimension::Percent(1.0)),
+                    height: Dimension::Auto,
                 },
                 max_size: Size {
                     width: lp.max_width.unwrap_or(Dimension::Auto),
-                    height: lp.max_height.unwrap_or(Dimension::Auto),
+                    height: Dimension::Auto,
                 },
                 margin,
                 padding,
-                border,
-                box_sizing,
                 grid_template_columns: columns,
                 grid_template_rows: rows,
-                grid_auto_rows: lp.grid_auto_rows.clone().unwrap_or_default(),
-                grid_auto_columns: lp.grid_auto_columns.clone().unwrap_or_default(),
                 gap: Size {
                     width: LengthPercentage::Length(col_gap),
                     height: LengthPercentage::Length(row_gap),
@@ -3078,154 +2144,54 @@ fn build_taffy_style(
                     start: row_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
                     end: row_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
                 },
-                align_self: grid_align_self,
+                align_self: if center_via_auto_margin {
+                    Some(AlignSelf::Center)
+                } else {
+                    None
+                },
                 ..Style::DEFAULT
             }
         }
 
-        "flex" | "inline-flex" => {
+        "flex" => {
             let direction = resolve_flex_direction(attributes);
-            // inline-flex containers shrink-wrap (Auto width) instead of
-            // filling 100% of the parent.
-            let is_inline_flex = display == "inline-flex";
-            let flex_wrap = match lp.flex_wrap.as_deref() {
-                Some("wrap") => FlexWrap::Wrap,
-                Some("wrap-reverse") => FlexWrap::WrapReverse,
-                _ => FlexWrap::NoWrap,
-            };
-            let align = match lp.align_items.as_deref() {
-                Some("center") => Some(AlignItems::Center),
-                Some("flex-start") | Some("start") => Some(AlignItems::FlexStart),
-                Some("flex-end") | Some("end") => Some(AlignItems::FlexEnd),
-                Some("stretch") => Some(AlignItems::Stretch),
-                Some("baseline") => Some(AlignItems::Baseline),
-                _ => None,
-            };
-            let justify = match lp.justify_content.as_deref() {
-                Some("center") => Some(JustifyContent::Center),
-                Some("flex-start") | Some("start") => Some(JustifyContent::FlexStart),
-                Some("flex-end") | Some("end") => Some(JustifyContent::FlexEnd),
-                Some("space-between") => Some(JustifyContent::SpaceBetween),
-                Some("space-around") => Some(JustifyContent::SpaceAround),
-                Some("space-evenly") => Some(JustifyContent::SpaceEvenly),
-                _ => None,
-            };
-            let (row_gap, col_gap) = lp.gap.unwrap_or((0.0, 0.0));
-            // Flex item properties when this flex container is itself a flex/grid child.
-            let flex_item_grow = item_flex_grow.unwrap_or(0.0);
-            let flex_item_shrink = item_flex_shrink.unwrap_or(1.0);
-            let default_flex_width = if is_inline_flex {
-                Dimension::Auto
-            } else {
-                Dimension::Percent(1.0)
-            };
-            let flex_item_width = if let Some(basis) = item_flex_basis {
-                basis
-            } else {
-                lp.width.unwrap_or(default_flex_width)
-            };
-            let flex_item_align_self = if item_align_self.is_some() {
-                item_align_self
-            } else if center_via_auto_margin {
-                Some(AlignSelf::Center)
-            } else if is_inline_flex {
-                // Prevent the parent's align-items: stretch from expanding
-                // this inline-level container to fill the cross axis.
-                Some(AlignSelf::FlexStart)
-            } else {
-                None
-            };
             Style {
                 display: Display::Flex,
                 flex_direction: direction,
-                flex_wrap,
                 position: taffy_position,
                 inset,
-                flex_grow: flex_item_grow,
-                flex_shrink: flex_item_shrink,
                 size: Size {
-                    width: flex_item_width,
-                    height: lp.height.unwrap_or(Dimension::Auto),
-                },
-                min_size: Size {
-                    width: lp.min_width.unwrap_or(Dimension::Auto),
-                    height: lp.min_height.unwrap_or(Dimension::Auto),
+                    width: lp.width.unwrap_or(Dimension::Percent(1.0)),
+                    height: Dimension::Auto,
                 },
                 max_size: Size {
                     width: lp.max_width.unwrap_or(Dimension::Auto),
-                    height: lp.max_height.unwrap_or(Dimension::Auto),
+                    height: Dimension::Auto,
                 },
                 margin,
                 padding,
-                border,
-                box_sizing,
-                align_items: align,
-                justify_content: justify,
-                gap: Size {
-                    width: LengthPercentage::Length(col_gap),
-                    height: LengthPercentage::Length(row_gap),
+                align_self: if center_via_auto_margin {
+                    Some(AlignSelf::Center)
+                } else {
+                    None
                 },
-                // Grid placement (for grid children).
-                grid_column: {
-                    let col_start = lp.grid_column.map(|(s, _)| s);
-                    let col_end = lp.grid_column.map(|(_, e)| e);
-                    Line {
-                        start: col_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                        end: col_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                    }
-                },
-                grid_row: {
-                    let row_start = lp.grid_row.map(|(s, _)| s);
-                    let row_end = lp.grid_row.map(|(_, e)| e);
-                    Line {
-                        start: row_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                        end: row_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                    }
-                },
-                align_self: flex_item_align_self,
                 ..Style::DEFAULT
             }
         }
 
         // Table row: horizontal flex container so cells sit side-by-side.
-        "table-row" => {
-            let (row_gap, col_gap) = lp.gap.unwrap_or((0.0, 0.0));
-            Style {
-                display: Display::Flex,
-                flex_direction: FlexDirection::Row,
-                position: taffy_position,
-                inset,
-                size: Size {
-                    width: Dimension::Percent(1.0),
-                    height: Dimension::Auto,
-                },
-                margin,
-                padding,
-                border,
-                box_sizing,
-                gap: Size {
-                    width: LengthPercentage::Length(col_gap),
-                    height: LengthPercentage::Length(row_gap),
-                },
-                // Grid placement (for grid children).
-                grid_column: {
-                    let col_start = lp.grid_column.map(|(s, _)| s);
-                    let col_end = lp.grid_column.map(|(_, e)| e);
-                    Line {
-                        start: col_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                        end: col_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                    }
-                },
-                grid_row: {
-                    let row_start = lp.grid_row.map(|(s, _)| s);
-                    let row_end = lp.grid_row.map(|(_, e)| e);
-                    Line {
-                        start: row_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                        end: row_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                    }
-                },
-                ..Style::DEFAULT
-            }
+        "table-row" => Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            position: taffy_position,
+            inset,
+            size: Size {
+                width: Dimension::Percent(1.0),
+                height: Dimension::Auto,
+            },
+            margin,
+            padding,
+            ..Style::DEFAULT
         },
 
         // Table cell: flex item that grows to share available space.
@@ -3240,173 +2206,77 @@ fn build_taffy_style(
                 inset,
                 size: Size {
                     width: cell_width,
-                    height: lp.height.unwrap_or(Dimension::Auto),
-                },
-                min_size: Size {
-                    width: lp.min_width.unwrap_or(Dimension::Auto),
-                    height: lp.min_height.unwrap_or(Dimension::Auto),
+                    height: Dimension::Auto,
                 },
                 max_size: Size {
                     width: lp.max_width.unwrap_or(Dimension::Auto),
-                    height: lp.max_height.unwrap_or(Dimension::Auto),
+                    height: Dimension::Auto,
                 },
                 margin,
                 padding,
-                border,
-                box_sizing,
-                // Grid placement (for grid children).
-                grid_column: {
-                    let col_start = lp.grid_column.map(|(s, _)| s);
-                    let col_end = lp.grid_column.map(|(_, e)| e);
-                    Line {
-                        start: col_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                        end: col_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                    }
-                },
-                grid_row: {
-                    let row_start = lp.grid_row.map(|(s, _)| s);
-                    let row_end = lp.grid_row.map(|(_, e)| e);
-                    Line {
-                        start: row_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                        end: row_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                    }
-                },
                 ..Style::DEFAULT
             }
         },
 
         // inline-block: behaves like a block box that flows inline.
-        "inline-block" => {
-            let ib_flex_grow = item_flex_grow.unwrap_or(0.0);
-            let ib_flex_shrink = item_flex_shrink.unwrap_or(0.0);
-            let ib_width = if let Some(basis) = item_flex_basis {
-                basis
-            } else {
-                lp.width.unwrap_or(Dimension::Auto)
-            };
-            let ib_align_self = if item_align_self.is_some() {
-                item_align_self
-            } else if center_via_auto_margin {
-                Some(AlignSelf::Center)
-            } else {
-                None
-            };
-            let (row_gap, col_gap) = lp.gap.unwrap_or((0.0, 0.0));
-            Style {
-                display: Display::Flex,
-                flex_direction: FlexDirection::Column,
-                position: taffy_position,
-                inset,
-                flex_grow: ib_flex_grow,
-                flex_shrink: ib_flex_shrink,
-                size: Size {
-                    width: ib_width,
-                    height: lp.height.unwrap_or(Dimension::Auto),
-                },
-                min_size: Size {
-                    width: lp.min_width.unwrap_or(Dimension::Auto),
-                    height: lp.min_height.unwrap_or(Dimension::Auto),
-                },
-                max_size: Size {
-                    width: lp.max_width.unwrap_or(Dimension::Auto),
-                    height: lp.max_height.unwrap_or(Dimension::Auto),
-                },
-                margin,
-                padding,
-                border,
-                box_sizing,
-                gap: Size {
-                    width: LengthPercentage::Length(col_gap),
-                    height: LengthPercentage::Length(row_gap),
-                },
-                // Grid placement (for grid children).
-                grid_column: {
-                    let col_start = lp.grid_column.map(|(s, _)| s);
-                    let col_end = lp.grid_column.map(|(_, e)| e);
-                    Line {
-                        start: col_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                        end: col_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                    }
-                },
-                grid_row: {
-                    let row_start = lp.grid_row.map(|(s, _)| s);
-                    let row_end = lp.grid_row.map(|(_, e)| e);
-                    Line {
-                        start: row_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                        end: row_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                    }
-                },
-                align_self: ib_align_self,
-                ..Style::DEFAULT
-            }
+        "inline-block" => Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            position: taffy_position,
+            inset,
+            size: Size {
+                width: lp.width.unwrap_or(Dimension::Auto),
+                height: Dimension::Auto,
+            },
+            max_size: Size {
+                width: lp.max_width.unwrap_or(Dimension::Auto),
+                height: Dimension::Auto,
+            },
+            margin,
+            padding,
+            flex_shrink: 0.0,
+            ..Style::DEFAULT
         },
 
-        "inline" => {
-            let inline_wrap = match lp.flex_wrap.as_deref() {
-                Some("wrap") => FlexWrap::Wrap,
-                Some("wrap-reverse") => FlexWrap::WrapReverse,
-                _ => FlexWrap::Wrap, // inline text should wrap by default
-            };
-            let (row_gap, col_gap) = lp.gap.unwrap_or((0.0, 0.0));
-            // Apply flex item properties from CSS (same as block case).
-            let inline_flex_grow = item_flex_grow.unwrap_or(0.0);
-            let inline_flex_shrink = item_flex_shrink.unwrap_or(1.0);
-            let inline_width = if let Some(basis) = item_flex_basis {
-                basis
-            } else {
-                lp.width.unwrap_or(Dimension::Auto)
-            };
-            let inline_align_self = if item_align_self.is_some() {
-                item_align_self
-            } else if center_via_auto_margin {
+        "inline" => Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::Wrap,
+            position: taffy_position,
+            inset,
+            size: Size {
+                width: lp.width.unwrap_or(Dimension::Auto),
+                height: Dimension::Auto,
+            },
+            max_size: Size {
+                width: lp.max_width.unwrap_or(Dimension::Auto),
+                height: Dimension::Auto,
+            },
+            margin,
+            padding,
+            // Grid placement (for grid children).
+            grid_column: {
+                let col_start = lp.grid_column.map(|(s, _)| s);
+                let col_end = lp.grid_column.map(|(_, e)| e);
+                Line {
+                    start: col_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                    end: col_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                }
+            },
+            grid_row: {
+                let row_start = lp.grid_row.map(|(s, _)| s);
+                let row_end = lp.grid_row.map(|(_, e)| e);
+                Line {
+                    start: row_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                    end: row_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                }
+            },
+            align_self: if center_via_auto_margin {
                 Some(AlignSelf::Center)
             } else {
                 None
-            };
-            Style {
-                display: Display::Flex,
-                flex_direction: FlexDirection::Row,
-                flex_wrap: inline_wrap,
-                position: taffy_position,
-                inset,
-                flex_grow: inline_flex_grow,
-                flex_shrink: inline_flex_shrink,
-                size: Size {
-                    width: inline_width,
-                    height: Dimension::Auto,
-                },
-                max_size: Size {
-                    width: lp.max_width.unwrap_or(Dimension::Auto),
-                    height: Dimension::Auto,
-                },
-                margin,
-                padding,
-                border,
-                box_sizing,
-                gap: Size {
-                    width: LengthPercentage::Length(col_gap),
-                    height: LengthPercentage::Length(row_gap),
-                },
-                // Grid placement (for grid children).
-                grid_column: {
-                    let col_start = lp.grid_column.map(|(s, _)| s);
-                    let col_end = lp.grid_column.map(|(_, e)| e);
-                    Line {
-                        start: col_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                        end: col_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                    }
-                },
-                grid_row: {
-                    let row_start = lp.grid_row.map(|(s, _)| s);
-                    let row_end = lp.grid_row.map(|(_, e)| e);
-                    Line {
-                        start: row_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                        end: row_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                    }
-                },
-                align_self: inline_align_self,
-                ..Style::DEFAULT
-            }
+            },
+            ..Style::DEFAULT
         },
 
         // "block" and everything else: column flex container at full width.
@@ -3418,12 +2288,7 @@ fn build_taffy_style(
             let is_floated = lp.float.as_deref().map_or(false, |f| f == "left" || f == "right");
             let has_h_margins = lp.margin_left.is_some() || lp.margin_right.is_some()
                 || is_floated;
-            // If the element has flex item properties set in CSS, it's likely a
-            // flex child and should NOT default to 100% width.
-            let is_flex_child = lp.flex_grow.is_some() || lp.flex_shrink.is_some() || lp.flex_basis.is_some();
-            let default_width = if is_flex_child {
-                lp.width.unwrap_or(Dimension::Auto)
-            } else if has_h_margins || lp.width.is_some() || is_floated {
+            let default_width = if has_h_margins || lp.width.is_some() || is_floated {
                 lp.width.unwrap_or(Dimension::Auto)
             } else {
                 Dimension::Percent(1.0)
@@ -3444,32 +2309,15 @@ fn build_taffy_style(
             };
             // float_flex_shrink was computed above (0.0 for floated, 1.0 otherwise).
             let _ = float_margin_left; // suppress unused warning; value folded into float_margin
-
-            // Apply flex item properties from CSS (flex-grow, flex-shrink, flex-basis, align-self).
-            let final_flex_grow = item_flex_grow.unwrap_or(effective_flex_grow);
-            let final_flex_shrink = item_flex_shrink.unwrap_or(float_flex_shrink);
-            let final_width = if let Some(basis) = item_flex_basis {
-                basis
-            } else {
-                default_width
-            };
-            let final_align_self = if item_align_self.is_some() {
-                item_align_self
-            } else if center_via_auto_margin {
-                Some(AlignSelf::Center)
-            } else {
-                None
-            };
-
             Style {
                 display: Display::Flex,
                 flex_direction: FlexDirection::Column,
                 position: taffy_position,
                 inset,
-                flex_grow: final_flex_grow,
-                flex_shrink: final_flex_shrink,
+                flex_grow: effective_flex_grow,
+                flex_shrink: float_flex_shrink,
                 size: Size {
-                    width: final_width,
+                    width: default_width,
                     height: lp.height.unwrap_or(Dimension::Auto),
                 },
                 min_size: Size {
@@ -3482,8 +2330,6 @@ fn build_taffy_style(
                 },
                 margin: float_margin,
                 padding,
-                border,
-                box_sizing,
                 // Grid placement (for grid children).
                 grid_column: {
                     let col_start = lp.grid_column.map(|(s, _)| s);
@@ -3501,7 +2347,11 @@ fn build_taffy_style(
                         end: row_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
                     }
                 },
-                align_self: final_align_self,
+                align_self: if center_via_auto_margin {
+                    Some(AlignSelf::Center)
+                } else {
+                    None
+                },
                 ..Style::DEFAULT
             }
         }
@@ -3510,19 +2360,17 @@ fn build_taffy_style(
 
 /// Parse the `flex-direction` value from an element's inline style.
 fn resolve_flex_direction(attributes: &[(String, String)]) -> FlexDirection {
-    for attr_name in &["data-nova-style", "style"] {
-        if let Some(style_attr) = attributes.iter().find(|(k, _)| k == *attr_name) {
-            for decl in style_attr.1.split(';') {
-                let parts: Vec<&str> = decl.splitn(2, ':').collect();
-                if parts.len() == 2 && parts[0].trim() == "flex-direction" {
-                    return match parts[1].trim() {
-                        "row" => FlexDirection::Row,
-                        "row-reverse" => FlexDirection::RowReverse,
-                        "column" => FlexDirection::Column,
-                        "column-reverse" => FlexDirection::ColumnReverse,
-                        _ => FlexDirection::Row,
-                    };
-                }
+    if let Some(style_attr) = attributes.iter().find(|(k, _)| k == "style") {
+        for decl in style_attr.1.split(';') {
+            let parts: Vec<&str> = decl.splitn(2, ':').collect();
+            if parts.len() == 2 && parts[0].trim() == "flex-direction" {
+                return match parts[1].trim() {
+                    "row" => FlexDirection::Row,
+                    "row-reverse" => FlexDirection::RowReverse,
+                    "column" => FlexDirection::Column,
+                    "column-reverse" => FlexDirection::ColumnReverse,
+                    _ => FlexDirection::Row, // CSS default for flex containers
+                };
             }
         }
     }
@@ -4128,9 +2976,9 @@ mod phase4_tests {
     }
 
     #[test]
-    fn multi_word_text_creates_line_with_combined_text() {
-        // A text node with multiple words should produce a line box containing
-        // a single combined text node (words merged for consistent rendering).
+    fn multi_word_text_creates_multiple_children() {
+        // A text node with multiple words should produce a wrapper containing
+        // multiple word leaf nodes.
         let dom = DomNode::Document {
             children: vec![DomNode::Element {
                 tag: "body".into(),
@@ -4140,23 +2988,18 @@ mod phase4_tests {
         };
         let root = compute_layout(&dom, &viewport()).expect("layout ok");
         let body = &root.children[0];
+        // body has one child: the inline wrapper for the text.
         assert!(
             !body.children.is_empty(),
             "body should have children for the text"
         );
-        // The line box should contain merged text run(s).
-        let line_box = &body.children[0];
+        // The text wrapper should have multiple children (word nodes + space nodes).
+        let text_wrapper = &body.children[0];
         assert!(
-            !line_box.children.is_empty(),
-            "line box should have at least one text run"
+            text_wrapper.children.len() >= 3,
+            "text wrapper should have >=3 children (words + spaces), got {}",
+            text_wrapper.children.len()
         );
-        // The first child should contain the combined text.
-        if let LayoutContent::Text(ref text) = line_box.children[0].content {
-            assert!(
-                text.contains("Hello") && text.contains("World") && text.contains("Foo"),
-                "combined text should contain all words, got: {text}"
-            );
-        }
     }
 
     #[test]
@@ -4227,293 +3070,199 @@ mod phase4_tests {
         );
     }
 
-    // ── Flex percentage children (Wikipedia 2-column layout) ──────────
+    // ── Phase 4: CSS Positioning + Transforms tests ────────────────────
 
     #[test]
-    fn flex_children_percentage_widths() {
-        // A flex row container with two children at 70% and 30% should
-        // produce a side-by-side 2-column layout.
+    fn position_relative_offsets() {
+        // An element with position: relative and top/left offsets should be
+        // visually shifted from its normal flow position.
         let dom = DomNode::Document {
             children: vec![DomNode::Element {
                 tag: "div".into(),
                 attributes: vec![(
                     "data-nova-style".into(),
-                    "display: flex; flex-direction: row".into(),
+                    "position: relative; top: 10px; left: 20px".into(),
                 )],
+                children: vec![DomNode::Text("Shifted".into())],
+            }],
+        };
+        let root = compute_layout(&dom, &viewport()).expect("layout ok");
+        let div = &root.children[0];
+        // The div should be offset by top=10, left=20 from its normal position.
+        assert!(
+            div.x >= 20.0,
+            "relative div should have x >= 20 from left offset, got {}",
+            div.x
+        );
+        assert!(
+            div.y >= 10.0,
+            "relative div should have y >= 10 from top offset, got {}",
+            div.y
+        );
+    }
+
+    #[test]
+    fn position_relative_bottom_right() {
+        // When only bottom/right are set (not top/left), they offset the opposite way.
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "div".into(),
+                attributes: vec![(
+                    "data-nova-style".into(),
+                    "position: relative; bottom: 10px; right: 20px".into(),
+                )],
+                children: vec![DomNode::Text("Shifted".into())],
+            }],
+        };
+        let root_normal = {
+            let dom2 = DomNode::Document {
+                children: vec![DomNode::Element {
+                    tag: "div".into(),
+                    attributes: vec![],
+                    children: vec![DomNode::Text("Shifted".into())],
+                }],
+            };
+            compute_layout(&dom2, &viewport()).expect("layout ok")
+        };
+        let root = compute_layout(&dom, &viewport()).expect("layout ok");
+        let div = &root.children[0];
+        let div_normal = &root_normal.children[0];
+        // Bottom=10 should shift y up by 10; right=20 should shift x left by 20.
+        assert!(
+            div.y < div_normal.y || (div.y - div_normal.y).abs() < 0.01,
+            "bottom offset should move element up or keep at 0"
+        );
+    }
+
+    #[test]
+    fn position_absolute_placement() {
+        // An absolutely positioned element with top/left should be placed
+        // relative to its containing block.
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "div".into(),
+                attributes: vec![(
+                    "data-nova-style".into(),
+                    "position: relative".into(),
+                )],
+                children: vec![
+                    DomNode::Text("Normal flow".into()),
+                    DomNode::Element {
+                        tag: "div".into(),
+                        attributes: vec![(
+                            "data-nova-style".into(),
+                            "position: absolute; top: 10px; left: 10px; width: 100px".into(),
+                        )],
+                        children: vec![DomNode::Text("Absolute".into())],
+                    },
+                ],
+            }],
+        };
+        let root = compute_layout(&dom, &viewport()).expect("layout ok");
+        let container = &root.children[0];
+        // Find the absolute child (second child in DOM, but z-index sorting may reorder).
+        let abs_child = container.children.iter().find(|c| c.width <= 100.0 + 1.0);
+        assert!(abs_child.is_some(), "should find the absolutely positioned child");
+    }
+
+    #[test]
+    fn position_fixed_viewport_relative() {
+        // A fixed element should be positioned relative to the viewport.
+        let dom = DomNode::Document {
+            children: vec![
+                DomNode::Element {
+                    tag: "div".into(),
+                    attributes: vec![(
+                        "data-nova-style".into(),
+                        "position: fixed; top: 0px; left: 0px; width: 800px; height: 50px".into(),
+                    )],
+                    children: vec![DomNode::Text("Fixed header".into())],
+                },
+            ],
+        };
+        let root = compute_layout(&dom, &viewport()).expect("layout ok");
+        let fixed = &root.children[0];
+        assert!(
+            (fixed.x - 0.0).abs() < 1.0,
+            "fixed element x should be 0, got {}",
+            fixed.x
+        );
+        assert!(
+            (fixed.y - 0.0).abs() < 1.0,
+            "fixed element y should be 0, got {}",
+            fixed.y
+        );
+    }
+
+    #[test]
+    fn z_index_sorting() {
+        // Children with different z-index values should be sorted by z-index
+        // after layout.
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "div".into(),
+                attributes: vec![],
                 children: vec![
                     DomNode::Element {
                         tag: "div".into(),
                         attributes: vec![(
                             "data-nova-style".into(),
-                            "width: 70%".into(),
+                            "z-index: 10".into(),
                         )],
-                        children: vec![DomNode::Text("Main content".into())],
+                        children: vec![DomNode::Text("High z".into())],
                     },
                     DomNode::Element {
                         tag: "div".into(),
                         attributes: vec![(
                             "data-nova-style".into(),
-                            "width: 30%".into(),
+                            "z-index: -1".into(),
                         )],
-                        children: vec![DomNode::Text("Sidebar".into())],
+                        children: vec![DomNode::Text("Low z".into())],
+                    },
+                    DomNode::Element {
+                        tag: "div".into(),
+                        attributes: vec![(
+                            "data-nova-style".into(),
+                            "z-index: 5".into(),
+                        )],
+                        children: vec![DomNode::Text("Mid z".into())],
                     },
                 ],
             }],
         };
         let root = compute_layout(&dom, &viewport()).expect("layout ok");
-        let flex = &root.children[0];
-        assert_eq!(flex.children.len(), 2, "flex should have 2 children");
-        let main = &flex.children[0];
-        let sidebar = &flex.children[1];
-        // Main should be ~70% of 800 = 560.
-        assert!(
-            (main.width - 560.0).abs() < 1.0,
-            "main should be ~560px (70%), got {}",
-            main.width
-        );
-        // Sidebar should be ~30% of 800 = 240.
-        assert!(
-            (sidebar.width - 240.0).abs() < 1.0,
-            "sidebar should be ~240px (30%), got {}",
-            sidebar.width
-        );
-        // Sidebar should be to the right of main.
-        assert!(
-            sidebar.x > main.x,
-            "sidebar should be to the right of main: sidebar.x={}, main.x={}",
-            sidebar.x,
-            main.x
-        );
+        let container = &root.children[0];
+        assert_eq!(container.children.len(), 3);
+        // Children should be sorted by z-index: -1, 5, 10.
+        assert_eq!(container.children[0].z_index, -1);
+        assert_eq!(container.children[1].z_index, 5);
+        assert_eq!(container.children[2].z_index, 10);
     }
 
     #[test]
-    fn flex_shorthand_single_number() {
-        // `flex: 1` → flex-grow: 1, flex-shrink: 1, flex-basis: 0.
-        let attrs = vec![(
-            "data-nova-style".into(),
-            "flex: 1".into(),
-        )];
-        let lp = parse_layout_props(&attrs);
-        assert!(
-            matches!(lp.flex_grow, Some(v) if (v - 1.0).abs() < 0.01),
-            "flex-grow should be 1, got {:?}",
-            lp.flex_grow
-        );
-        assert!(
-            matches!(lp.flex_shrink, Some(v) if (v - 1.0).abs() < 0.01),
-            "flex-shrink should be 1, got {:?}",
-            lp.flex_shrink
-        );
-        assert!(
-            matches!(lp.flex_basis, Some(Dimension::Length(v)) if v.abs() < 0.01),
-            "flex-basis should be 0, got {:?}",
-            lp.flex_basis
-        );
+    fn parse_css_position_variants() {
+        let mut style = StyleMap::default();
+        assert_eq!(parse_css_position(&style), CssPosition::Static);
+
+        style.properties.push(("position".into(), StyleValue::Keyword("relative".into())));
+        assert_eq!(parse_css_position(&style), CssPosition::Relative);
+
+        style.properties.clear();
+        style.properties.push(("position".into(), StyleValue::Keyword("absolute".into())));
+        assert_eq!(parse_css_position(&style), CssPosition::Absolute);
+
+        style.properties.clear();
+        style.properties.push(("position".into(), StyleValue::Keyword("fixed".into())));
+        assert_eq!(parse_css_position(&style), CssPosition::Fixed);
     }
 
     #[test]
-    fn flex_shorthand_none() {
-        // `flex: none` → flex-grow: 0, flex-shrink: 0, flex-basis: auto.
-        let attrs = vec![(
-            "data-nova-style".into(),
-            "flex: none".into(),
-        )];
-        let lp = parse_layout_props(&attrs);
-        assert!(
-            matches!(lp.flex_grow, Some(v) if v.abs() < 0.01),
-            "flex-grow should be 0, got {:?}",
-            lp.flex_grow
-        );
-        assert!(
-            matches!(lp.flex_shrink, Some(v) if v.abs() < 0.01),
-            "flex-shrink should be 0, got {:?}",
-            lp.flex_shrink
-        );
-        assert!(
-            matches!(lp.flex_basis, Some(Dimension::Auto)),
-            "flex-basis should be auto, got {:?}",
-            lp.flex_basis
-        );
-    }
-
-    #[test]
-    fn flex_shorthand_three_values() {
-        // `flex: 0 0 75%` → flex-grow: 0, flex-shrink: 0, flex-basis: 75%.
-        let attrs = vec![(
-            "data-nova-style".into(),
-            "flex: 0 0 75%".into(),
-        )];
-        let lp = parse_layout_props(&attrs);
-        assert!(
-            matches!(lp.flex_grow, Some(v) if v.abs() < 0.01),
-            "flex-grow should be 0, got {:?}",
-            lp.flex_grow
-        );
-        assert!(
-            matches!(lp.flex_shrink, Some(v) if v.abs() < 0.01),
-            "flex-shrink should be 0, got {:?}",
-            lp.flex_shrink
-        );
-        assert!(
-            matches!(lp.flex_basis, Some(Dimension::Percent(p)) if (p - 0.75).abs() < 0.01),
-            "flex-basis should be 75%, got {:?}",
-            lp.flex_basis
-        );
-    }
-
-    #[test]
-    fn inline_flex_does_not_fill_width() {
-        // An inline-flex container should shrink-wrap, not fill 100%.
-        let dom = DomNode::Document {
-            children: vec![DomNode::Element {
-                tag: "div".into(),
-                attributes: vec![(
-                    "data-nova-style".into(),
-                    "display: inline-flex".into(),
-                )],
-                children: vec![DomNode::Text("Short".into())],
-            }],
-        };
-        let root = compute_layout(&dom, &viewport()).expect("layout ok");
-        let div = &root.children[0];
-        // inline-flex should NOT be the full 800px viewport width.
-        assert!(
-            div.width < 790.0,
-            "inline-flex should shrink-wrap, not fill 800px, got {}",
-            div.width
-        );
-    }
-
-    #[test]
-    fn mixed_inline_generates_segments() {
-        // A <p> with "Hello " text + <a> "world" should generate segments
-        // because the link has a different color than the surrounding text.
-        let dom = DomNode::Document {
-            children: vec![DomNode::Element {
-                tag: "body".into(),
-                attributes: vec![
-                    ("data-nova-style".into(), "display: block; color: #000000".into()),
-                ],
-                children: vec![DomNode::Element {
-                    tag: "p".into(),
-                    attributes: vec![
-                        ("data-nova-style".into(), "display: block; color: #000000".into()),
-                    ],
-                    children: vec![
-                        DomNode::Text("Hello ".into()),
-                        DomNode::Element {
-                            tag: "a".into(),
-                            attributes: vec![
-                                ("href".into(), "https://example.com".into()),
-                                ("data-nova-style".into(), "display: inline; color: #0000ee; text-decoration: underline".into()),
-                            ],
-                            children: vec![DomNode::Text("world".into())],
-                        },
-                    ],
-                }],
-            }],
-        };
-        let root = compute_layout(&dom, &viewport()).expect("layout ok");
-
-        // Walk the layout tree to find a text node that contains "Hello world"
-        // and has nova-text-segments.
-        fn find_segments(node: &LayoutBox) -> Option<String> {
-            if let LayoutContent::Text(ref t) = node.content {
-                if t.contains("Hello") && t.contains("world") {
-                    let seg = node.style.properties.iter()
-                        .find(|(k, _)| k == "nova-text-segments")
-                        .map(|(_, v)| match v {
-                            StyleValue::Str(s) => s.clone(),
-                            _ => String::new(),
-                        });
-                    return seg;
-                }
-            }
-            for child in &node.children {
-                if let Some(s) = find_segments(child) {
-                    return Some(s);
-                }
-            }
-            None
-        }
-
-        let seg = find_segments(&root);
-        assert!(
-            seg.is_some(),
-            "should find nova-text-segments on the merged 'Hello world' text node"
-        );
-        let seg_str = seg.unwrap();
-        // The segment data should contain a blue color (#0000ee) for "world".
-        assert!(
-            seg_str.contains("0000ee"),
-            "segments should include the link's blue color, got: {seg_str}"
-        );
-    }
-
-    #[test]
-    fn table_cell_link_has_color() {
-        // In a table cell (non-IFC path), a link's text should preserve the blue color.
-        let dom = DomNode::Document {
-            children: vec![DomNode::Element {
-                tag: "body".into(),
-                attributes: vec![
-                    ("data-nova-style".into(), "display: block; color: #000000".into()),
-                ],
-                children: vec![DomNode::Element {
-                    tag: "table".into(),
-                    attributes: vec![("data-nova-style".into(), "display: block".into())],
-                    children: vec![DomNode::Element {
-                        tag: "tr".into(),
-                        attributes: vec![("data-nova-style".into(), "display: table-row".into())],
-                        children: vec![DomNode::Element {
-                            tag: "td".into(),
-                            attributes: vec![("data-nova-style".into(), "display: table-cell; color: #000000".into())],
-                            children: vec![DomNode::Element {
-                                tag: "a".into(),
-                                attributes: vec![
-                                    ("href".into(), "https://example.com".into()),
-                                    ("data-nova-style".into(), "display: inline; color: #0000ee; text-decoration: underline".into()),
-                                ],
-                                children: vec![DomNode::Text("Link Text".into())],
-                            }],
-                        }],
-                    }],
-                }],
-            }],
-        };
-        let root = compute_layout(&dom, &viewport()).expect("layout ok");
-
-        // Find the text node containing "Link Text" and check its color.
-        fn find_link_color(node: &LayoutBox) -> Option<String> {
-            if let LayoutContent::Text(ref t) = node.content {
-                if t.contains("Link") {
-                    let color = node.style.properties.iter()
-                        .find(|(k, _)| k == "color")
-                        .map(|(_, v)| match v {
-                            StyleValue::Str(s) | StyleValue::Keyword(s) => s.clone(),
-                            StyleValue::Color(c) => format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b),
-                            _ => String::new(),
-                        });
-                    return color;
-                }
-            }
-            for child in &node.children {
-                if let Some(c) = find_link_color(child) {
-                    return Some(c);
-                }
-            }
-            None
-        }
-
-        let color = find_link_color(&root);
-        assert!(
-            color.is_some(),
-            "should find color on the 'Link Text' text node"
-        );
-        let color_str = color.unwrap();
-        assert!(
-            color_str.contains("0000ee") || color_str.contains("0000EE"),
-            "link text should have blue color, got: {color_str}"
-        );
+    fn extract_inset_px_values() {
+        let mut style = StyleMap::default();
+        style.properties.push(("top".into(), StyleValue::Px(15.0)));
+        style.properties.push(("left".into(), StyleValue::Keyword("20px".into())));
+        assert_eq!(extract_inset_px(&style, "top"), Some(15.0));
+        assert_eq!(extract_inset_px(&style, "left"), Some(20.0));
+        assert_eq!(extract_inset_px(&style, "bottom"), None);
     }
 }

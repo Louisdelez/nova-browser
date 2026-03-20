@@ -24,12 +24,17 @@ use nova_mod_api::{
     CoreApi, NovaMod,
 };
 
+pub mod cookie_jar;
 mod transport;
+
+use cookie_jar::CookieJar;
 
 /// The network mod — fetches resources over HTTP and HTTPS.
 pub struct NetworkMod {
     manifest: ModManifest,
     core: Option<Arc<dyn CoreApi>>,
+    /// Thread-safe cookie storage shared across all requests.
+    cookie_jar: Arc<CookieJar>,
 }
 
 impl NetworkMod {
@@ -64,6 +69,7 @@ impl NetworkMod {
         Self {
             manifest,
             core: None,
+            cookie_jar: Arc::new(CookieJar::new()),
         }
     }
 
@@ -153,6 +159,18 @@ impl NetworkMod {
 
         let stream = transport::connect(&host, port, use_tls).await?;
 
+        // Look up cookies for this URL.
+        let cookie_header = {
+            let cookies = self.cookie_jar.cookies_for_url(&parsed);
+            if cookies.is_empty() {
+                String::new()
+            } else {
+                let header_value = CookieJar::to_cookie_header(&cookies);
+                debug!(url = %url_str, cookies = %header_value, "attaching cookies");
+                format!("Cookie: {header_value}\r\n")
+            }
+        };
+
         // Build HTTP/1.1 request manually (simple, no heavy framework overhead).
         let request = format!(
             "{method} {path} HTTP/1.1\r\n\
@@ -160,12 +178,22 @@ impl NetworkMod {
              User-Agent: NOVA/0.1.0\r\n\
              Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n\
              Accept-Encoding: gzip, identity\r\n\
+             {cookie_header}\
              Connection: close\r\n\
              \r\n"
         );
 
         let raw_response = transport::send_request(stream, &request).await?;
         let response = parse_http_response(&raw_response, url_str)?;
+
+        // Store any Set-Cookie headers from the response.
+        for (name, value) in &response.headers {
+            if name == "set-cookie" {
+                if let Some(cookie) = CookieJar::parse_set_cookie(value, &parsed) {
+                    self.cookie_jar.store(cookie);
+                }
+            }
+        }
 
         info!(
             url = %url_str,

@@ -136,15 +136,6 @@ pub struct JsDomTree {
     listeners: HashMap<(ElementHandle, String), Vec<EventCallback>>,
     /// Log of pending callbacks that were triggered (for the interpreter loop).
     pub pending_events: Vec<(ElementHandle, String)>,
-    /// URL set by `location.href = "…"` / `window.location.href = "…"`.
-    ///
-    /// After script execution the caller can check this field to determine
-    /// whether the script requested a navigation.
-    pub navigation_url: Option<String>,
-    /// Whether the `DOMContentLoaded` event has already been fired for this
-    /// tree.  Prevents re-dispatching when `eval_script_with_env` is called
-    /// recursively (e.g. from inside a DOMContentLoaded callback).
-    pub dcl_fired: bool,
 }
 
 impl JsDomTree {
@@ -156,8 +147,6 @@ impl JsDomTree {
             next_handle: 1,
             listeners: HashMap::new(),
             pending_events: Vec::new(),
-            navigation_url: None,
-            dcl_fired: false,
         };
 
         // Reserve handle 0 for the document root.
@@ -320,7 +309,7 @@ impl JsDomTree {
     }
 
     /// Recursive depth-first search by attribute.
-    pub fn find_by_attr(&self, attr: &str, value: &str, handle: ElementHandle) -> Option<ElementHandle> {
+    fn find_by_attr(&self, attr: &str, value: &str, handle: ElementHandle) -> Option<ElementHandle> {
         let elem = self.nodes.get(&handle)?;
         if elem.attributes.iter().any(|(k, v)| k == attr && v == value) {
             return Some(handle);
@@ -334,7 +323,7 @@ impl JsDomTree {
     }
 
     /// Recursive depth-first search by class membership.
-    pub fn find_by_class(&self, class: &str, handle: ElementHandle) -> Option<ElementHandle> {
+    fn find_by_class(&self, class: &str, handle: ElementHandle) -> Option<ElementHandle> {
         let elem = self.nodes.get(&handle)?;
         let classes = elem.class_attr();
         if classes.split_whitespace().any(|c| c == class) {
@@ -349,7 +338,7 @@ impl JsDomTree {
     }
 
     /// Recursive depth-first search by tag name.
-    pub fn find_by_tag(&self, tag: &str, handle: ElementHandle) -> Option<ElementHandle> {
+    fn find_by_tag(&self, tag: &str, handle: ElementHandle) -> Option<ElementHandle> {
         let elem = self.nodes.get(&handle)?;
         if elem.tag == tag.to_lowercase() && handle != self.root {
             return Some(handle);
@@ -691,7 +680,235 @@ impl JsDomTree {
         self.root
     }
 
-    /// `document.createTextNode(text)` — creates a text node and returns its handle.
+    /// `document.querySelectorAll(selector)` — returns all matching elements.
+    pub fn query_selector_all(&self, selector: &str) -> Vec<ElementHandle> {
+        let selector = selector.trim();
+        let mut results = Vec::new();
+        if selector.starts_with('#') {
+            self.collect_by_attr("id", &selector[1..], self.root, &mut results);
+        } else if selector.starts_with('.') {
+            self.collect_by_class(&selector[1..], self.root, &mut results);
+        } else {
+            self.collect_by_tag(selector, self.root, &mut results);
+        }
+        results
+    }
+
+    /// Recursive collect by attribute.
+    fn collect_by_attr(
+        &self,
+        attr: &str,
+        value: &str,
+        handle: ElementHandle,
+        out: &mut Vec<ElementHandle>,
+    ) {
+        let Some(elem) = self.nodes.get(&handle) else { return };
+        if elem.attributes.iter().any(|(k, v)| k == attr && v == value) {
+            out.push(handle);
+        }
+        for &child in &elem.children {
+            self.collect_by_attr(attr, value, child, out);
+        }
+    }
+
+    /// Recursive collect by class.
+    fn collect_by_class(
+        &self,
+        class: &str,
+        handle: ElementHandle,
+        out: &mut Vec<ElementHandle>,
+    ) {
+        let Some(elem) = self.nodes.get(&handle) else { return };
+        if elem.class_attr().split_whitespace().any(|c| c == class) {
+            out.push(handle);
+        }
+        for &child in &elem.children {
+            self.collect_by_class(class, child, out);
+        }
+    }
+
+    /// Recursive collect by tag name.
+    fn collect_by_tag(
+        &self,
+        tag: &str,
+        handle: ElementHandle,
+        out: &mut Vec<ElementHandle>,
+    ) {
+        let Some(elem) = self.nodes.get(&handle) else { return };
+        if elem.tag == tag.to_lowercase() && handle != self.root {
+            out.push(handle);
+        }
+        for &child in &elem.children {
+            self.collect_by_tag(tag, child, out);
+        }
+    }
+
+    /// Get the parent node of an element.
+    pub fn parent_node(&self, handle: ElementHandle) -> Option<ElementHandle> {
+        for (h, elem) in &self.nodes {
+            if elem.children.contains(&handle) {
+                return Some(*h);
+            }
+        }
+        None
+    }
+
+    /// Get the next sibling of an element.
+    pub fn next_sibling(&self, handle: ElementHandle) -> Option<ElementHandle> {
+        let parent = self.parent_node(handle)?;
+        let parent_elem = self.nodes.get(&parent)?;
+        let pos = parent_elem.children.iter().position(|&h| h == handle)?;
+        parent_elem.children.get(pos + 1).copied()
+    }
+
+    /// Get the previous sibling of an element.
+    pub fn previous_sibling(&self, handle: ElementHandle) -> Option<ElementHandle> {
+        let parent = self.parent_node(handle)?;
+        let parent_elem = self.nodes.get(&parent)?;
+        let pos = parent_elem.children.iter().position(|&h| h == handle)?;
+        if pos > 0 {
+            Some(parent_elem.children[pos - 1])
+        } else {
+            None
+        }
+    }
+
+    /// Get the first child of an element.
+    pub fn first_child(&self, handle: ElementHandle) -> Option<ElementHandle> {
+        self.nodes.get(&handle)?.children.first().copied()
+    }
+
+    /// Get the last child of an element.
+    pub fn last_child(&self, handle: ElementHandle) -> Option<ElementHandle> {
+        self.nodes.get(&handle)?.children.last().copied()
+    }
+
+    /// Clone a node (optionally deep).
+    pub fn clone_node(&mut self, handle: ElementHandle, deep: bool) -> ElementHandle {
+        let Some(elem) = self.nodes.get(&handle).cloned() else {
+            return self.alloc_handle();
+        };
+        let new_handle = self.alloc_handle();
+        let mut new_elem = JsElement {
+            handle: new_handle,
+            tag: elem.tag.clone(),
+            attributes: elem.attributes.clone(),
+            children: Vec::new(),
+            text: elem.text.clone(),
+            inline_styles: elem.inline_styles.clone(),
+        };
+        if deep {
+            for &child in &elem.children {
+                let cloned_child = self.clone_node(child, true);
+                new_elem.children.push(cloned_child);
+            }
+        }
+        self.nodes.insert(new_handle, new_elem);
+        new_handle
+    }
+
+    /// Insert a new child before a reference child.
+    pub fn insert_before(
+        &mut self,
+        parent: ElementHandle,
+        new_child: ElementHandle,
+        ref_child: Option<ElementHandle>,
+    ) -> bool {
+        if !self.nodes.contains_key(&parent) || !self.nodes.contains_key(&new_child) {
+            warn!(parent, new_child, "insertBefore: handle not found");
+            return false;
+        }
+        let Some(parent_elem) = self.nodes.get_mut(&parent) else {
+            return false;
+        };
+        match ref_child {
+            Some(ref_h) => {
+                if let Some(pos) = parent_elem.children.iter().position(|&h| h == ref_h) {
+                    parent_elem.children.insert(pos, new_child);
+                    true
+                } else {
+                    parent_elem.children.push(new_child);
+                    true
+                }
+            }
+            None => {
+                parent_elem.children.push(new_child);
+                true
+            }
+        }
+    }
+
+    /// Check if a parent element contains a child (descendant).
+    pub fn contains(&self, parent: ElementHandle, child: ElementHandle) -> bool {
+        if parent == child {
+            return true;
+        }
+        let Some(elem) = self.nodes.get(&parent) else {
+            return false;
+        };
+        for &c in &elem.children {
+            if self.contains(c, child) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove an attribute from an element.
+    pub fn remove_attribute(&mut self, handle: ElementHandle, name: &str) {
+        let Some(elem) = self.nodes.get_mut(&handle) else {
+            warn!(handle, name, "removeAttribute: handle not found");
+            return;
+        };
+        elem.attributes.retain(|(k, _)| k != name);
+        debug!(handle, name, "removeAttribute");
+    }
+
+    /// Check if an element has a given attribute.
+    pub fn has_attribute(&self, handle: ElementHandle, name: &str) -> bool {
+        self.nodes
+            .get(&handle)
+            .map(|e| e.attributes.iter().any(|(k, _)| k == name))
+            .unwrap_or(false)
+    }
+
+    /// Get all element children (not text nodes) of a node.
+    pub fn children(&self, handle: ElementHandle) -> Vec<ElementHandle> {
+        let Some(elem) = self.nodes.get(&handle) else {
+            return Vec::new();
+        };
+        elem.children
+            .iter()
+            .copied()
+            .filter(|&h| {
+                self.nodes
+                    .get(&h)
+                    .map(|e| e.tag != "#text" && e.tag != "#comment")
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// Check if an element matches a simple CSS selector.
+    pub fn matches(&self, handle: ElementHandle, selector: &str) -> bool {
+        let selector = selector.trim();
+        let Some(elem) = self.nodes.get(&handle) else {
+            return false;
+        };
+        if selector.starts_with('#') {
+            elem.attributes
+                .iter()
+                .any(|(k, v)| k == "id" && v == &selector[1..])
+        } else if selector.starts_with('.') {
+            elem.class_attr()
+                .split_whitespace()
+                .any(|c| c == &selector[1..])
+        } else {
+            elem.tag == selector.to_lowercase()
+        }
+    }
+
+    /// `document.createTextNode(text)` — creates an unattached text node.
     pub fn create_text_node(&mut self, text: &str) -> ElementHandle {
         let handle = self.alloc_handle();
         let elem = JsElement::new_text(handle, text);
@@ -700,75 +917,136 @@ impl JsDomTree {
         handle
     }
 
-    /// `el.remove()` — removes the element from its parent.
-    pub fn remove_element(&mut self, handle: ElementHandle) {
-        // Find and remove from parent's children list.
-        let parent_handles: Vec<ElementHandle> = self.nodes.keys().cloned().collect();
-        for ph in parent_handles {
-            if let Some(parent) = self.nodes.get_mut(&ph) {
-                if parent.children.contains(&handle) {
-                    parent.children.retain(|&h| h != handle);
-                    break;
-                }
-            }
+    /// Remove a child from its parent.
+    pub fn remove_child(&mut self, parent: ElementHandle, child: ElementHandle) -> bool {
+        let Some(parent_elem) = self.nodes.get_mut(&parent) else {
+            warn!(parent, child, "removeChild: parent not found");
+            return false;
+        };
+        let len_before = parent_elem.children.len();
+        parent_elem.children.retain(|&h| h != child);
+        let removed = parent_elem.children.len() < len_before;
+        if removed {
+            debug!(parent, child, "removeChild");
         }
-        self.remove_subtree(handle);
-        debug!(handle, "remove");
+        removed
     }
 
-    /// `el.hasAttribute(name)` — returns whether the attribute exists.
-    pub fn has_attribute(&self, handle: ElementHandle, name: &str) -> bool {
+    /// Get inline style property value.
+    pub fn style_get_property(&self, handle: ElementHandle, name: &str) -> Option<String> {
+        self.nodes
+            .get(&handle)?
+            .inline_styles
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// Check if a classList contains a class.
+    pub fn class_list_contains(&self, handle: ElementHandle, cls: &str) -> bool {
         self.nodes
             .get(&handle)
-            .map(|e| e.attributes.iter().any(|(k, _)| k == name))
+            .map(|e| e.class_attr().split_whitespace().any(|c| c == cls))
             .unwrap_or(false)
     }
 
-    /// `el.removeAttribute(name)` — removes an attribute.
-    pub fn remove_attribute(&mut self, handle: ElementHandle, name: &str) {
-        if let Some(elem) = self.nodes.get_mut(&handle) {
-            elem.attributes.retain(|(k, _)| k != name);
-            debug!(handle, name, "removeAttribute");
+    /// Toggle a class in classList. Returns true if class is now present.
+    pub fn class_list_toggle(&mut self, handle: ElementHandle, cls: &str) -> bool {
+        if self.class_list_contains(handle, cls) {
+            self.class_list_remove(handle, cls);
+            false
+        } else {
+            self.class_list_add(handle, cls);
+            true
         }
     }
 
-    /// `el.parentNode` — find the parent of the given handle.
-    pub fn parent_node(&self, handle: ElementHandle) -> Option<ElementHandle> {
-        for (ph, elem) in &self.nodes {
-            if elem.children.contains(&handle) {
-                return Some(*ph);
-            }
-        }
-        None
-    }
-
-    /// Set a pending navigation URL (from `location.href = "…"`).
-    pub fn set_navigation_url(&mut self, url: &str) {
-        debug!(url, "navigation requested via location.href");
-        self.navigation_url = Some(url.to_owned());
-    }
-
-    /// `el.children` / `el.childNodes` — returns child handles (elements only for children).
-    pub fn child_element_count(&self, handle: ElementHandle) -> usize {
+    /// Get the `className` (class attribute value) for an element.
+    pub fn class_name(&self, handle: ElementHandle) -> String {
         self.nodes
             .get(&handle)
-            .map(|e| {
-                e.children
-                    .iter()
-                    .filter(|&&h| {
-                        self.nodes
-                            .get(&h)
-                            .map(|n| n.tag != "#text" && n.tag != "#comment")
-                            .unwrap_or(false)
-                    })
-                    .count()
-            })
-            .unwrap_or(0)
+            .map(|e| e.class_attr())
+            .unwrap_or_default()
     }
 
-    /// `el.tagName` — returns the uppercase tag name.
-    pub fn tag_name(&self, handle: ElementHandle) -> Option<String> {
-        self.nodes.get(&handle).map(|e| e.tag.to_uppercase())
+    /// Set the `className` attribute for an element.
+    pub fn set_class_name(&mut self, handle: ElementHandle, value: &str) {
+        if let Some(elem) = self.nodes.get_mut(&handle) {
+            elem.set_class_attr(value.to_owned());
+        }
+    }
+
+    /// Get the `id` attribute for an element.
+    pub fn get_id(&self, handle: ElementHandle) -> String {
+        self.get_attribute(handle, "id").unwrap_or_default()
+    }
+
+    /// Set the `id` attribute for an element.
+    pub fn set_id(&mut self, handle: ElementHandle, value: &str) {
+        self.set_attribute(handle, "id", value);
+    }
+
+    /// Get all child handles (including text nodes).
+    pub fn child_nodes(&self, handle: ElementHandle) -> Vec<ElementHandle> {
+        self.nodes
+            .get(&handle)
+            .map(|e| e.children.clone())
+            .unwrap_or_default()
+    }
+
+    /// Find the body element handle.
+    pub fn body(&self) -> Option<ElementHandle> {
+        self.find_by_tag("body", self.root)
+    }
+
+    /// Get or set the document title.
+    pub fn get_title(&self) -> String {
+        if let Some(title_handle) = self.find_by_tag("title", self.root) {
+            self.get_text_content(title_handle)
+        } else {
+            String::new()
+        }
+    }
+
+    /// Set the document title.
+    pub fn set_title(&mut self, title: &str) {
+        if let Some(title_handle) = self.find_by_tag("title", self.root) {
+            self.set_text_content(title_handle, title);
+        }
+    }
+
+    /// Query selector scoped to a specific element.
+    pub fn query_selector_within(
+        &self,
+        handle: ElementHandle,
+        selector: &str,
+    ) -> Option<ElementHandle> {
+        let selector = selector.trim();
+        if selector.starts_with('#') {
+            self.find_by_attr("id", &selector[1..], handle)
+        } else if selector.starts_with('.') {
+            self.find_by_class(&selector[1..], handle)
+        } else {
+            self.find_by_tag(selector, handle)
+        }
+    }
+
+    /// Query selector all scoped to a specific element.
+    pub fn query_selector_all_within(
+        &self,
+        handle: ElementHandle,
+        selector: &str,
+    ) -> Vec<ElementHandle> {
+        let selector = selector.trim();
+        let mut results = Vec::new();
+        if selector.starts_with('#') {
+            self.collect_by_attr("id", &selector[1..], handle, &mut results);
+        } else if selector.starts_with('.') {
+            self.collect_by_class(&selector[1..], handle, &mut results);
+        } else {
+            self.collect_by_tag(selector, handle, &mut results);
+        }
+        results
     }
 }
 
@@ -865,13 +1143,6 @@ pub fn eval_script_with_env(
         .iter()
         .cloned()
         .collect();
-
-    // Pre-seed `document` as the root handle (0) so that
-    // `document.addEventListener(…)` etc. resolve through the normal
-    // method-call path without special-casing.
-    let root = tree.lock().unwrap().root_handle();
-    env.entry("document".into()).or_insert(root);
-
     let mut last_value = JsValue::Undefined;
 
     // Strip /* … */ block comments.
@@ -887,35 +1158,6 @@ pub fn eval_script_with_env(
 
         // Evaluate and update last value.
         last_value = eval_statement(line, &mut env, Arc::clone(&tree));
-    }
-
-    // Dispatch DOMContentLoaded event.
-    // After all scripts are evaluated, fire any callbacks that were registered
-    // via `document.addEventListener('DOMContentLoaded', callback)`.
-    // The document root is handle 0, which is where `document.addEventListener`
-    // stores its listeners.  The `dcl_fired` flag prevents infinite recursion
-    // when a DOMContentLoaded callback itself triggers `eval_script_with_env`.
-    let dcl_callbacks = {
-        let mut t = tree.lock().unwrap();
-        if t.dcl_fired {
-            vec![]
-        } else {
-            t.dcl_fired = true;
-            t.dispatch_event(0, "DOMContentLoaded")
-        }
-    };
-    for (cb_source, captured_env) in dcl_callbacks {
-        debug!(len = cb_source.len(), "executing DOMContentLoaded callback");
-        // Merge the captured env with the current env so the callback can
-        // reference variables from both the registration scope and the
-        // current script scope.
-        let mut merged_env: Vec<(String, ElementHandle)> = captured_env;
-        for (k, v) in &env {
-            if !merged_env.iter().any(|(mk, _)| mk == k) {
-                merged_env.push((k.clone(), *v));
-            }
-        }
-        last_value = eval_script_with_env(&cb_source, Arc::clone(&tree), &merged_env);
     }
 
     last_value
@@ -978,58 +1220,6 @@ fn eval_statement(
         return JsValue::Undefined;
     }
 
-    if line.starts_with("console.error(") {
-        let inner = extract_call_args(line, "console.error");
-        debug!(msg = inner, "console.error");
-        return JsValue::Undefined;
-    }
-
-    if line.starts_with("console.warn(") {
-        let inner = extract_call_args(line, "console.warn");
-        debug!(msg = inner, "console.warn");
-        return JsValue::Undefined;
-    }
-
-    if line.starts_with("console.info(") {
-        let inner = extract_call_args(line, "console.info");
-        debug!(msg = inner, "console.info");
-        return JsValue::Undefined;
-    }
-
-    if line.starts_with("console.debug(") {
-        let inner = extract_call_args(line, "console.debug");
-        debug!(msg = inner, "console.debug");
-        return JsValue::Undefined;
-    }
-
-    // ── location.href = "…" (JS-based navigation) ────────────────────────────
-
-    if let Some((lhs, rhs)) = split_assignment(line) {
-        let lhs_trimmed = lhs.trim();
-        let rhs_trimmed = rhs.trim();
-
-        // Handle location.href, window.location.href, document.location.href,
-        // window.location, location.href assignments.
-        if lhs_trimmed == "window.location.href"
-            || lhs_trimmed == "location.href"
-            || lhs_trimmed == "document.location.href"
-            || lhs_trimmed == "window.location"
-            || lhs_trimmed == "document.location"
-        {
-            let url = unquote(rhs_trimmed);
-            debug!(url = %url, "location.href assignment — navigation requested");
-            tree.lock().unwrap().set_navigation_url(&url);
-            return JsValue::String(url);
-        }
-
-        // Handle document.title = "…"
-        if lhs_trimmed == "document.title" {
-            let value = unquote(rhs_trimmed);
-            debug!(title = %value, "document.title assignment (stored)");
-            return JsValue::String(value);
-        }
-    }
-
     // ── el.textContent = "…" ──────────────────────────────────────────────────
 
     if let Some((lhs, rhs)) = split_assignment(line) {
@@ -1049,20 +1239,6 @@ fn eval_statement(
                     if let Some(&handle) = env.get(var) {
                         let value = unquote(rhs);
                         tree.lock().unwrap().set_inner_html(handle, &value);
-                        return JsValue::String(value);
-                    }
-                }
-                "className" => {
-                    if let Some(&handle) = env.get(var) {
-                        let value = unquote(rhs);
-                        tree.lock().unwrap().set_attribute(handle, "class", &value);
-                        return JsValue::String(value);
-                    }
-                }
-                "id" => {
-                    if let Some(&handle) = env.get(var) {
-                        let value = unquote(rhs);
-                        tree.lock().unwrap().set_attribute(handle, "id", &value);
                         return JsValue::String(value);
                     }
                 }
@@ -1152,438 +1328,10 @@ fn eval_statement(
                     .add_event_listener(handle, &event_type, &cb_body, captured);
             }
         }
-        // Even if the object wasn't in env (e.g. `window.addEventListener`),
-        // swallow the call silently.
-        return JsValue::Undefined;
-    }
-
-    // `el.removeEventListener(…)` — no-op (we don't track removal yet).
-    if split_method_call(line, "removeEventListener").is_some() {
-        return JsValue::Undefined;
-    }
-
-    // `el.removeAttribute("name")`
-    if let Some((obj, rest)) = split_method_call(line, "removeAttribute") {
-        if let Some(&handle) = env.get(obj.trim()) {
-            let name = unquote(extract_parens_inner(&rest));
-            tree.lock().unwrap().remove_attribute(handle, &name);
-        }
-        return JsValue::Undefined;
-    }
-
-    // `el.hasAttribute("name")`
-    if let Some((obj, rest)) = split_method_call(line, "hasAttribute") {
-        if let Some(&handle) = env.get(obj.trim()) {
-            let name = unquote(extract_parens_inner(&rest));
-            let has = tree.lock().unwrap().has_attribute(handle, &name);
-            return JsValue::Boolean(has);
-        }
-        return JsValue::Boolean(false);
-    }
-
-    // `el.remove()` — remove element from its parent.
-    if let Some((obj, _rest)) = split_method_call(line, "remove") {
-        if let Some(&handle) = env.get(obj.trim()) {
-            tree.lock().unwrap().remove_element(handle);
-        }
-        return JsValue::Undefined;
-    }
-
-    // `el.insertBefore(…)` — stub, treat as no-op.
-    if split_method_call(line, "insertBefore").is_some() {
-        return JsValue::Undefined;
-    }
-
-    // `el.replaceChild(…)` — stub, treat as no-op.
-    if split_method_call(line, "replaceChild").is_some() {
-        return JsValue::Undefined;
-    }
-
-    // `el.removeChild(…)` — stub, treat as no-op.
-    if split_method_call(line, "removeChild").is_some() {
-        return JsValue::Undefined;
-    }
-
-    // `el.cloneNode(…)` — stub, treat as no-op.
-    if split_method_call(line, "cloneNode").is_some() {
-        return JsValue::Undefined;
-    }
-
-    // `el.contains(…)` — stub.
-    if split_method_call(line, "contains").is_some() {
-        return JsValue::Boolean(false);
-    }
-
-    // `el.focus()` / `el.blur()` / `el.click()` — stub.
-    if split_method_call(line, "focus").is_some()
-        || split_method_call(line, "blur").is_some()
-        || split_method_call(line, "click").is_some()
-    {
-        return JsValue::Undefined;
-    }
-
-    // `el.getBoundingClientRect()` — return stub object.
-    if split_method_call(line, "getBoundingClientRect").is_some() {
-        return JsValue::Undefined;
-    }
-
-    // `el.closest(…)` — stub.
-    if split_method_call(line, "closest").is_some() {
-        return JsValue::Null;
-    }
-
-    // `el.matches(…)` — stub.
-    if split_method_call(line, "matches").is_some() {
-        return JsValue::Boolean(false);
-    }
-
-    // `el.classList.contains(…)` — stub.
-    if split_method_call(line, "classList.contains").is_some() {
-        return JsValue::Boolean(false);
-    }
-
-    // `el.classList.toggle(…)` — stub.
-    if split_method_call(line, "classList.toggle").is_some() {
-        return JsValue::Undefined;
-    }
-
-    // `el.style.*` property assignments (e.g. `el.style.display = "none"`).
-    if let Some((lhs, rhs)) = split_assignment(line) {
-        let lhs_t = lhs.trim();
-        // Match patterns like `varname.style.propname`.
-        if let Some(style_idx) = lhs_t.find(".style.") {
-            let var = &lhs_t[..style_idx];
-            let prop = &lhs_t[style_idx + 7..]; // skip ".style."
-            if let Some(&handle) = env.get(var.trim()) {
-                let value = unquote(rhs.trim());
-                // Convert camelCase to kebab-case for CSS.
-                let css_prop = camel_to_kebab(prop.trim());
-                tree.lock().unwrap().style_set_property(handle, &css_prop, &value);
-                return JsValue::String(value);
-            }
-        }
-    }
-
-    // ── Window / global no-op stubs ────────────────────────────────────────────
-    //
-    // Many real-world pages call these APIs.  We don't implement them yet, but
-    // returning `Undefined` instead of crashing keeps scripts running.
-
-    // `window.addEventListener(…)` / `window.removeEventListener(…)`
-    // Already handled above via the generic addEventListener / removeEventListener
-    // matchers.  `document.addEventListener` also works because `document` is
-    // pre-seeded in the env as handle 0.
-
-    // `setTimeout` / `clearTimeout` / `setInterval` / `clearInterval`
-    if line.starts_with("setTimeout(") || line.starts_with("window.setTimeout(") {
-        debug!("setTimeout stub (no-op)");
-        return JsValue::Number(0.0);
-    }
-    if line.starts_with("clearTimeout(") || line.starts_with("window.clearTimeout(") {
-        return JsValue::Undefined;
-    }
-    if line.starts_with("setInterval(") || line.starts_with("window.setInterval(") {
-        debug!("setInterval stub (no-op)");
-        return JsValue::Number(0.0);
-    }
-    if line.starts_with("clearInterval(") || line.starts_with("window.clearInterval(") {
-        return JsValue::Undefined;
-    }
-
-    // `requestAnimationFrame` / `cancelAnimationFrame`
-    if line.starts_with("requestAnimationFrame(")
-        || line.starts_with("window.requestAnimationFrame(")
-    {
-        debug!("requestAnimationFrame stub (no-op)");
-        return JsValue::Number(0.0);
-    }
-    if line.starts_with("cancelAnimationFrame(")
-        || line.starts_with("window.cancelAnimationFrame(")
-    {
-        return JsValue::Undefined;
-    }
-
-    // `fetch(…)` / `window.fetch(…)` — stub that returns Undefined (no Promise
-    // support in the mini-interpreter).
-    if line.starts_with("fetch(") || line.starts_with("window.fetch(") {
-        debug!("fetch stub (no-op)");
-        return JsValue::Undefined;
-    }
-
-    // `getComputedStyle(…)` / `window.getComputedStyle(…)`
-    if line.starts_with("getComputedStyle(") || line.starts_with("window.getComputedStyle(") {
-        return JsValue::Undefined;
-    }
-
-    // `matchMedia(…)` / `window.matchMedia(…)`
-    if line.starts_with("matchMedia(") || line.starts_with("window.matchMedia(") {
-        return JsValue::Undefined;
-    }
-
-    // `document.querySelectorAll(…)` — standalone call (not assignment).
-    if line.starts_with("document.querySelectorAll(") {
-        return JsValue::Undefined;
-    }
-
-    // `document.getElementsByClassName(…)` / `document.getElementsByTagName(…)`
-    if line.starts_with("document.getElementsByClassName(")
-        || line.starts_with("document.getElementsByTagName(")
-    {
-        return JsValue::Undefined;
-    }
-
-    // `window.location.*` property reads — ignore silently.
-    if line.starts_with("window.location") || line.starts_with("location.") {
-        return JsValue::Undefined;
-    }
-
-    // `document.location.*` property reads — ignore silently.
-    if line.starts_with("document.location") {
-        return JsValue::Undefined;
-    }
-
-    // ── Service Worker / Clipboard / Notification stubs ────────────────────
-    //
-    // Modern sites frequently access these APIs.  Return Undefined so scripts
-    // don't crash when e.g. `navigator.serviceWorker.register(…)` is called.
-
-    if line.starts_with("navigator.serviceWorker") {
-        debug!("navigator.serviceWorker stub (no-op)");
-        return JsValue::Undefined;
-    }
-
-    if line.starts_with("navigator.clipboard") {
-        debug!("navigator.clipboard stub (no-op)");
-        return JsValue::Undefined;
-    }
-
-    if line.starts_with("Notification.requestPermission") || line.starts_with("Notification.") {
-        debug!("Notification API stub (no-op)");
-        return JsValue::Undefined;
-    }
-
-    // `window.navigator.*` property reads — ignore silently.
-    if line.starts_with("window.navigator") || line.starts_with("navigator.") {
-        return JsValue::Undefined;
-    }
-
-    // ── History API stubs ────────────────────────────────────────────────────
-
-    if line.starts_with("history.pushState")
-        || line.starts_with("history.replaceState")
-        || line.starts_with("history.back")
-        || line.starts_with("history.forward")
-        || line.starts_with("history.go")
-    {
-        debug!(line, "History API stub (no-op)");
-        return JsValue::Undefined;
-    }
-
-    // `window.history.*` — ignore silently.
-    if line.starts_with("window.history") || line.starts_with("history.") {
-        return JsValue::Undefined;
-    }
-
-    // `document.cookie` — ignore silently.
-    if line.starts_with("document.cookie") {
-        return JsValue::Undefined;
-    }
-
-    // `document.title` — ignore reads.
-    if line == "document.title" {
-        return JsValue::String(String::new());
-    }
-
-    // `document.readyState` — always "complete".
-    if line == "document.readyState" {
-        return JsValue::String("complete".into());
-    }
-
-    // `document.write(…)` / `document.writeln(…)` — no-op.
-    if line.starts_with("document.write(") || line.starts_with("document.writeln(") {
-        return JsValue::Undefined;
-    }
-
-    // `document.createDocumentFragment()` — no-op stub.
-    if line.starts_with("document.createDocumentFragment(") {
-        return JsValue::Undefined;
-    }
-
-    // `window.innerWidth` / `window.innerHeight` / `window.outerWidth` / `window.outerHeight`
-    if line == "window.innerWidth" || line == "innerWidth" {
-        return JsValue::Number(1280.0);
-    }
-    if line == "window.innerHeight" || line == "innerHeight" {
-        return JsValue::Number(720.0);
-    }
-    if line == "window.outerWidth" || line == "window.outerHeight"
-        || line == "window.screen.width" || line == "window.screen.height"
-        || line == "screen.width" || line == "screen.height"
-    {
-        return JsValue::Number(1280.0);
-    }
-
-    // `window.devicePixelRatio`
-    if line == "window.devicePixelRatio" || line == "devicePixelRatio" {
-        return JsValue::Number(1.0);
-    }
-
-    // `window.pageYOffset` / `window.pageXOffset` / `window.scrollX` / `window.scrollY`
-    if line == "window.pageYOffset" || line == "window.scrollY"
-        || line == "window.pageXOffset" || line == "window.scrollX"
-        || line == "pageYOffset" || line == "pageXOffset"
-    {
-        return JsValue::Number(0.0);
-    }
-
-    // `window.performance.*` — ignore silently.
-    if line.starts_with("window.performance") || line.starts_with("performance.") {
-        return JsValue::Undefined;
-    }
-
-    // `window.localStorage.*` / `window.sessionStorage.*` — ignore silently.
-    if line.starts_with("localStorage.") || line.starts_with("window.localStorage")
-        || line.starts_with("sessionStorage.") || line.starts_with("window.sessionStorage")
-    {
-        return JsValue::Undefined;
-    }
-
-    // `JSON.stringify(…)` / `JSON.parse(…)` — no-op stubs.
-    if line.starts_with("JSON.stringify(") || line.starts_with("JSON.parse(") {
-        return JsValue::Undefined;
-    }
-
-    // `new …` constructor calls — ignore silently.
-    // Covers `new Worker(…)`, `new IntersectionObserver(…)`,
-    // `new MutationObserver(…)`, `new ResizeObserver(…)`, and any other
-    // constructor.
-    if line.starts_with("new ") {
-        debug!(line, "constructor call stub (no-op)");
-        return JsValue::Undefined;
-    }
-
-    // `typeof …` expressions — return "undefined".
-    if line.starts_with("typeof ") {
-        return JsValue::String("undefined".into());
-    }
-
-    // Control flow: `if`, `else`, `for`, `while`, `switch`, `try`, `catch`,
-    // `finally`, `return`, `throw`, `break`, `continue` — ignore silently.
-    // Our line-by-line interpreter cannot handle these; silently skipping is
-    // better than logging a warning for every single control flow keyword.
-    if line.starts_with("if ")
-        || line.starts_with("if(")
-        || line.starts_with("} else")
-        || line.starts_with("else ")
-        || line.starts_with("else{")
-        || line == "else"
-        || line == "}"
-        || line == "})"
-        || line == "});"
-        || line == "};"
-        || line.starts_with("for ")
-        || line.starts_with("for(")
-        || line.starts_with("while ")
-        || line.starts_with("while(")
-        || line.starts_with("switch ")
-        || line.starts_with("switch(")
-        || line.starts_with("case ")
-        || line == "default:"
-        || line.starts_with("try ")
-        || line.starts_with("try{")
-        || line.starts_with("catch ")
-        || line.starts_with("catch(")
-        || line.starts_with("finally ")
-        || line.starts_with("finally{")
-        || line.starts_with("return ")
-        || line == "return"
-        || line.starts_with("throw ")
-        || line == "break"
-        || line == "continue"
-    {
-        return JsValue::Undefined;
-    }
-
-    // Function declarations — ignore silently.
-    if line.starts_with("function ") || line.starts_with("async function ") {
-        return JsValue::Undefined;
-    }
-
-    // `void …` — return undefined.
-    if line.starts_with("void ") {
-        return JsValue::Undefined;
-    }
-
-    // `window.scrollTo(…)` / `window.scroll(…)` / `window.scrollBy(…)`
-    if line.starts_with("window.scrollTo(")
-        || line.starts_with("window.scroll(")
-        || line.starts_with("window.scrollBy(")
-        || line.starts_with("scrollTo(")
-    {
-        return JsValue::Undefined;
-    }
-
-    // `window.alert(…)` / `window.confirm(…)` / `window.prompt(…)`
-    if line.starts_with("alert(") || line.starts_with("window.alert(") {
-        return JsValue::Undefined;
-    }
-    if line.starts_with("confirm(") || line.starts_with("window.confirm(") {
-        return JsValue::Undefined;
-    }
-    if line.starts_with("prompt(") || line.starts_with("window.prompt(") {
-        return JsValue::Undefined;
-    }
-
-    // `window.dispatchEvent(…)` / `document.dispatchEvent(…)` — no-op.
-    if line.starts_with("window.dispatchEvent(") || line.starts_with("document.dispatchEvent(") {
-        return JsValue::Undefined;
-    }
-
-    // ── ES6+ syntax stubs ───────────────────────────────────────────────────
-    //
-    // The mini-interpreter is ES5-oriented.  When it encounters ES6+ syntax
-    // we skip or simplify rather than crashing.
-
-    // `import …` / `export …` — ES module syntax, skip.
-    if line.starts_with("import ") || line.starts_with("import{") || line.starts_with("import\"") || line.starts_with("import'") {
-        return JsValue::Undefined;
-    }
-    if line.starts_with("export ") || line.starts_with("export{") {
-        return JsValue::Undefined;
-    }
-
-    // `class …` declarations — skip.
-    if line.starts_with("class ") {
-        return JsValue::Undefined;
-    }
-
-    // `async …` — strip prefix and evaluate the rest.
-    if let Some(rest) = line.strip_prefix("async ") {
-        return eval_statement(rest, env, tree);
-    }
-
-    // `await …` — strip prefix and evaluate the rest.
-    if let Some(rest) = line.strip_prefix("await ") {
-        return eval_statement(rest, env, tree);
-    }
-
-    // Arrow functions as standalone expressions — skip.
-    if line.contains("=>") {
-        return JsValue::Undefined;
-    }
-
-    // Spread operator as standalone expression — skip.
-    if line.starts_with("...") {
-        return JsValue::Undefined;
-    }
-
-    // Template literals as standalone expressions — skip.
-    if line.starts_with('`') {
         return JsValue::Undefined;
     }
 
     // Unrecognised — return undefined.
-    debug!(line, "unrecognised JS statement (ignored)");
     JsValue::Undefined
 }
 
@@ -1615,58 +1363,6 @@ fn eval_dom_expr(
         let tag = unquote(arg);
         let handle = tree.lock().unwrap().create_element(&tag);
         return Some(handle);
-    }
-
-    // `document.createTextNode("text")`
-    if expr.starts_with("document.createTextNode(") {
-        let arg = extract_call_args(expr, "document.createTextNode");
-        let text = unquote(arg);
-        let handle = tree.lock().unwrap().create_text_node(&text);
-        return Some(handle);
-    }
-
-    // `document.getElementsByClassName("cls")` — returns first match (no array support).
-    if expr.starts_with("document.getElementsByClassName(") {
-        let arg = extract_call_args(expr, "document.getElementsByClassName");
-        let cls = unquote(arg);
-        let root = tree.lock().unwrap().root_handle();
-        return tree.lock().unwrap().find_by_class(&cls, root);
-    }
-
-    // `document.getElementsByTagName("tag")` — returns first match (no array support).
-    if expr.starts_with("document.getElementsByTagName(") {
-        let arg = extract_call_args(expr, "document.getElementsByTagName");
-        let tag = unquote(arg);
-        let root = tree.lock().unwrap().root_handle();
-        return tree.lock().unwrap().find_by_tag(&tag, root);
-    }
-
-    // `document.querySelectorAll("sel")` — returns first match (no NodeList support).
-    if expr.starts_with("document.querySelectorAll(") {
-        let arg = extract_call_args(expr, "document.querySelectorAll");
-        let sel = unquote(arg);
-        return tree.lock().unwrap().query_selector(&sel);
-    }
-
-    // `document.body` — find the <body> element.
-    if expr == "document.body" {
-        let t = tree.lock().unwrap();
-        let root = t.root_handle();
-        return t.find_by_tag("body", root);
-    }
-
-    // `document.head` — find the <head> element.
-    if expr == "document.head" {
-        let t = tree.lock().unwrap();
-        let root = t.root_handle();
-        return t.find_by_tag("head", root);
-    }
-
-    // `document.documentElement` — find the <html> element.
-    if expr == "document.documentElement" {
-        let t = tree.lock().unwrap();
-        let root = t.root_handle();
-        return t.find_by_tag("html", root);
     }
 
     // Variable reference.
@@ -1795,22 +1491,6 @@ fn parse_two_string_args(args_with_parens: &str) -> Option<(String, String)> {
     let first = unquote(inner[..pos].trim());
     let second = unquote(inner[pos + 1..].trim());
     Some((first, second))
-}
-
-/// Convert a camelCase CSS property name to kebab-case.
-///
-/// e.g. `backgroundColor` → `background-color`, `fontSize` → `font-size`.
-fn camel_to_kebab(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 4);
-    for c in s.chars() {
-        if c.is_uppercase() {
-            out.push('-');
-            out.push(c.to_lowercase().next().unwrap_or(c));
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// Parse `addEventListener` arguments: `("type", function() { body })`.
@@ -2052,436 +1732,5 @@ mod tests {
         // Should still have the main div.
         let tree2 = JsDomTree::from_dom(&exported);
         assert!(tree2.lock().unwrap().get_element_by_id("main").is_some());
-    }
-
-    // ── Browser API stub tests ────────────────────────────────────────────────
-
-    #[test]
-    fn window_stubs_do_not_crash() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        // All of these should return Undefined without panicking.
-        let script = r#"
-            window.addEventListener("load", function() {});
-            window.removeEventListener("load", function() {});
-            setTimeout(function() {}, 100);
-            window.setTimeout(function() {}, 100);
-            clearTimeout(0);
-            setInterval(function() {}, 100);
-            clearInterval(0);
-            requestAnimationFrame(function() {});
-            cancelAnimationFrame(0);
-            fetch("https://example.com");
-            window.fetch("https://example.com");
-            getComputedStyle(null);
-            window.getComputedStyle(null);
-            matchMedia("(max-width: 600px)");
-            window.matchMedia("(max-width: 600px)");
-            window.scrollTo(0, 0);
-            scrollTo(0, 0);
-            alert("hello");
-            window.alert("hello");
-            console.error("err");
-            console.warn("warn");
-            console.info("info");
-            console.debug("dbg");
-        "#;
-        let result = eval_script(script, Arc::clone(&tree));
-        // Should complete without panicking; last statement is console.debug → Undefined.
-        assert!(matches!(result, JsValue::Undefined));
-    }
-
-    #[test]
-    fn document_body_and_head() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        let script = r#"
-            var body = document.body;
-            body.setAttribute("data-found", "yes");
-        "#;
-        eval_script(script, Arc::clone(&tree));
-
-        let t = tree.lock().unwrap();
-        let root = t.root_handle();
-        let body_handle = t.find_by_tag("body", root).unwrap();
-        assert_eq!(t.get_attribute(body_handle, "data-found"), Some("yes".into()));
-    }
-
-    #[test]
-    fn document_addeventlistener_registers_and_fires() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        // `document` is pre-seeded as handle 0 (root), so addEventListener
-        // stores a listener on the root.  DOMContentLoaded fires after
-        // script evaluation completes.
-        let script = r#"
-            document.addEventListener("DOMContentLoaded", function() {
-                console.log("loaded");
-            });
-        "#;
-        let result = eval_script(script, Arc::clone(&tree));
-        assert!(matches!(result, JsValue::Undefined));
-    }
-
-    #[test]
-    fn document_getelementsbyclassname() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        let script = r#"
-            var el = document.getElementsByClassName("intro");
-            el.textContent = "found by class";
-        "#;
-        eval_script(script, Arc::clone(&tree));
-
-        let t = tree.lock().unwrap();
-        let root = t.root_handle();
-        let handle = t.find_by_class("intro", root).unwrap();
-        assert_eq!(t.get_text_content(handle), "found by class");
-    }
-
-    #[test]
-    fn document_getelementsbytagname() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        let script = r#"
-            var el = document.getElementsByTagName("p");
-            el.setAttribute("data-tag", "found");
-        "#;
-        eval_script(script, Arc::clone(&tree));
-
-        let t = tree.lock().unwrap();
-        let root = t.root_handle();
-        let handle = t.find_by_tag("p", root).unwrap();
-        assert_eq!(t.get_attribute(handle, "data-tag"), Some("found".into()));
-    }
-
-    // ── New tests: location.href navigation ────────────────────────────────
-
-    #[test]
-    fn location_href_sets_navigation_url() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        let script = r#"
-            window.location.href = "https://example.com/new-page";
-        "#;
-        eval_script(script, Arc::clone(&tree));
-
-        let t = tree.lock().unwrap();
-        assert_eq!(
-            t.navigation_url.as_deref(),
-            Some("https://example.com/new-page")
-        );
-    }
-
-    #[test]
-    fn document_location_href_sets_navigation_url() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        let script = r#"
-            document.location.href = "https://example.com/other";
-        "#;
-        eval_script(script, Arc::clone(&tree));
-
-        let t = tree.lock().unwrap();
-        assert_eq!(
-            t.navigation_url.as_deref(),
-            Some("https://example.com/other")
-        );
-    }
-
-    #[test]
-    fn location_href_bare_sets_navigation_url() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        let script = r#"
-            location.href = "/relative/path";
-        "#;
-        eval_script(script, Arc::clone(&tree));
-
-        let t = tree.lock().unwrap();
-        assert_eq!(t.navigation_url.as_deref(), Some("/relative/path"));
-    }
-
-    // ── New tests: additional DOM API methods ──────────────────────────────
-
-    #[test]
-    fn create_text_node() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        let script = r#"
-            var parent = document.getElementById("main");
-            var text = document.createTextNode("New text node");
-            parent.appendChild(text);
-        "#;
-        eval_script(script, Arc::clone(&tree));
-
-        let t = tree.lock().unwrap();
-        let handle = t.get_element_by_id("main").unwrap();
-        let text = t.get_text_content(handle);
-        assert!(text.contains("New text node"), "expected 'New text node' in '{text}'");
-    }
-
-    #[test]
-    fn remove_attribute() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        let script = r#"
-            var el = document.querySelector(".intro");
-            el.removeAttribute("class");
-        "#;
-        eval_script(script, Arc::clone(&tree));
-
-        let t = tree.lock().unwrap();
-        // The element should no longer have a class attribute.
-        // query_selector(".intro") should return None now.
-        assert!(t.query_selector(".intro").is_none());
-    }
-
-    #[test]
-    fn has_attribute() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        let script = r#"
-            var el = document.getElementById("main");
-            el.hasAttribute("id");
-        "#;
-        let result = eval_script(script, Arc::clone(&tree));
-        assert!(matches!(result, JsValue::Boolean(true)));
-    }
-
-    #[test]
-    fn style_property_assignment() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        let script = r#"
-            var el = document.getElementById("main");
-            el.style.backgroundColor = "red";
-        "#;
-        eval_script(script, Arc::clone(&tree));
-
-        let dom = tree.lock().unwrap().to_dom();
-        let doc_str = format!("{dom:?}");
-        assert!(
-            doc_str.contains("background-color:red"),
-            "expected background-color:red in {doc_str}"
-        );
-    }
-
-    #[test]
-    fn classname_assignment() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        let script = r#"
-            var el = document.getElementById("main");
-            el.className = "new-class";
-        "#;
-        eval_script(script, Arc::clone(&tree));
-
-        let t = tree.lock().unwrap();
-        let handle = t.get_element_by_id("main").unwrap();
-        assert_eq!(t.get_attribute(handle, "class"), Some("new-class".into()));
-    }
-
-    // ── New tests: control flow / crash prevention stubs ───────────────────
-
-    #[test]
-    fn control_flow_and_extra_stubs_do_not_crash() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        let script = r#"
-            if (true) {
-            }
-            for (var i = 0; i < 10; i++) {
-            }
-            try {
-            } catch (e) {
-            } finally {
-            }
-            typeof window;
-            new Object();
-            return;
-            break;
-            continue;
-            void 0;
-            function myFunc() {}
-            document.title = "Hello";
-            document.readyState;
-            document.write("test");
-            window.innerWidth;
-            window.innerHeight;
-            window.devicePixelRatio;
-            window.pageYOffset;
-            window.performance.now();
-            localStorage.getItem("key");
-            sessionStorage.setItem("key", "val");
-            JSON.stringify({});
-            JSON.parse("{}");
-        "#;
-        let result = eval_script(script, Arc::clone(&tree));
-        // Should complete without panicking.
-        assert!(matches!(result, JsValue::Undefined));
-    }
-
-    #[test]
-    fn service_worker_and_observer_stubs_do_not_crash() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        let script = r#"
-            navigator.serviceWorker.register("/sw.js");
-            navigator.serviceWorker.ready;
-            navigator.clipboard.writeText("hello");
-            Notification.requestPermission();
-            history.pushState({}, "", "/new-url");
-            history.replaceState({}, "", "/other");
-            history.back();
-            history.forward();
-            new Worker("worker.js");
-            new IntersectionObserver(function() {});
-            new MutationObserver(function() {});
-            new ResizeObserver(function() {});
-        "#;
-        let result = eval_script(script, Arc::clone(&tree));
-        assert!(matches!(result, JsValue::Undefined));
-    }
-
-    #[test]
-    fn es6_syntax_stubs_do_not_crash() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        let script = r#"
-            import "module.js";
-            export { foo };
-            class MyComponent {}
-            async function doStuff() {}
-            await fetch("/api");
-            `template literal`;
-            ...args;
-        "#;
-        let result = eval_script(script, Arc::clone(&tree));
-        assert!(matches!(result, JsValue::Undefined));
-    }
-
-    #[test]
-    fn camel_to_kebab_conversion() {
-        assert_eq!(super::camel_to_kebab("backgroundColor"), "background-color");
-        assert_eq!(super::camel_to_kebab("fontSize"), "font-size");
-        assert_eq!(super::camel_to_kebab("display"), "display");
-        assert_eq!(super::camel_to_kebab("borderTopWidth"), "border-top-width");
-    }
-
-    // ── DOMContentLoaded tests ──────────────────────────────────────────────
-
-    #[test]
-    fn dom_content_loaded_fires_after_script() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        // Register a DOMContentLoaded listener that mutates the DOM.
-        // It should fire automatically after script evaluation.
-        let script = r#"
-            var el = document.getElementById("main");
-            document.addEventListener("DOMContentLoaded", function() {
-                el.setAttribute("data-ready", "true");
-            });
-        "#;
-        eval_script(script, Arc::clone(&tree));
-
-        let t = tree.lock().unwrap();
-        let handle = t.get_element_by_id("main").unwrap();
-        assert_eq!(
-            t.get_attribute(handle, "data-ready"),
-            Some("true".into()),
-            "DOMContentLoaded callback should have set data-ready attribute"
-        );
-    }
-
-    #[test]
-    fn dom_content_loaded_fires_only_once() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        // First script registers a DOMContentLoaded listener.
-        let script1 = r#"
-            var el = document.getElementById("main");
-            document.addEventListener("DOMContentLoaded", function() {
-                el.textContent = "loaded";
-            });
-        "#;
-        eval_script(script1, Arc::clone(&tree));
-
-        // Verify it fired.
-        {
-            let t = tree.lock().unwrap();
-            let handle = t.get_element_by_id("main").unwrap();
-            assert_eq!(t.get_text_content(handle), "loaded");
-        }
-
-        // Second call to eval_script should NOT fire DOMContentLoaded again
-        // (dcl_fired flag is set).
-        {
-            let mut t = tree.lock().unwrap();
-            let handle = t.get_element_by_id("main").unwrap();
-            t.set_text_content(handle, "reset");
-        }
-
-        let script2 = r#"
-            // This script does nothing, but DOMContentLoaded should not re-fire.
-        "#;
-        eval_script_with_env(script2, Arc::clone(&tree), &[]);
-
-        let t = tree.lock().unwrap();
-        let handle = t.get_element_by_id("main").unwrap();
-        assert_eq!(
-            t.get_text_content(handle),
-            "reset",
-            "DOMContentLoaded should not fire a second time"
-        );
-    }
-
-    #[test]
-    fn dom_content_loaded_multiple_listeners() {
-        let dom = make_simple_dom();
-        let tree = JsDomTree::from_dom(&dom);
-
-        // Register two DOMContentLoaded listeners.
-        let script = r#"
-            var el = document.getElementById("main");
-            document.addEventListener("DOMContentLoaded", function() {
-                el.setAttribute("data-first", "yes");
-            });
-            document.addEventListener("DOMContentLoaded", function() {
-                el.setAttribute("data-second", "yes");
-            });
-        "#;
-        eval_script(script, Arc::clone(&tree));
-
-        let t = tree.lock().unwrap();
-        let handle = t.get_element_by_id("main").unwrap();
-        assert_eq!(
-            t.get_attribute(handle, "data-first"),
-            Some("yes".into()),
-            "first DOMContentLoaded callback should have fired"
-        );
-        assert_eq!(
-            t.get_attribute(handle, "data-second"),
-            Some("yes".into()),
-            "second DOMContentLoaded callback should have fired"
-        );
     }
 }

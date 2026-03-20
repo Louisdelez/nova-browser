@@ -77,8 +77,6 @@ pub enum RenderOp {
         /// loaded (via `@font-face`), the renderer uses that font instead of
         /// the default DejaVu Sans.
         font_family: Option<String>,
-        /// CSS letter-spacing in pixels. None means normal (0).
-        letter_spacing: Option<f32>,
     },
     /// Draw an image from a GPU texture.
     DrawTexture {
@@ -193,21 +191,33 @@ pub enum RenderOp {
         offset_y: f32,
         blur: f32,
     },
-    /// Mark the start of a scrollable container.
+    /// Mark the start of a fixed-position element.
     ///
-    /// Content exceeding the container's dimensions can be scrolled.
-    /// The renderer should clip to `(x, y, width, height)` and apply
-    /// the internal scroll offset when painting children.
-    ScrollContainerStart {
+    /// Fixed elements are positioned relative to the viewport and are not
+    /// affected by scrolling. The renderer should temporarily ignore scroll
+    /// offsets for all ops until `FixedPositionEnd`.
+    FixedPosition {
         x: f32,
         y: f32,
         width: f32,
         height: f32,
-        /// Total height of the content inside the container.
-        content_height: f32,
     },
-    /// Mark the end of a scrollable container.
-    ScrollContainerEnd,
+    /// End of a fixed-position element region.
+    FixedPositionEnd,
+    /// Apply a 2D affine transform matrix to subsequent drawing operations.
+    ///
+    /// The matrix is specified as `[a, b, c, d, tx, ty]` representing:
+    /// ```text
+    /// | a  c  tx |
+    /// | b  d  ty |
+    /// | 0  0   1 |
+    /// ```
+    Transform {
+        /// 2x3 affine transform matrix `[a, b, c, d, tx, ty]`.
+        matrix: [f32; 6],
+    },
+    /// End of a transform region — pops the current transform.
+    TransformEnd,
 }
 
 /// RGBA color.

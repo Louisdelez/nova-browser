@@ -1342,8 +1342,40 @@ fn eval_statement(
         return JsValue::Undefined;
     }
 
+    // ── Service Worker / Clipboard / Notification stubs ────────────────────
+    //
+    // Modern sites frequently access these APIs.  Return Undefined so scripts
+    // don't crash when e.g. `navigator.serviceWorker.register(…)` is called.
+
+    if line.starts_with("navigator.serviceWorker") {
+        debug!("navigator.serviceWorker stub (no-op)");
+        return JsValue::Undefined;
+    }
+
+    if line.starts_with("navigator.clipboard") {
+        debug!("navigator.clipboard stub (no-op)");
+        return JsValue::Undefined;
+    }
+
+    if line.starts_with("Notification.requestPermission") || line.starts_with("Notification.") {
+        debug!("Notification API stub (no-op)");
+        return JsValue::Undefined;
+    }
+
     // `window.navigator.*` property reads — ignore silently.
     if line.starts_with("window.navigator") || line.starts_with("navigator.") {
+        return JsValue::Undefined;
+    }
+
+    // ── History API stubs ────────────────────────────────────────────────────
+
+    if line.starts_with("history.pushState")
+        || line.starts_with("history.replaceState")
+        || line.starts_with("history.back")
+        || line.starts_with("history.forward")
+        || line.starts_with("history.go")
+    {
+        debug!(line, "History API stub (no-op)");
         return JsValue::Undefined;
     }
 
@@ -1422,6 +1454,9 @@ fn eval_statement(
     }
 
     // `new …` constructor calls — ignore silently.
+    // Covers `new Worker(…)`, `new IntersectionObserver(…)`,
+    // `new MutationObserver(…)`, `new ResizeObserver(…)`, and any other
+    // constructor.
     if line.starts_with("new ") {
         debug!(line, "constructor call stub (no-op)");
         return JsValue::Undefined;
@@ -1501,6 +1536,49 @@ fn eval_statement(
 
     // `window.dispatchEvent(…)` / `document.dispatchEvent(…)` — no-op.
     if line.starts_with("window.dispatchEvent(") || line.starts_with("document.dispatchEvent(") {
+        return JsValue::Undefined;
+    }
+
+    // ── ES6+ syntax stubs ───────────────────────────────────────────────────
+    //
+    // The mini-interpreter is ES5-oriented.  When it encounters ES6+ syntax
+    // we skip or simplify rather than crashing.
+
+    // `import …` / `export …` — ES module syntax, skip.
+    if line.starts_with("import ") || line.starts_with("import{") || line.starts_with("import\"") || line.starts_with("import'") {
+        return JsValue::Undefined;
+    }
+    if line.starts_with("export ") || line.starts_with("export{") {
+        return JsValue::Undefined;
+    }
+
+    // `class …` declarations — skip.
+    if line.starts_with("class ") {
+        return JsValue::Undefined;
+    }
+
+    // `async …` — strip prefix and evaluate the rest.
+    if let Some(rest) = line.strip_prefix("async ") {
+        return eval_statement(rest, env, tree);
+    }
+
+    // `await …` — strip prefix and evaluate the rest.
+    if let Some(rest) = line.strip_prefix("await ") {
+        return eval_statement(rest, env, tree);
+    }
+
+    // Arrow functions as standalone expressions — skip.
+    if line.contains("=>") {
+        return JsValue::Undefined;
+    }
+
+    // Spread operator as standalone expression — skip.
+    if line.starts_with("...") {
+        return JsValue::Undefined;
+    }
+
+    // Template literals as standalone expressions — skip.
+    if line.starts_with('`') {
         return JsValue::Undefined;
     }
 
@@ -2255,6 +2333,47 @@ mod tests {
         "#;
         let result = eval_script(script, Arc::clone(&tree));
         // Should complete without panicking.
+        assert!(matches!(result, JsValue::Undefined));
+    }
+
+    #[test]
+    fn service_worker_and_observer_stubs_do_not_crash() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        let script = r#"
+            navigator.serviceWorker.register("/sw.js");
+            navigator.serviceWorker.ready;
+            navigator.clipboard.writeText("hello");
+            Notification.requestPermission();
+            history.pushState({}, "", "/new-url");
+            history.replaceState({}, "", "/other");
+            history.back();
+            history.forward();
+            new Worker("worker.js");
+            new IntersectionObserver(function() {});
+            new MutationObserver(function() {});
+            new ResizeObserver(function() {});
+        "#;
+        let result = eval_script(script, Arc::clone(&tree));
+        assert!(matches!(result, JsValue::Undefined));
+    }
+
+    #[test]
+    fn es6_syntax_stubs_do_not_crash() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        let script = r#"
+            import "module.js";
+            export { foo };
+            class MyComponent {}
+            async function doStuff() {}
+            await fetch("/api");
+            `template literal`;
+            ...args;
+        "#;
+        let result = eval_script(script, Arc::clone(&tree));
         assert!(matches!(result, JsValue::Undefined));
     }
 

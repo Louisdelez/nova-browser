@@ -722,7 +722,10 @@ fn add_node(
                         flex_direction: FlexDirection::Row,
                         flex_wrap: FlexWrap::Wrap,
                         size: Size {
-                            width: Dimension::Auto,
+                            // Use 100% width so the wrapper fills its parent
+                            // container and words wrap at the container edge
+                            // (e.g., max-width: 600px div on example.com).
+                            width: Dimension::Percent(1.0),
                             height: Dimension::Auto,
                         },
                         ..Style::DEFAULT

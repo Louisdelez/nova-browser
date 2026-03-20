@@ -72,6 +72,11 @@ struct FontRenderer {
     bold_italic: Option<fontdue::Font>,
     /// Cache keyed by (variant, character, font_size * 10 as u32).
     cache: HashMap<(FontVariant, char, u32), CachedGlyph>,
+    /// Custom fonts loaded from `@font-face` rules, keyed by family name
+    /// (case-insensitive — keys are stored lowercased).
+    custom_fonts: HashMap<String, fontdue::Font>,
+    /// Cache for custom font glyphs, keyed by (family_lowercase, character, font_size * 10).
+    custom_cache: HashMap<(String, char, u32), CachedGlyph>,
 }
 
 impl FontRenderer {
@@ -104,7 +109,42 @@ impl FontRenderer {
             italic,
             bold_italic,
             cache: HashMap::new(),
+            custom_fonts: HashMap::new(),
+            custom_cache: HashMap::new(),
         })
+    }
+
+    /// Load a custom font from raw TTF/OTF bytes.
+    ///
+    /// The font is stored under the given `family` name (lowercased for
+    /// case-insensitive lookup). If parsing fails, the font is silently
+    /// skipped with a warning.
+    fn load_custom_font(&mut self, family: &str, data: Vec<u8>) {
+        let key = family.to_lowercase();
+        if self.custom_fonts.contains_key(&key) {
+            return; // already loaded
+        }
+        let settings = fontdue::FontSettings::default();
+        match fontdue::Font::from_bytes(data, settings) {
+            Ok(font) => {
+                tracing::info!(family = %family, "loaded custom @font-face font");
+                self.custom_fonts.insert(key, font);
+            }
+            Err(e) => {
+                tracing::warn!(family = %family, error = %e, "failed to parse @font-face font data");
+            }
+        }
+    }
+
+    /// Rasterize a glyph using a custom font, returning it from cache if available.
+    fn rasterize_custom(&mut self, family_lower: &str, ch: char, font_size: f32) -> Option<&CachedGlyph> {
+        let key = (family_lower.to_string(), ch, (font_size * 10.0).round() as u32);
+        if !self.custom_cache.contains_key(&key) {
+            let font = self.custom_fonts.get(family_lower)?;
+            let (metrics, bitmap) = font.rasterize(ch, font_size);
+            self.custom_cache.insert(key.clone(), CachedGlyph { bitmap, metrics });
+        }
+        self.custom_cache.get(&key)
     }
 
     /// Locate font bytes from well-known paths for a given filename.
@@ -206,6 +246,8 @@ pub struct Framebuffer {
     /// Stack of clip rectangles. Rendering is restricted to the intersection of
     /// all active clip rects.
     clip_stack: Vec<ClipRect>,
+    /// Extra y-offset applied by sticky positioning (reset each frame).
+    translate_y_offset: f32,
 }
 
 impl Framebuffer {
@@ -219,6 +261,7 @@ impl Framebuffer {
             pixels,
             font_renderer,
             clip_stack: Vec::new(),
+            translate_y_offset: 0.0,
         }
     }
 
@@ -230,6 +273,23 @@ impl Framebuffer {
         let size = (width * height * 4) as usize;
         self.pixels.resize(size, 255);
         self.pixels.fill(255);
+    }
+
+    /// Load custom `@font-face` fonts into the font renderer.
+    ///
+    /// Each entry is `(family_name, font_bytes)`. Fonts that have already been
+    /// loaded (same family name) are skipped. Only TTF/OTF data is accepted;
+    /// fontdue will reject anything else.
+    pub fn load_custom_fonts(&mut self, fonts: &[(String, Vec<u8>)]) {
+        if let Some(ref mut renderer) = self.font_renderer {
+            for (family, data) in fonts {
+                renderer.load_custom_font(family, data.clone());
+            }
+        } else {
+            tracing::warn!(
+                "cannot load custom fonts: no font renderer available (no base font loaded)"
+            );
+        }
     }
 
     /// Measure the width of text at a given font size without rendering.
@@ -451,6 +511,9 @@ impl Framebuffer {
     /// Draw text using the fontdue renderer with glyph caching, anti-aliasing,
     /// and automatic line wrapping. Supports bold/italic via font variants.
     ///
+    /// When `font_family` is `Some` and a matching custom `@font-face` font has
+    /// been loaded, that font is used instead of the default DejaVu Sans.
+    ///
     /// Falls back to the built-in bitmap font if no TTF font was loaded.
     pub fn draw_text(
         &mut self,
@@ -461,6 +524,7 @@ impl Framebuffer {
         color: Color,
         font_weight: Option<u16>,
         font_style: Option<&str>,
+        font_family: Option<&str>,
     ) {
         if self.font_renderer.is_none() {
             self.draw_text_bitmap(x, y, text, font_size, color);
@@ -468,6 +532,16 @@ impl Framebuffer {
         }
 
         let variant = FontVariant::from_css(font_weight, font_style);
+
+        // Check if we should use a custom @font-face font.
+        let custom_family_key = font_family
+            .map(|f| f.to_lowercase())
+            .filter(|key| {
+                self.font_renderer
+                    .as_ref()
+                    .map(|r| r.custom_fonts.contains_key(key))
+                    .unwrap_or(false)
+            });
 
         // We need to temporarily take the font renderer out of `self` so we can
         // mutably borrow both `self` (for pixel writes) and the renderer (for
@@ -487,8 +561,19 @@ impl Framebuffer {
                 continue;
             }
 
-            let glyph = renderer.rasterize(ch, font_size, variant);
-            let metrics = glyph.metrics;
+            // Rasterize: use the custom font if available, otherwise the default.
+            let (metrics, bitmap) = if let Some(ref family_key) = custom_family_key {
+                if let Some(glyph) = renderer.rasterize_custom(family_key, ch, font_size) {
+                    (glyph.metrics, glyph.bitmap.clone())
+                } else {
+                    // Custom font didn't have this glyph — fall back to default.
+                    let glyph = renderer.rasterize(ch, font_size, variant);
+                    (glyph.metrics, glyph.bitmap.clone())
+                }
+            } else {
+                let glyph = renderer.rasterize(ch, font_size, variant);
+                (glyph.metrics, glyph.bitmap.clone())
+            };
 
             // Line wrapping: if this glyph would exceed the framebuffer width,
             // wrap to the next line.
@@ -502,10 +587,6 @@ impl Framebuffer {
             let gy = cy - metrics.ymin; // fontdue ymin is distance from baseline up
             let bw = metrics.width;
             let bh = metrics.height;
-
-            // Safety: we clone the bitmap slice to avoid borrow issues.
-            // The bitmap is typically small (< 2 KB), so this is cheap.
-            let bitmap = glyph.bitmap.clone();
 
             for row in 0..bh {
                 for col in 0..bw {
@@ -609,36 +690,43 @@ impl Framebuffer {
     ) {
         self.clear(Color::WHITE);
         self.clip_stack.clear();
+        self.translate_y_offset = 0.0;
+
+        // Load any custom @font-face fonts that haven't been loaded yet.
+        if !commands.fonts.is_empty() {
+            self.load_custom_fonts(&commands.fonts);
+        }
 
         let sx = scroll_x;
 
         for op in &commands.ops {
+            let sy_extra = self.translate_y_offset;
             match op {
                 RenderOp::FillRect { x, y, width, height, color } => {
-                    self.fill_rect(*x - sx, *y + y_offset - scroll_y, *width, *height, *color);
+                    self.fill_rect(*x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, *color);
                 }
-                RenderOp::DrawText { x, y, text, font_size, color, font_weight, font_style } => {
+                RenderOp::DrawText { x, y, text, font_size, color, font_weight, font_style, font_family } => {
                     self.draw_text(
-                        *x - sx, *y + y_offset - scroll_y, text, *font_size, *color,
-                        *font_weight, font_style.as_deref(),
+                        *x - sx, *y + y_offset - scroll_y + sy_extra, text, *font_size, *color,
+                        *font_weight, font_style.as_deref(), font_family.as_deref(),
                     );
                 }
                 RenderOp::StrokeRect { x, y, width, height, color, width_px } => {
-                    self.stroke_rect(*x - sx, *y + y_offset - scroll_y, *width, *height, *color, *width_px);
+                    self.stroke_rect(*x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, *color, *width_px);
                 }
                 RenderOp::DrawImage {
                     x, y, width, height,
                     img_width, img_height, pixels,
                 } => {
                     self.draw_image(
-                        *x - sx, *y + y_offset - scroll_y, *width, *height,
+                        *x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height,
                         *img_width, *img_height, pixels,
                     );
                 }
                 RenderOp::PushClip { x, y, width, height } => {
                     self.clip_stack.push(ClipRect {
                         x: (*x - sx).round() as i32,
-                        y: (*y + y_offset - scroll_y).round() as i32,
+                        y: (*y + y_offset - scroll_y + sy_extra).round() as i32,
                         width: width.round() as i32,
                         height: height.round() as i32,
                     });
@@ -648,7 +736,7 @@ impl Framebuffer {
                 }
                 RenderOp::FillRoundedRect { x, y, width, height, color, radius } => {
                     self.fill_rounded_rect(
-                        *x - sx, *y + y_offset - scroll_y, *width, *height, *color, *radius,
+                        *x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, *color, *radius,
                     );
                 }
                 RenderOp::BoxShadow {
@@ -656,11 +744,25 @@ impl Framebuffer {
                 } => {
                     self.fill_rect(
                         *x + *offset_x - sx,
-                        *y + *offset_y + y_offset - scroll_y,
+                        *y + *offset_y + y_offset - scroll_y + sy_extra,
                         *width,
                         *height,
                         *color,
                     );
+                }
+                // Sticky positioning: adjust the y-offset for subsequent ops
+                // so the element sticks to the viewport during scroll.
+                RenderOp::StickyStart { original_y, sticky_top } => {
+                    // If the element would scroll above sticky_top in the viewport,
+                    // push a translation to keep it at sticky_top.
+                    let element_viewport_y = *original_y + y_offset - scroll_y;
+                    if element_viewport_y < y_offset + *sticky_top {
+                        let offset = (y_offset + *sticky_top) - element_viewport_y;
+                        self.translate_y_offset += offset;
+                    }
+                }
+                RenderOp::StickyEnd => {
+                    self.translate_y_offset = 0.0;
                 }
                 // Link ops are metadata-only; they don't draw anything.
                 RenderOp::Link { .. } => {}
@@ -669,11 +771,61 @@ impl Framebuffer {
             }
         }
 
-        // Draw the scrollbar if the content is taller than the page area.
+        // Draw vertical scrollbar if content is taller than the page area.
         let page_area_height = (self.height as f32 - y_offset).max(0.0);
+        let page_area_width = self.width as f32;
         if content_height > page_area_height && content_height > 0.0 {
             self.draw_scrollbar(scroll_y, content_height, page_area_height, y_offset);
         }
+
+        // Draw horizontal scrollbar if content is wider than the viewport.
+        if page_area_width > 0.0 {
+            let content_w = self.compute_content_width_from_ops(commands);
+            if content_w > page_area_width {
+                self.draw_horizontal_scrollbar(scroll_x, content_w, page_area_width, y_offset + page_area_height);
+            }
+        }
+    }
+
+    /// Compute content width from render ops (max x + width).
+    fn compute_content_width_from_ops(&self, commands: &RenderCommands) -> f32 {
+        let mut max_x: f32 = 0.0;
+        for op in &commands.ops {
+            let right = match op {
+                RenderOp::FillRect { x, width, .. } => x + width,
+                RenderOp::DrawText { x, text, font_size, .. } => x + text.len() as f32 * font_size * 0.6,
+                RenderOp::StrokeRect { x, width, .. } => x + width,
+                RenderOp::DrawImage { x, width, .. } => x + width,
+                _ => 0.0,
+            };
+            if right > max_x { max_x = right; }
+        }
+        max_x
+    }
+
+    /// Draw a thin horizontal scrollbar at the bottom of the page area.
+    fn draw_horizontal_scrollbar(
+        &mut self,
+        scroll_x: f32,
+        content_width: f32,
+        page_area_width: f32,
+        bar_y: f32,
+    ) {
+        let bar_height: f32 = 8.0;
+        let bar_y = bar_y - bar_height; // Draw just above the bottom edge.
+
+        // Track.
+        let track_color = Color::rgba(0.85, 0.85, 0.85, 0.6);
+        self.fill_rect(0.0, bar_y, page_area_width, bar_height, track_color);
+
+        // Thumb.
+        let thumb_width = (page_area_width / content_width * page_area_width).max(20.0);
+        let max_scroll = (content_width - page_area_width).max(0.0);
+        let scroll_ratio = if max_scroll > 0.0 { scroll_x / max_scroll } else { 0.0 };
+        let thumb_x = scroll_ratio * (page_area_width - thumb_width);
+
+        let thumb_color = Color::rgba(0.5, 0.5, 0.5, 0.7);
+        self.fill_rect(thumb_x, bar_y, thumb_width, bar_height, thumb_color);
     }
 
     /// Draw a thin scrollbar on the right edge of the page area.

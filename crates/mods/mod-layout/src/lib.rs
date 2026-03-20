@@ -397,7 +397,7 @@ fn add_node(
                 if !label.is_empty() {
                     let text_w = measure_text_width(&label, font_size).min(w);
                     let text_ctx = NodeContext {
-                        content: LayoutContent::Text(label),
+                        content: LayoutContent::Text(label.clone()),
                         style: StyleMap { properties: props.clone() },
                     };
                     let text_id = taffy
@@ -415,6 +415,14 @@ fn add_node(
                         .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
                     child_ids.push(text_id);
                 }
+
+                // Tag the form element type so the painter can emit FormField ops.
+                let form_type = match tag.as_str() {
+                    "input" => input_type.to_string(),
+                    other => other.to_string(),
+                };
+                props.push(("nova-form-type".into(), StyleValue::Str(form_type)));
+                props.push(("nova-form-value".into(), StyleValue::Str(label.clone())));
 
                 let ctx = NodeContext {
                     content: LayoutContent::Block,
@@ -1327,7 +1335,8 @@ fn build_taffy_style(
     let taffy_position = match lp.position.as_deref() {
         Some("relative") => Position::Relative,
         Some("absolute") | Some("fixed") => Position::Absolute,
-        // `sticky` is approximated as `relative` since Taffy has no sticky concept.
+        // `sticky` uses Relative positioning in Taffy; the shell applies
+        // the sticky offset at render time based on scroll position.
         Some("sticky") => Position::Relative,
         _ => Position::Relative, // CSS default (static ≈ relative in Taffy)
     };

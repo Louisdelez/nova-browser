@@ -109,6 +109,16 @@ impl PipelineEngine {
             }
         }
 
+        // Step 4d: Fetch @font-face font files (in parallel)
+        let custom_fonts = self.fetch_fonts_parallel(&font_face_urls).await;
+        if !custom_fonts.is_empty() {
+            info!(
+                "Pipeline: fetched {}/{} @font-face font(s)",
+                custom_fonts.len(),
+                font_face_urls.len()
+            );
+        }
+
         // Step 5: Compute styles (with external stylesheets)
         let styles = self.compute_styles_with(&dom, stylesheets, &viewport).await?;
 
@@ -126,7 +136,15 @@ impl PipelineEngine {
         );
 
         // Step 8: Paint (with decoded images)
-        let render_commands = self.paint_with_images(&layout_tree, images).await?;
+        let mut render_commands = self.paint_with_images(&layout_tree, images).await?;
+
+        // Step 8b: Inject fetched @font-face fonts into the render commands
+        // so the renderer can load and use them.
+        if !custom_fonts.is_empty() {
+            if let TypedData::RenderCommands(ref mut cmds) = render_commands {
+                cmds.fonts = custom_fonts;
+            }
+        }
 
         // Step 9: Execute scripts (after paint, so scripts don't block rendering)
         self.execute_scripts(&sub_resources.scripts, &sub_resources.inline_scripts)
@@ -327,6 +345,77 @@ impl PipelineEngine {
             }
         }
         result
+    }
+
+    /// Fetch `@font-face` font files in parallel.
+    ///
+    /// Only `.ttf` and `.otf` fonts are fetched (fontdue can parse them natively).
+    /// `.woff` and `.woff2` URLs are logged as warnings and skipped because
+    /// fontdue cannot decode compressed WOFF containers.
+    ///
+    /// Returns `(family_name, font_bytes)` pairs for successfully fetched fonts.
+    async fn fetch_fonts_parallel(&self, font_urls: &[FontFaceUrl]) -> Vec<(String, Vec<u8>)> {
+        if font_urls.is_empty() {
+            return vec![];
+        }
+
+        let futures: Vec<_> = font_urls
+            .iter()
+            .map(|ff| self.fetch_font(&ff.family, &ff.url))
+            .collect();
+        let results = futures::future::join_all(futures).await;
+
+        results.into_iter().flatten().collect()
+    }
+
+    /// Fetch a single font file, returning `None` on failure or unsupported format.
+    async fn fetch_font(&self, family: &str, url: &str) -> Option<(String, Vec<u8>)> {
+        // Determine the format from the URL extension.
+        let path = url.split('?').next().unwrap_or(url);
+        let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
+
+        match ext.as_str() {
+            "ttf" | "otf" => {}
+            "woff" | "woff2" => {
+                warn!(
+                    family = %family,
+                    url = %url,
+                    "skipping @font-face font: .{ext} format is not supported by fontdue"
+                );
+                return None;
+            }
+            _ => {
+                warn!(
+                    family = %family,
+                    url = %url,
+                    ext = %ext,
+                    "skipping @font-face font: unrecognized font format"
+                );
+                return None;
+            }
+        }
+
+        match self.fetch(url).await {
+            Ok(response) => {
+                let bytes = response.body.to_vec();
+                info!(
+                    family = %family,
+                    url = %url,
+                    size = bytes.len(),
+                    "fetched @font-face font"
+                );
+                Some((family.to_string(), bytes))
+            }
+            Err(e) => {
+                warn!(
+                    family = %family,
+                    url = %url,
+                    error = %e,
+                    "failed to fetch @font-face font, skipping"
+                );
+                None
+            }
+        }
     }
 
     /// Fetch and decode images in parallel.

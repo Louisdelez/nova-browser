@@ -59,6 +59,23 @@ impl HitRegion {
     }
 }
 
+/// An interactive form field region on the page.
+#[derive(Debug, Clone)]
+struct FormFieldRegion {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    value: String,
+    field_type: String,
+}
+
+impl FormFieldRegion {
+    fn contains(&self, px: f32, py: f32) -> bool {
+        px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
+    }
+}
+
 /// State of the GPU surface once the window is created.
 struct GpuState {
     surface: wgpu::Surface<'static>,
@@ -107,6 +124,12 @@ pub struct BrowserWindow {
     /// Total width of the rendered content in pixels.
     content_width: f32,
 
+    // -- Form field interaction state --
+    /// Interactive form field regions extracted from `RenderOp::FormField` ops.
+    form_fields: Vec<FormFieldRegion>,
+    /// Index of the currently focused form field, or None.
+    focused_field: Option<usize>,
+
     // -- Link interaction state --
     /// Clickable link regions extracted from `RenderOp::Link` ops.
     hit_regions: Vec<HitRegion>,
@@ -136,6 +159,7 @@ impl BrowserWindow {
         core: Arc<NovaCore>,
     ) -> Self {
         let hit_regions = Self::extract_hit_regions(&commands);
+        let form_fields = Self::extract_form_fields(&commands);
         let content_height = Self::compute_content_height(&commands);
         let content_width = Self::compute_content_width(&commands);
         let fb = Framebuffer::new(width, height);
@@ -165,6 +189,8 @@ impl BrowserWindow {
             scroll_x: 0.0,
             content_height,
             content_width,
+            form_fields,
+            focused_field: None,
             hit_regions,
             last_clicked_url: None,
             core,
@@ -194,6 +220,20 @@ impl BrowserWindow {
                 }
             })
             .collect()
+    }
+
+    /// Extract form field regions from render commands.
+    fn extract_form_fields(commands: &RenderCommands) -> Vec<FormFieldRegion> {
+        commands.ops.iter().filter_map(|op| {
+            if let RenderOp::FormField { x, y, width, height, value, field_type } = op {
+                Some(FormFieldRegion {
+                    x: *x, y: *y, width: *width, height: *height,
+                    value: value.clone(), field_type: field_type.clone(),
+                })
+            } else {
+                None
+            }
+        }).collect()
     }
 
     /// Compute the total content height by scanning all render ops for the
@@ -442,6 +482,16 @@ impl BrowserWindow {
             self.content_height,
         );
 
+        // Draw focus ring on the focused form field (if any).
+        if let Some(idx) = self.focused_field {
+            if let Some(field) = self.form_fields.get(idx) {
+                let fx = field.x - self.scroll_x;
+                let fy = field.y + URL_BAR_HEIGHT - self.scroll_y;
+                let focus_color = Color { r: 0.26, g: 0.52, b: 0.96, a: 1.0 };
+                self.framebuffer.stroke_rect(fx - 1.0, fy - 1.0, field.width + 2.0, field.height + 2.0, focus_color, 2.0);
+            }
+        }
+
         // Draw the URL bar on top (overwrites the top region, not affected by scroll).
         self.draw_url_bar();
     }
@@ -542,7 +592,7 @@ impl BrowserWindow {
         }
 
         self.framebuffer
-            .draw_text(text_x, text_y, &self.url_bar_text, URL_BAR_FONT_SIZE, text_color, None, None);
+            .draw_text(text_x, text_y, &self.url_bar_text, URL_BAR_FONT_SIZE, text_color, None, None, None);
 
         // -- Cursor (vertical line at the cursor position) --
         if self.url_bar_focused && !self.url_bar_select_all {
@@ -800,6 +850,8 @@ impl BrowserWindow {
             Ok(TypedData::RenderCommands(cmds)) => {
                 info!("In-place navigation successful! {} render ops", cmds.ops.len());
                 self.hit_regions = Self::extract_hit_regions(&cmds);
+                self.form_fields = Self::extract_form_fields(&cmds);
+                self.focused_field = None;
                 self.content_height = Self::compute_content_height(&cmds);
                 self.content_width = Self::compute_content_width(&cmds);
                 self.render_commands = cmds;
@@ -1001,6 +1053,26 @@ impl ApplicationHandler for BrowserWindow {
                         self.url_bar_focused = false;
                         self.url_bar_select_all = false;
                         self.request_redraw();
+                    }
+
+                    // Check for form field clicks — focus the field.
+                    let page_x = cx as f32 + self.scroll_x;
+                    let page_y = (cy as f32 - URL_BAR_HEIGHT) + self.scroll_y;
+                    let mut clicked_field = None;
+                    for (i, field) in self.form_fields.iter().enumerate() {
+                        if field.contains(page_x, page_y) {
+                            clicked_field = Some(i);
+                            break;
+                        }
+                    }
+                    if let Some(idx) = clicked_field {
+                        self.focused_field = Some(idx);
+                        self.request_redraw();
+                    } else {
+                        if self.focused_field.is_some() {
+                            self.focused_field = None;
+                            self.request_redraw();
+                        }
                     }
 
                     // Check for link clicks — navigate in place.

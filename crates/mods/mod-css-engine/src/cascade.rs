@@ -5,12 +5,91 @@
 //! inline styles, then writes the computed styles into `data-nova-style`
 //! attributes on each element.
 
+use std::collections::HashMap;
+
 use nova_mod_api::content::DomNode;
 
 use crate::defaults::default_style_for_tag;
 use crate::parser::{self, CssRule};
 use crate::selector::{PseudoElement, SiblingContext, Specificity};
 use crate::values;
+
+// ── Rule index for fast selector pre-filtering ────────────────────────
+
+/// Pre-sorted index of CSS rules for fast selector matching.
+///
+/// Rules are bucketed by the rightmost compound selector's ID, class, or tag.
+/// When matching an element, only relevant buckets are checked instead of all rules.
+struct RuleIndex {
+    by_id: HashMap<String, Vec<usize>>,
+    by_class: HashMap<String, Vec<usize>>,
+    by_tag: HashMap<String, Vec<usize>>,
+    universal: Vec<usize>,
+}
+
+impl RuleIndex {
+    fn build(rules: &[CssRule]) -> Self {
+        let mut by_id: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_class: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_tag: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut universal: Vec<usize> = Vec::new();
+
+        for (i, rule) in rules.iter().enumerate() {
+            let mut indexed = false;
+            for sel in &rule.selector.selectors {
+                if let Some(last) = sel.parts.last() {
+                    if let Some(ref id) = last.id {
+                        by_id.entry(id.clone()).or_default().push(i);
+                        indexed = true;
+                    } else if !last.classes.is_empty() {
+                        by_class.entry(last.classes[0].clone()).or_default().push(i);
+                        indexed = true;
+                    } else if let Some(ref tag) = last.tag {
+                        by_tag.entry(tag.clone()).or_default().push(i);
+                        indexed = true;
+                    }
+                }
+            }
+            if !indexed {
+                universal.push(i);
+            }
+        }
+
+        RuleIndex { by_id, by_class, by_tag, universal }
+    }
+
+    fn candidates_for(&self, tag: &str, attributes: &[(String, String)]) -> Vec<usize> {
+        let mut seen = Vec::new();
+        let mut result = Vec::new();
+        let push = |idx: usize, seen: &mut Vec<usize>, result: &mut Vec<usize>| {
+            if !seen.contains(&idx) {
+                seen.push(idx);
+                result.push(idx);
+            }
+        };
+
+        if let Some(id) = attributes.iter().find(|(k, _)| k == "id").map(|(_, v)| v) {
+            if let Some(indices) = self.by_id.get(id) {
+                for &idx in indices { push(idx, &mut seen, &mut result); }
+            }
+        }
+        if let Some(class_attr) = attributes.iter().find(|(k, _)| k == "class").map(|(_, v)| v) {
+            for cls in class_attr.split_whitespace() {
+                if let Some(indices) = self.by_class.get(cls) {
+                    for &idx in indices { push(idx, &mut seen, &mut result); }
+                }
+            }
+        }
+        let tag_lower = tag.to_ascii_lowercase();
+        if let Some(indices) = self.by_tag.get(&tag_lower) {
+            for &idx in indices { push(idx, &mut seen, &mut result); }
+        }
+        for &idx in &self.universal {
+            push(idx, &mut seen, &mut result);
+        }
+        result
+    }
+}
 
 /// A declaration with its origin and specificity, used for cascade sorting.
 #[derive(Debug, Clone)]
@@ -99,15 +178,19 @@ pub fn compute_styles(dom: DomNode, extra_css: &[String], viewport_width: f32) -
         "parsed CSS rules for style computation"
     );
 
-    // 3. Walk DOM and apply styles.
+    // 3. Build rule index for fast matching.
+    let index = RuleIndex::build(&rules);
+
+    // 4. Walk DOM and apply styles.
     let ancestors: Vec<&DomNode> = Vec::new();
-    apply_styles_recursive(dom, &rules, &ancestors)
+    apply_styles_recursive(dom, &rules, &index, &ancestors)
 }
 
 /// Recursively apply styles to a DOM node.
 fn apply_styles_recursive(
     node: DomNode,
     rules: &[CssRule],
+    index: &RuleIndex,
     ancestors: &[&DomNode],
 ) -> DomNode {
     match node {
@@ -124,7 +207,7 @@ fn apply_styles_recursive(
             };
 
             // Compute styles for this element.
-            let style_str = compute_element_style(&tag, &attributes, &temp_node, rules, ancestors);
+            let style_str = compute_element_style(&tag, &attributes, &temp_node, rules, index, ancestors);
 
             // Build new attributes with data-nova-style.
             let mut new_attributes = attributes;
@@ -149,7 +232,7 @@ fn apply_styles_recursive(
             let this_ref: &DomNode = &this_node;
             new_ancestors.push(this_ref);
 
-            let mut new_children = apply_styles_to_children(children, rules, &new_ancestors);
+            let mut new_children = apply_styles_to_children(children, rules, index, &new_ancestors);
 
             // Inject ::before and ::after pseudo-element text nodes when a CSS
             // rule targets this element with `::before` or `::after` and
@@ -182,7 +265,7 @@ fn apply_styles_recursive(
             }
         }
         DomNode::Document { children } => {
-            let new_children = apply_styles_to_children(children, rules, ancestors);
+            let new_children = apply_styles_to_children(children, rules, index, ancestors);
             DomNode::Document {
                 children: new_children,
             }
@@ -196,6 +279,7 @@ fn apply_styles_recursive(
 fn apply_styles_to_children(
     children: Vec<DomNode>,
     rules: &[CssRule],
+    index: &RuleIndex,
     ancestors: &[&DomNode],
 ) -> Vec<DomNode> {
     let len = children.len();
@@ -208,7 +292,7 @@ fn apply_styles_to_children(
             index: i,
         };
         let child = children_vec[i].clone();
-        result.push(apply_styles_recursive_with_siblings(child, rules, ancestors, Some(sib_ctx)));
+        result.push(apply_styles_recursive_with_siblings(child, rules, index, ancestors, Some(sib_ctx)));
     }
 
     result
@@ -218,6 +302,7 @@ fn apply_styles_to_children(
 fn apply_styles_recursive_with_siblings(
     node: DomNode,
     rules: &[CssRule],
+    index: &RuleIndex,
     ancestors: &[&DomNode],
     siblings: Option<SiblingContext<'_>>,
 ) -> DomNode {
@@ -234,7 +319,7 @@ fn apply_styles_recursive_with_siblings(
             };
 
             let style_str = compute_element_style_with_siblings(
-                &tag, &attributes, &temp_node, rules, ancestors, siblings,
+                &tag, &attributes, &temp_node, rules, index, ancestors, siblings,
             );
 
             let mut new_attributes = attributes;
@@ -253,7 +338,7 @@ fn apply_styles_recursive_with_siblings(
             let this_ref: &DomNode = &this_node;
             new_ancestors.push(this_ref);
 
-            let mut new_children = apply_styles_to_children(children, rules, &new_ancestors);
+            let mut new_children = apply_styles_to_children(children, rules, index, &new_ancestors);
 
             if let Some(before_text) = pseudo_element_content(
                 &tag, &new_attributes, &this_node, rules, ancestors, PseudoElement::Before,
@@ -273,7 +358,7 @@ fn apply_styles_recursive_with_siblings(
             }
         }
         DomNode::Document { children } => {
-            let new_children = apply_styles_to_children(children, rules, ancestors);
+            let new_children = apply_styles_to_children(children, rules, index, ancestors);
             DomNode::Document { children: new_children }
         }
         other => other,
@@ -286,25 +371,22 @@ fn compute_element_style_with_siblings(
     attributes: &[(String, String)],
     node: &DomNode,
     rules: &[CssRule],
+    index: &RuleIndex,
     ancestors: &[&DomNode],
     siblings: Option<SiblingContext<'_>>,
 ) -> String {
-    // Delegate to the main compute function, but pass siblings for matching.
-    compute_element_style_impl(tag, attributes, node, rules, ancestors, siblings)
+    compute_element_style_impl(tag, attributes, node, rules, index, ancestors, siblings)
 }
 
-/// Compute the style string for a single element.
-///
-/// Collects declarations from: user-agent defaults, stylesheet rules, inline styles.
-/// Sorts by cascade precedence, deduplicates (last wins), and serializes.
 fn compute_element_style(
     tag: &str,
     attributes: &[(String, String)],
     node: &DomNode,
     rules: &[CssRule],
+    index: &RuleIndex,
     ancestors: &[&DomNode],
 ) -> String {
-    compute_element_style_impl(tag, attributes, node, rules, ancestors, None)
+    compute_element_style_impl(tag, attributes, node, rules, index, ancestors, None)
 }
 
 /// Internal implementation that supports optional sibling context.
@@ -313,6 +395,7 @@ fn compute_element_style_impl(
     attributes: &[(String, String)],
     node: &DomNode,
     rules: &[CssRule],
+    index: &RuleIndex,
     ancestors: &[&DomNode],
     siblings: Option<SiblingContext<'_>>,
 ) -> String {
@@ -377,8 +460,10 @@ fn compute_element_style_impl(
         });
     }
 
-    // 2. Stylesheet rules (sorted by specificity).
-    for rule in rules {
+    // 2. Stylesheet rules — use the index to only check candidate rules.
+    let candidates = index.candidates_for(tag, attributes);
+    for &rule_idx in &candidates {
+        let rule = &rules[rule_idx];
         if rule.selector.matches(node, ancestors, siblings) {
             let spec = rule.selector.specificity();
             for decl in &rule.declarations {

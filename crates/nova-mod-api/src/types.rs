@@ -43,6 +43,12 @@ impl GpuTextureHandle {
 #[derive(Debug, Clone)]
 pub struct RenderCommands {
     pub ops: Vec<RenderOp>,
+    /// Custom fonts fetched from `@font-face` rules.
+    ///
+    /// Each entry is `(family_name, font_bytes)` where `font_bytes` is the raw
+    /// TTF/OTF file data. The renderer loads these fonts and uses them when a
+    /// `DrawText` op references the corresponding `font_family`.
+    pub fonts: Vec<(String, Vec<u8>)>,
 }
 
 /// Individual render operations.
@@ -67,6 +73,10 @@ pub enum RenderOp {
         font_weight: Option<u16>,
         /// CSS font-style ("italic", "oblique"). None defaults to normal.
         font_style: Option<String>,
+        /// CSS font-family name. When set and a matching custom font has been
+        /// loaded (via `@font-face`), the renderer uses that font instead of
+        /// the default DejaVu Sans.
+        font_family: Option<String>,
     },
     /// Draw an image from a GPU texture.
     DrawTexture {
@@ -118,6 +128,31 @@ pub enum RenderOp {
     Save,
     /// Restore the previous transform state.
     Restore,
+    /// Mark the start of a sticky-positioned element.
+    ///
+    /// The renderer should clamp the element's y position so it stays visible
+    /// within `[sticky_top, sticky_bottom]` relative to the viewport during scroll.
+    /// `original_y` is the element's position in the document flow.
+    StickyStart {
+        original_y: f32,
+        sticky_top: f32,
+    },
+    /// End of a sticky-positioned element region.
+    StickyEnd,
+    /// An interactive form field region.
+    ///
+    /// Emitted by the painter for `<input>`, `<textarea>`, `<select>` elements.
+    /// The window tracks these for click-to-focus and basic text editing.
+    FormField {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        /// The current value/text of the field.
+        value: String,
+        /// The type of form element ("text", "password", "textarea", "select", "checkbox", "radio").
+        field_type: String,
+    },
     /// A clickable link region (does not render anything visible).
     ///
     /// Emitted by the painter when it encounters an `<a>` element with an `href`.

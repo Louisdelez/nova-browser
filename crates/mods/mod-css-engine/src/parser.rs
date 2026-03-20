@@ -42,6 +42,15 @@ pub struct FontFaceRule {
     pub src: String,
 }
 
+/// A parsed `@keyframes` rule.
+#[derive(Debug, Clone)]
+pub struct KeyframesRule {
+    /// The animation name.
+    pub name: String,
+    /// Keyframe stops: (percentage 0.0–1.0, declarations).
+    pub keyframes: Vec<(f32, Vec<Declaration>)>,
+}
+
 /// Combined output from `parse_stylesheet_full`.
 #[derive(Debug, Clone)]
 pub struct ParsedStylesheet {
@@ -49,6 +58,8 @@ pub struct ParsedStylesheet {
     pub rules: Vec<CssRule>,
     /// Parsed `@font-face` rules encountered in the stylesheet.
     pub font_faces: Vec<FontFaceRule>,
+    /// Parsed `@keyframes` rules.
+    pub keyframes: Vec<KeyframesRule>,
 }
 
 /// A parsed `@media` query with optional width constraints.
@@ -321,8 +332,101 @@ pub fn parse_stylesheet(css: &str, viewport_width: f32) -> Vec<CssRule> {
 /// `viewport_width` is used to evaluate `@media` queries.
 pub fn parse_stylesheet_full(css: &str, viewport_width: f32) -> ParsedStylesheet {
     let (preprocessed, font_faces) = preprocess_media_queries(css, viewport_width);
+    let keyframes = extract_keyframes(css);
     let rules = parse_stylesheet_inner(&preprocessed);
-    ParsedStylesheet { rules, font_faces }
+    ParsedStylesheet { rules, font_faces, keyframes }
+}
+
+/// Extract `@keyframes` rules from CSS text.
+///
+/// Parses `@keyframes name { from { ... } to { ... } }` and
+/// `@keyframes name { 0% { ... } 50% { ... } 100% { ... } }` forms.
+fn extract_keyframes(css: &str) -> Vec<KeyframesRule> {
+    let mut result = Vec::new();
+    let lower = css.to_ascii_lowercase();
+    let mut search_from = 0;
+
+    while let Some(idx) = lower[search_from..].find("@keyframes") {
+        let abs_idx = search_from + idx;
+        let after = &css[abs_idx + "@keyframes".len()..];
+        let after = after.trim_start();
+
+        // Extract animation name.
+        let name_end = after.find(|c: char| c == '{' || c.is_whitespace()).unwrap_or(after.len());
+        let name = after[..name_end].trim().trim_matches('"').trim_matches('\'').to_string();
+        if name.is_empty() {
+            search_from = abs_idx + 1;
+            continue;
+        }
+
+        // Find the opening brace of the keyframes block.
+        let Some(brace_start) = after.find('{') else {
+            search_from = abs_idx + 1;
+            continue;
+        };
+        let block_start = abs_idx + "@keyframes".len() + brace_start + 1;
+
+        // Find matching closing brace (track depth).
+        let mut depth = 1;
+        let mut pos = block_start;
+        let bytes = css.as_bytes();
+        while pos < bytes.len() && depth > 0 {
+            match bytes[pos] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            if depth > 0 { pos += 1; }
+        }
+        let block = &css[block_start..pos];
+
+        // Parse individual keyframe stops from the block.
+        let keyframes = parse_keyframe_stops(block);
+        if !keyframes.is_empty() {
+            result.push(KeyframesRule { name, keyframes });
+        }
+
+        search_from = pos + 1;
+    }
+
+    result
+}
+
+/// Parse keyframe stops like `from { opacity: 0; } 50% { opacity: 0.5; } to { opacity: 1; }`.
+fn parse_keyframe_stops(block: &str) -> Vec<(f32, Vec<Declaration>)> {
+    let mut stops = Vec::new();
+    let mut remaining = block.trim();
+
+    while !remaining.is_empty() {
+        remaining = remaining.trim_start();
+        if remaining.is_empty() { break; }
+
+        // Read the stop selector (e.g., "from", "to", "50%").
+        let brace = remaining.find('{');
+        let Some(brace_idx) = brace else { break };
+        let selector = remaining[..brace_idx].trim();
+        let pct = match selector {
+            "from" => 0.0,
+            "to" => 1.0,
+            s if s.ends_with('%') => {
+                s[..s.len()-1].trim().parse::<f32>().unwrap_or(0.0) / 100.0
+            }
+            _ => { remaining = &remaining[brace_idx + 1..]; continue; }
+        };
+
+        // Find the closing brace.
+        let after_brace = &remaining[brace_idx + 1..];
+        let close = after_brace.find('}').unwrap_or(after_brace.len());
+        let decl_str = &after_brace[..close];
+
+        // Parse declarations.
+        let decls = parse_inline_style(decl_str);
+        stops.push((pct, decls));
+
+        remaining = if close < after_brace.len() { &after_brace[close + 1..] } else { "" };
+    }
+
+    stops
 }
 
 /// Parse a CSS stylesheet string into a list of rules (internal, no media query handling).

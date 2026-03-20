@@ -90,7 +90,7 @@ impl NovaMod for PainterMod {
                 paint_box(&root, &mut ops, &images_map);
 
                 debug!(op_count = ops.len(), "painting complete");
-                Ok(TypedData::RenderCommands(RenderCommands { ops }))
+                Ok(TypedData::RenderCommands(RenderCommands { ops, fonts: vec![] }))
             }
             other => Err(NovaError::UnsupportedContent(format!(
                 "painter cannot handle request: {other:?}"
@@ -213,6 +213,16 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         return;
     }
 
+    // Check for position: sticky and emit StickyStart/StickyEnd.
+    let is_sticky = is_position_sticky(&layout_box.style);
+    if is_sticky {
+        let sticky_top = extract_sticky_top(&layout_box.style);
+        ops.push(RenderOp::StickyStart {
+            original_y: layout_box.y,
+            sticky_top,
+        });
+    }
+
     // Check for CSS transform and wrap in Save/Translate/Restore if needed.
     let transform = extract_transform(&layout_box.style);
     let needs_translate = transform.as_ref().is_some_and(|t| t.has_translate());
@@ -271,6 +281,7 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
             let text_color = multiply_alpha(extract_text_color(&layout_box.style), opacity);
             let font_weight = extract_font_weight(&layout_box.style);
             let font_style = extract_font_style(&layout_box.style);
+            let font_family = extract_font_family(&layout_box.style);
             let transformed_text = apply_text_transform(text, &layout_box.style);
             ops.push(RenderOp::DrawText {
                 x: layout_box.x,
@@ -280,6 +291,7 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                 color: text_color,
                 font_weight,
                 font_style,
+                font_family,
             });
 
             // Draw underline if text-decoration: underline is set.
@@ -323,8 +335,21 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                 color: Color::rgb(0.4, 0.4, 0.4),
                 font_weight: None,
                 font_style: None,
+                font_family: None,
             });
         }
+    }
+
+    // Emit FormField op for interactive form elements.
+    if let Some((field_type, value)) = extract_form_field(&layout_box.style) {
+        ops.push(RenderOp::FormField {
+            x: layout_box.x,
+            y: layout_box.y,
+            width: layout_box.width,
+            height: layout_box.height,
+            value,
+            field_type,
+        });
     }
 
     // Paint CSS borders if border-style is set.
@@ -376,6 +401,10 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
 
     if clips_overflow {
         ops.push(RenderOp::PopClip);
+    }
+
+    if is_sticky {
+        ops.push(RenderOp::StickyEnd);
     }
 
     if needs_translate {
@@ -819,6 +848,37 @@ fn extract_font_style(style: &nova_mod_api::content::StyleMap) -> Option<String>
     None
 }
 
+/// Extract the first CSS font-family name from a style map.
+///
+/// Returns the first family name (stripped of quotes) if set, `None` otherwise.
+/// Generic families like `sans-serif`, `serif`, `monospace` are ignored since
+/// they map to the default font.
+fn extract_font_family(style: &nova_mod_api::content::StyleMap) -> Option<String> {
+    for (key, value) in &style.properties {
+        if key == "font-family" {
+            let raw = match value {
+                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
+                _ => continue,
+            };
+            // font-family can be a comma-separated list. Take the first entry.
+            let first = raw.split(',').next().unwrap_or(raw).trim();
+            let first = first.trim_matches(|c: char| c == '"' || c == '\'');
+            // Skip generic families — the renderer already handles those.
+            let generic = [
+                "sans-serif", "serif", "monospace", "cursive", "fantasy",
+                "system-ui", "-apple-system", "BlinkMacSystemFont",
+            ];
+            if generic.iter().any(|g| g.eq_ignore_ascii_case(first)) {
+                return None;
+            }
+            if !first.is_empty() {
+                return Some(first.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Extract CSS border properties (width, color) from a style map.
 ///
 /// Returns `Some((width_px, color))` if a visible border is declared.
@@ -864,6 +924,55 @@ fn extract_border(style: &nova_mod_api::content::StyleMap) -> Option<(f32, Color
     let width = border_width.unwrap_or(1.0);
     let color = border_color.unwrap_or(Color::BLACK);
     Some((width, color))
+}
+
+/// Extract form field info from style props (set by mod-layout for form elements).
+fn extract_form_field(style: &nova_mod_api::content::StyleMap) -> Option<(String, String)> {
+    let mut field_type = None;
+    let mut value = String::new();
+    for (key, val) in &style.properties {
+        if key == "nova-form-type" {
+            if let StyleValue::Str(s) | StyleValue::Keyword(s) = val {
+                field_type = Some(s.clone());
+            }
+        }
+        if key == "nova-form-value" {
+            if let StyleValue::Str(s) | StyleValue::Keyword(s) = val {
+                value = s.clone();
+            }
+        }
+    }
+    field_type.map(|ft| (ft, value))
+}
+
+/// Check if the element has `position: sticky`.
+fn is_position_sticky(style: &nova_mod_api::content::StyleMap) -> bool {
+    for (key, value) in &style.properties {
+        if key == "position" {
+            if let StyleValue::Keyword(k) | StyleValue::Str(k) = value {
+                return k == "sticky";
+            }
+        }
+    }
+    false
+}
+
+/// Extract the `top` value for a sticky element (defaults to 0).
+fn extract_sticky_top(style: &nova_mod_api::content::StyleMap) -> f32 {
+    for (key, value) in &style.properties {
+        if key == "top" {
+            match value {
+                StyleValue::Px(px) => return *px,
+                StyleValue::Str(s) | StyleValue::Keyword(s) => {
+                    if let Some(px) = parse_length_px(s) {
+                        return px;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    0.0
 }
 
 /// Extract the font size from a style map, defaulting to 16px.
@@ -1179,5 +1288,60 @@ mod tests {
         assert!((blur - 0.0).abs() < 0.01);
         // "black" → rgb(0,0,0)
         assert!(color.r < 0.01 && color.g < 0.01 && color.b < 0.01);
+    }
+
+    #[test]
+    fn extract_font_family_custom() {
+        let mut style = StyleMap::default();
+        style.properties.push((
+            "font-family".into(),
+            StyleValue::Str("\"Roboto\", sans-serif".into()),
+        ));
+        let result = extract_font_family(&style);
+        assert_eq!(result, Some("Roboto".to_string()));
+    }
+
+    #[test]
+    fn extract_font_family_generic_returns_none() {
+        let mut style = StyleMap::default();
+        style.properties.push((
+            "font-family".into(),
+            StyleValue::Keyword("sans-serif".into()),
+        ));
+        let result = extract_font_family(&style);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn extract_font_family_none_when_absent() {
+        let style = StyleMap::default();
+        let result = extract_font_family(&style);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn font_family_passed_in_draw_text_op() {
+        let mut style = StyleMap::default();
+        style.properties.push((
+            "font-family".into(),
+            StyleValue::Str("\"CustomFont\", Arial, sans-serif".into()),
+        ));
+        let layout = LayoutBox {
+            x: 0.0, y: 0.0, width: 200.0, height: 20.0,
+            content: LayoutContent::Text("test".into()),
+            style,
+            children: vec![],
+            z_index: 0,
+        };
+        let mut ops = Vec::new();
+        paint_box(&layout, &mut ops, &HashMap::new());
+        let has_family = ops.iter().any(|op| {
+            if let RenderOp::DrawText { font_family, .. } = op {
+                font_family.as_deref() == Some("CustomFont")
+            } else {
+                false
+            }
+        });
+        assert!(has_family, "DrawText should carry font_family = Some(\"CustomFont\")");
     }
 }

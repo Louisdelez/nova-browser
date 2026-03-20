@@ -1171,7 +1171,7 @@ fn flatten_node_recursive(
 ) {
     match node {
         DomNode::Text(text) => {
-            let space_width = (font_size * 0.25).max(1.0);
+            let space_width = measure_text_width(" ", font_size).max(1.0);
 
             // Check white-space property to decide how to split text.
             let white_space = style_props.iter()
@@ -1598,6 +1598,7 @@ fn layout_inline_run(
                             .new_leaf_with_context(
                                 Style {
                                     display: Display::Flex,
+                                    flex_shrink: 0.0,
                                     size: Size {
                                         width: Dimension::Length(measured_width),
                                         height: Dimension::Length(lh),

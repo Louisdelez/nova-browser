@@ -169,6 +169,11 @@ pub struct BrowserWindow {
     tokio_handle: tokio::runtime::Handle,
     /// Viewport dimensions for navigation.
     viewport: Viewport,
+
+    // -- Animation state --
+    /// When `true`, the window requests periodic redraws (~60 fps) for animations.
+    /// Set this to `true` when the page contains CSS animations or transitions.
+    needs_animation: bool,
 }
 
 impl BrowserWindow {
@@ -224,6 +229,7 @@ impl BrowserWindow {
             core,
             tokio_handle,
             viewport,
+            needs_animation: false,
         }
     }
 
@@ -985,6 +991,16 @@ impl ApplicationHandler for BrowserWindow {
             }
             WindowEvent::RedrawRequested => {
                 self.render_frame();
+
+                // If animation mode is active, schedule the next frame at ~60 fps.
+                if self.needs_animation {
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(
+                        std::time::Instant::now() + std::time::Duration::from_millis(16),
+                    ));
+                }
             }
             WindowEvent::Resized(new_size) => {
                 if let Some(gpu) = &mut self.gpu {

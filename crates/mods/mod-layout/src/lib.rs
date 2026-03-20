@@ -1936,9 +1936,40 @@ fn apply_table_layout(layout_box: &mut LayoutBox) {
 
         if max_cols > 0 {
             let table_width = layout_box.width;
-            let col_width = table_width / max_cols as f32;
 
-            // Reposition cells in each row.
+            // Calculate content-based column widths.
+            let mut col_widths: Vec<f32> = vec![0.0; max_cols];
+            for row in &layout_box.children {
+                let is_row = row.style.properties.iter().any(|(k, v)| {
+                    k == "display"
+                        && matches!(v, StyleValue::Keyword(d) | StyleValue::Str(d) if d == "table-row")
+                });
+                if !is_row {
+                    continue;
+                }
+                for (i, cell) in row.children.iter().enumerate() {
+                    if i < max_cols {
+                        col_widths[i] = col_widths[i].max(cell.width);
+                    }
+                }
+            }
+
+            // If total content width < table width, distribute extra space
+            // proportionally. If wider, shrink proportionally.
+            let total_content: f32 = col_widths.iter().sum();
+            if total_content < table_width && total_content > 0.0 {
+                let extra = table_width - total_content;
+                for w in &mut col_widths {
+                    *w += extra * (*w / total_content);
+                }
+            } else if total_content > table_width && total_content > 0.0 {
+                let ratio = table_width / total_content;
+                for w in &mut col_widths {
+                    *w *= ratio;
+                }
+            }
+
+            // Reposition cells in each row using content-based column widths.
             let mut row_y = layout_box.y;
             for row in &mut layout_box.children {
                 let is_row = row.style.properties.iter().any(|(k, v)| {
@@ -1957,7 +1988,7 @@ fn apply_table_layout(layout_box: &mut LayoutBox) {
                 let mut cell_x = layout_box.x;
                 let mut max_cell_height = 0.0_f32;
 
-                for cell in row.children.iter_mut() {
+                for (i, cell) in row.children.iter_mut().enumerate() {
                     // Check for colspan attribute.
                     let colspan = cell
                         .style
@@ -1974,7 +2005,10 @@ fn apply_table_layout(layout_box: &mut LayoutBox) {
                         .unwrap_or(1)
                         .max(1);
 
-                    let cell_w = col_width * colspan as f32;
+                    // Sum column widths for colspan.
+                    let cell_w: f32 = (0..colspan)
+                        .filter_map(|c| col_widths.get(i + c))
+                        .sum();
                     cell.x = cell_x;
                     cell.y = row_y;
                     cell.width = cell_w;

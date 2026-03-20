@@ -309,7 +309,7 @@ impl JsDomTree {
     }
 
     /// Recursive depth-first search by attribute.
-    fn find_by_attr(&self, attr: &str, value: &str, handle: ElementHandle) -> Option<ElementHandle> {
+    pub fn find_by_attr(&self, attr: &str, value: &str, handle: ElementHandle) -> Option<ElementHandle> {
         let elem = self.nodes.get(&handle)?;
         if elem.attributes.iter().any(|(k, v)| k == attr && v == value) {
             return Some(handle);
@@ -323,7 +323,7 @@ impl JsDomTree {
     }
 
     /// Recursive depth-first search by class membership.
-    fn find_by_class(&self, class: &str, handle: ElementHandle) -> Option<ElementHandle> {
+    pub fn find_by_class(&self, class: &str, handle: ElementHandle) -> Option<ElementHandle> {
         let elem = self.nodes.get(&handle)?;
         let classes = elem.class_attr();
         if classes.split_whitespace().any(|c| c == class) {
@@ -338,7 +338,7 @@ impl JsDomTree {
     }
 
     /// Recursive depth-first search by tag name.
-    fn find_by_tag(&self, tag: &str, handle: ElementHandle) -> Option<ElementHandle> {
+    pub fn find_by_tag(&self, tag: &str, handle: ElementHandle) -> Option<ElementHandle> {
         let elem = self.nodes.get(&handle)?;
         if elem.tag == tag.to_lowercase() && handle != self.root {
             return Some(handle);
@@ -774,6 +774,13 @@ pub fn eval_script_with_env(
         .iter()
         .cloned()
         .collect();
+
+    // Pre-seed `document` as the root handle (0) so that
+    // `document.addEventListener(…)` etc. resolve through the normal
+    // method-call path without special-casing.
+    let root = tree.lock().unwrap().root_handle();
+    env.entry("document".into()).or_insert(root);
+
     let mut last_value = JsValue::Undefined;
 
     // Strip /* … */ block comments.
@@ -848,6 +855,30 @@ fn eval_statement(
     if line.starts_with("console.log(") {
         let inner = extract_call_args(line, "console.log");
         debug!(msg = inner, "console.log");
+        return JsValue::Undefined;
+    }
+
+    if line.starts_with("console.error(") {
+        let inner = extract_call_args(line, "console.error");
+        debug!(msg = inner, "console.error");
+        return JsValue::Undefined;
+    }
+
+    if line.starts_with("console.warn(") {
+        let inner = extract_call_args(line, "console.warn");
+        debug!(msg = inner, "console.warn");
+        return JsValue::Undefined;
+    }
+
+    if line.starts_with("console.info(") {
+        let inner = extract_call_args(line, "console.info");
+        debug!(msg = inner, "console.info");
+        return JsValue::Undefined;
+    }
+
+    if line.starts_with("console.debug(") {
+        let inner = extract_call_args(line, "console.debug");
+        debug!(msg = inner, "console.debug");
         return JsValue::Undefined;
     }
 
@@ -959,10 +990,131 @@ fn eval_statement(
                     .add_event_listener(handle, &event_type, &cb_body, captured);
             }
         }
+        // Even if the object wasn't in env (e.g. `window.addEventListener`),
+        // swallow the call silently.
+        return JsValue::Undefined;
+    }
+
+    // `el.removeEventListener(…)` — no-op (we don't track removal yet).
+    if split_method_call(line, "removeEventListener").is_some() {
+        return JsValue::Undefined;
+    }
+
+    // ── Window / global no-op stubs ────────────────────────────────────────────
+    //
+    // Many real-world pages call these APIs.  We don't implement them yet, but
+    // returning `Undefined` instead of crashing keeps scripts running.
+
+    // `window.addEventListener(…)` / `window.removeEventListener(…)`
+    // Already handled above via the generic addEventListener / removeEventListener
+    // matchers.  `document.addEventListener` also works because `document` is
+    // pre-seeded in the env as handle 0.
+
+    // `setTimeout` / `clearTimeout` / `setInterval` / `clearInterval`
+    if line.starts_with("setTimeout(") || line.starts_with("window.setTimeout(") {
+        debug!("setTimeout stub (no-op)");
+        return JsValue::Number(0.0);
+    }
+    if line.starts_with("clearTimeout(") || line.starts_with("window.clearTimeout(") {
+        return JsValue::Undefined;
+    }
+    if line.starts_with("setInterval(") || line.starts_with("window.setInterval(") {
+        debug!("setInterval stub (no-op)");
+        return JsValue::Number(0.0);
+    }
+    if line.starts_with("clearInterval(") || line.starts_with("window.clearInterval(") {
+        return JsValue::Undefined;
+    }
+
+    // `requestAnimationFrame` / `cancelAnimationFrame`
+    if line.starts_with("requestAnimationFrame(")
+        || line.starts_with("window.requestAnimationFrame(")
+    {
+        debug!("requestAnimationFrame stub (no-op)");
+        return JsValue::Number(0.0);
+    }
+    if line.starts_with("cancelAnimationFrame(")
+        || line.starts_with("window.cancelAnimationFrame(")
+    {
+        return JsValue::Undefined;
+    }
+
+    // `fetch(…)` / `window.fetch(…)` — stub that returns Undefined (no Promise
+    // support in the mini-interpreter).
+    if line.starts_with("fetch(") || line.starts_with("window.fetch(") {
+        debug!("fetch stub (no-op)");
+        return JsValue::Undefined;
+    }
+
+    // `getComputedStyle(…)` / `window.getComputedStyle(…)`
+    if line.starts_with("getComputedStyle(") || line.starts_with("window.getComputedStyle(") {
+        return JsValue::Undefined;
+    }
+
+    // `matchMedia(…)` / `window.matchMedia(…)`
+    if line.starts_with("matchMedia(") || line.starts_with("window.matchMedia(") {
+        return JsValue::Undefined;
+    }
+
+    // `document.querySelectorAll(…)` — standalone call (not assignment).
+    if line.starts_with("document.querySelectorAll(") {
+        return JsValue::Undefined;
+    }
+
+    // `document.getElementsByClassName(…)` / `document.getElementsByTagName(…)`
+    if line.starts_with("document.getElementsByClassName(")
+        || line.starts_with("document.getElementsByTagName(")
+    {
+        return JsValue::Undefined;
+    }
+
+    // `window.location.*` property reads — ignore silently.
+    if line.starts_with("window.location") || line.starts_with("location.") {
+        return JsValue::Undefined;
+    }
+
+    // `window.navigator.*` property reads — ignore silently.
+    if line.starts_with("window.navigator") || line.starts_with("navigator.") {
+        return JsValue::Undefined;
+    }
+
+    // `window.history.*` — ignore silently.
+    if line.starts_with("window.history") || line.starts_with("history.") {
+        return JsValue::Undefined;
+    }
+
+    // `document.cookie` — ignore silently.
+    if line.starts_with("document.cookie") {
+        return JsValue::Undefined;
+    }
+
+    // `window.scrollTo(…)` / `window.scroll(…)` / `window.scrollBy(…)`
+    if line.starts_with("window.scrollTo(")
+        || line.starts_with("window.scroll(")
+        || line.starts_with("window.scrollBy(")
+        || line.starts_with("scrollTo(")
+    {
+        return JsValue::Undefined;
+    }
+
+    // `window.alert(…)` / `window.confirm(…)` / `window.prompt(…)`
+    if line.starts_with("alert(") || line.starts_with("window.alert(") {
+        return JsValue::Undefined;
+    }
+    if line.starts_with("confirm(") || line.starts_with("window.confirm(") {
+        return JsValue::Undefined;
+    }
+    if line.starts_with("prompt(") || line.starts_with("window.prompt(") {
+        return JsValue::Undefined;
+    }
+
+    // `window.dispatchEvent(…)` / `document.dispatchEvent(…)` — no-op.
+    if line.starts_with("window.dispatchEvent(") || line.starts_with("document.dispatchEvent(") {
         return JsValue::Undefined;
     }
 
     // Unrecognised — return undefined.
+    debug!(line, "unrecognised JS statement (ignored)");
     JsValue::Undefined
 }
 
@@ -994,6 +1146,50 @@ fn eval_dom_expr(
         let tag = unquote(arg);
         let handle = tree.lock().unwrap().create_element(&tag);
         return Some(handle);
+    }
+
+    // `document.getElementsByClassName("cls")` — returns first match (no array support).
+    if expr.starts_with("document.getElementsByClassName(") {
+        let arg = extract_call_args(expr, "document.getElementsByClassName");
+        let cls = unquote(arg);
+        let root = tree.lock().unwrap().root_handle();
+        return tree.lock().unwrap().find_by_class(&cls, root);
+    }
+
+    // `document.getElementsByTagName("tag")` — returns first match (no array support).
+    if expr.starts_with("document.getElementsByTagName(") {
+        let arg = extract_call_args(expr, "document.getElementsByTagName");
+        let tag = unquote(arg);
+        let root = tree.lock().unwrap().root_handle();
+        return tree.lock().unwrap().find_by_tag(&tag, root);
+    }
+
+    // `document.querySelectorAll("sel")` — returns first match (no NodeList support).
+    if expr.starts_with("document.querySelectorAll(") {
+        let arg = extract_call_args(expr, "document.querySelectorAll");
+        let sel = unquote(arg);
+        return tree.lock().unwrap().query_selector(&sel);
+    }
+
+    // `document.body` — find the <body> element.
+    if expr == "document.body" {
+        let t = tree.lock().unwrap();
+        let root = t.root_handle();
+        return t.find_by_tag("body", root);
+    }
+
+    // `document.head` — find the <head> element.
+    if expr == "document.head" {
+        let t = tree.lock().unwrap();
+        let root = t.root_handle();
+        return t.find_by_tag("head", root);
+    }
+
+    // `document.documentElement` — find the <html> element.
+    if expr == "document.documentElement" {
+        let t = tree.lock().unwrap();
+        let root = t.root_handle();
+        return t.find_by_tag("html", root);
     }
 
     // Variable reference.
@@ -1363,5 +1559,110 @@ mod tests {
         // Should still have the main div.
         let tree2 = JsDomTree::from_dom(&exported);
         assert!(tree2.lock().unwrap().get_element_by_id("main").is_some());
+    }
+
+    // ── Browser API stub tests ────────────────────────────────────────────────
+
+    #[test]
+    fn window_stubs_do_not_crash() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        // All of these should return Undefined without panicking.
+        let script = r#"
+            window.addEventListener("load", function() {});
+            window.removeEventListener("load", function() {});
+            setTimeout(function() {}, 100);
+            window.setTimeout(function() {}, 100);
+            clearTimeout(0);
+            setInterval(function() {}, 100);
+            clearInterval(0);
+            requestAnimationFrame(function() {});
+            cancelAnimationFrame(0);
+            fetch("https://example.com");
+            window.fetch("https://example.com");
+            getComputedStyle(null);
+            window.getComputedStyle(null);
+            matchMedia("(max-width: 600px)");
+            window.matchMedia("(max-width: 600px)");
+            window.scrollTo(0, 0);
+            scrollTo(0, 0);
+            alert("hello");
+            window.alert("hello");
+            console.error("err");
+            console.warn("warn");
+            console.info("info");
+            console.debug("dbg");
+        "#;
+        let result = eval_script(script, Arc::clone(&tree));
+        // Should complete without panicking; last statement is console.debug → Undefined.
+        assert!(matches!(result, JsValue::Undefined));
+    }
+
+    #[test]
+    fn document_body_and_head() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        let script = r#"
+            var body = document.body;
+            body.setAttribute("data-found", "yes");
+        "#;
+        eval_script(script, Arc::clone(&tree));
+
+        let t = tree.lock().unwrap();
+        let root = t.root_handle();
+        let body_handle = t.find_by_tag("body", root).unwrap();
+        assert_eq!(t.get_attribute(body_handle, "data-found"), Some("yes".into()));
+    }
+
+    #[test]
+    fn document_addeventlistener_noop() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        // `document` is pre-seeded as handle 0 (root), so addEventListener
+        // should store a listener on the root without crashing.
+        let script = r#"
+            document.addEventListener("DOMContentLoaded", function() {
+                console.log("loaded");
+            });
+        "#;
+        let result = eval_script(script, Arc::clone(&tree));
+        assert!(matches!(result, JsValue::Undefined));
+    }
+
+    #[test]
+    fn document_getelementsbyclassname() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        let script = r#"
+            var el = document.getElementsByClassName("intro");
+            el.textContent = "found by class";
+        "#;
+        eval_script(script, Arc::clone(&tree));
+
+        let t = tree.lock().unwrap();
+        let root = t.root_handle();
+        let handle = t.find_by_class("intro", root).unwrap();
+        assert_eq!(t.get_text_content(handle), "found by class");
+    }
+
+    #[test]
+    fn document_getelementsbytagname() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        let script = r#"
+            var el = document.getElementsByTagName("p");
+            el.setAttribute("data-tag", "found");
+        "#;
+        eval_script(script, Arc::clone(&tree));
+
+        let t = tree.lock().unwrap();
+        let root = t.root_handle();
+        let handle = t.find_by_tag("p", root).unwrap();
+        assert_eq!(t.get_attribute(handle, "data-tag"), Some("found".into()));
     }
 }

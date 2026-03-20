@@ -213,6 +213,21 @@ impl FontRenderer {
         None
     }
 
+    /// Look up the horizontal kerning adjustment between two characters.
+    ///
+    /// Returns the kern value in pixels (usually negative to tighten spacing)
+    /// for the given font size. Uses the custom font if `custom_family` matches
+    /// a loaded `@font-face` font, otherwise uses the appropriate built-in
+    /// variant (currently always the regular font's kern table).
+    fn kern(&self, left: char, right: char, font_size: f32, custom_family: &Option<String>) -> Option<f32> {
+        if let Some(key) = custom_family {
+            if let Some(font) = self.custom_fonts.get(key) {
+                return font.horizontal_kern(left, right, font_size);
+            }
+        }
+        self.regular.horizontal_kern(left, right, font_size)
+    }
+
     /// Rasterize a glyph (or return it from cache) for a specific variant.
     fn rasterize(&mut self, ch: char, font_size: f32, variant: FontVariant) -> &CachedGlyph {
         let key = (variant, ch, (font_size * 10.0).round() as u32);
@@ -304,9 +319,16 @@ impl Framebuffer {
     pub fn measure_text_width(&mut self, text: &str, font_size: f32) -> f32 {
         if let Some(ref mut renderer) = self.font_renderer {
             let mut width: f32 = 0.0;
-            for ch in text.chars() {
-                let glyph = renderer.rasterize(ch, font_size, FontVariant::Regular);
+            let chars: Vec<char> = text.chars().collect();
+            for i in 0..chars.len() {
+                let glyph = renderer.rasterize(chars[i], font_size, FontVariant::Regular);
                 width += glyph.metrics.advance_width as f32;
+                // Apply kerning with the next character.
+                if i + 1 < chars.len() {
+                    if let Some(kern) = renderer.regular.horizontal_kern(chars[i], chars[i + 1], font_size) {
+                        width += kern;
+                    }
+                }
             }
             width
         } else {
@@ -596,7 +618,12 @@ impl Framebuffer {
         let mut cy = y.round() as i32;
         let line_height = (font_size * 1.2).round() as i32;
 
-        for ch in text.chars() {
+        // Collect chars for indexed access (needed for look-ahead kerning).
+        let chars: Vec<char> = text.chars().collect();
+
+        for i in 0..chars.len() {
+            let ch = chars[i];
+
             if ch == '\n' {
                 cx = x;
                 cy += line_height;
@@ -659,6 +686,14 @@ impl Framebuffer {
             }
 
             cx += metrics.advance_width;
+
+            // Apply kerning with the next character if available.
+            if i + 1 < chars.len() && chars[i + 1] != '\n' {
+                if let Some(kern) = renderer.kern(ch, chars[i + 1], font_size, &custom_family_key) {
+                    cx += kern;
+                }
+            }
+
             if let Some(ls) = letter_spacing {
                 cx += ls;
             }

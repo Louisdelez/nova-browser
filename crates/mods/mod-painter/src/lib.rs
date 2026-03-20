@@ -379,13 +379,21 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         return;
     }
 
-    // Check for position: sticky and emit StickyStart/StickyEnd.
+    // Check for position: sticky or position: fixed and emit StickyStart/StickyEnd.
+    // Fixed elements reuse the sticky mechanism — they always pin to the viewport.
     let is_sticky = is_position_sticky(&layout_box.style);
+    let is_fixed = is_position_fixed(&layout_box.style);
     if is_sticky {
         let sticky_top = extract_sticky_top(&layout_box.style);
         ops.push(RenderOp::StickyStart {
             original_y: layout_box.y,
             sticky_top,
+        });
+    } else if is_fixed {
+        let fixed_top = extract_fixed_top(&layout_box.style);
+        ops.push(RenderOp::StickyStart {
+            original_y: layout_box.y,
+            sticky_top: fixed_top,
         });
     }
 
@@ -767,7 +775,7 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         ops.push(RenderOp::PopClip);
     }
 
-    if is_sticky {
+    if is_sticky || is_fixed {
         ops.push(RenderOp::StickyEnd);
     }
 
@@ -1599,6 +1607,36 @@ fn is_position_sticky(style: &nova_mod_api::content::StyleMap) -> bool {
 
 /// Extract the `top` value for a sticky element (defaults to 0).
 fn extract_sticky_top(style: &nova_mod_api::content::StyleMap) -> f32 {
+    for (key, value) in &style.properties {
+        if key == "top" {
+            match value {
+                StyleValue::Px(px) => return *px,
+                StyleValue::Str(s) | StyleValue::Keyword(s) => {
+                    if let Some(px) = parse_length_px(s) {
+                        return px;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    0.0
+}
+
+/// Check if the element has `position: fixed`.
+fn is_position_fixed(style: &nova_mod_api::content::StyleMap) -> bool {
+    for (key, value) in &style.properties {
+        if key == "position" {
+            if let StyleValue::Keyword(k) | StyleValue::Str(k) = value {
+                return k == "fixed";
+            }
+        }
+    }
+    false
+}
+
+/// Extract the `top` value for a fixed-position element (defaults to 0).
+fn extract_fixed_top(style: &nova_mod_api::content::StyleMap) -> f32 {
     for (key, value) in &style.properties {
         if key == "top" {
             match value {

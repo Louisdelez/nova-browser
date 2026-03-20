@@ -1391,14 +1391,14 @@ fn layout_inline_run(
                                     break;
                                 }
                             }
-                            InlineItem::Space { width, style: s, .. } => {
-                                if styles_compatible_for_merge(&run_style, s) {
-                                    run_text.push(' ');
-                                    run_width += width;
-                                    j += 1;
-                                } else {
-                                    break;
-                                }
+                            InlineItem::Space { width, .. } => {
+                                // Spaces always merge into the current run,
+                                // regardless of their inherited style. This
+                                // ensures inter-element spacing ("points by")
+                                // is included in the text run.
+                                run_text.push(' ');
+                                run_width += width;
+                                j += 1;
                             }
                             InlineItem::Image { .. } => break,
                         }
@@ -1411,6 +1411,17 @@ fn layout_inline_run(
                             .unwrap_or(parent_font_size);
                         let lh = resolve_line_height(&run_style, fs);
                         max_height = max_height.max(lh);
+
+                        // If the next item is a Word with a different style
+                        // (i.e. a style break), and our run doesn't already
+                        // end with a space, append a trailing space.  This
+                        // ensures visible separation between adjacent styled
+                        // runs like "<span>points</span> by <a>user</a>".
+                        if !run_text.ends_with(' ') && j < line.len() {
+                            if let InlineItem::Word { .. } = &line[j] {
+                                run_text.push(' ');
+                            }
+                        }
 
                         // Measure the combined string for accurate width.
                         let measured_width = measure_text_width(&run_text, fs);

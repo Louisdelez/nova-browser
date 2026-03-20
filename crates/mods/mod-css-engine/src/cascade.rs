@@ -881,6 +881,45 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
             // Pass through as-is; values like `underline`, `none`, `line-through` are used directly.
             out.push(decl);
         }
+        "animation" => {
+            // Extract animation-name from the shorthand.
+            // animation: name duration timing-function delay iteration-count direction fill-mode
+            // The animation name is typically the first non-numeric, non-keyword token.
+            let parts: Vec<&str> = decl.value.split_whitespace().collect();
+            if !parts.is_empty() {
+                for part in &parts {
+                    if part.parse::<f64>().is_ok()
+                        || part.ends_with('s') || part.ends_with("ms")
+                    {
+                        continue;
+                    }
+                    if matches!(
+                        *part,
+                        "ease" | "linear" | "ease-in" | "ease-out" | "ease-in-out"
+                            | "normal" | "reverse" | "alternate" | "alternate-reverse"
+                            | "none" | "forwards" | "backwards" | "both" | "infinite"
+                            | "running" | "paused"
+                    ) {
+                        continue;
+                    }
+                    // This token is likely the animation name.
+                    out.push(CascadedDeclaration {
+                        property: "animation-name".into(),
+                        value: part.to_string(),
+                        specificity: decl.specificity,
+                        origin: decl.origin,
+                        important: decl.important,
+                    });
+                    break;
+                }
+            }
+            // TODO: implement animation application — currently @keyframes rules
+            // are parsed but animations are not applied. A full implementation
+            // requires a timer/event loop to interpolate between keyframes. A
+            // simple static version could apply the "to" (100%) keyframe styles
+            // as the final state.
+            out.push(decl);
+        }
         _ => {
             // Not a shorthand; pass through.
             out.push(decl);
@@ -1685,6 +1724,23 @@ mod tests {
     fn text_decoration_none_passes_through() {
         let m = expand("text-decoration", "none");
         assert_eq!(m.get("text-decoration").map(String::as_str), Some("none"));
+    }
+
+    // ── animation shorthand ─────────────────────────────────────────────────
+
+    #[test]
+    fn animation_shorthand_extracts_name() {
+        let m = expand("animation", "fadeIn 1s ease-in-out");
+        assert_eq!(m.get("animation-name").map(String::as_str), Some("fadeIn"));
+        // The original shorthand should also be preserved.
+        assert!(m.contains_key("animation"));
+    }
+
+    #[test]
+    fn animation_shorthand_no_name_when_only_keywords() {
+        let m = expand("animation", "none 0.5s linear");
+        // "none" is a keyword, not a name — should not be extracted.
+        assert!(!m.contains_key("animation-name"));
     }
 }
 

@@ -404,16 +404,36 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     // Emit box-shadow before the background (painter's order: shadow → bg → content).
     if let Some((shadow_color, offset_x, offset_y, blur)) = extract_box_shadow(&layout_box.style) {
         let shadow_color = multiply_alpha(shadow_color, opacity);
-        ops.push(RenderOp::BoxShadow {
-            x: layout_box.x,
-            y: layout_box.y,
-            width: layout_box.width,
-            height: layout_box.height,
-            color: shadow_color,
-            offset_x,
-            offset_y,
-            blur,
-        });
+        if blur > 0.0 {
+            // Simulate blur with concentric expanding rects of decreasing alpha.
+            let steps = (blur / 2.0).ceil().max(1.0) as i32;
+            for i in 0..=steps {
+                let expand = (i as f32 / steps as f32) * blur;
+                let alpha_factor = 1.0 - (i as f32 / steps as f32);
+                let c = Color::rgba(
+                    shadow_color.r, shadow_color.g, shadow_color.b,
+                    shadow_color.a * alpha_factor * 0.3,
+                );
+                ops.push(RenderOp::FillRect {
+                    x: layout_box.x + offset_x - expand,
+                    y: layout_box.y + offset_y - expand,
+                    width: layout_box.width + expand * 2.0,
+                    height: layout_box.height + expand * 2.0,
+                    color: c,
+                });
+            }
+        } else {
+            ops.push(RenderOp::BoxShadow {
+                x: layout_box.x,
+                y: layout_box.y,
+                width: layout_box.width,
+                height: layout_box.height,
+                color: shadow_color,
+                offset_x,
+                offset_y,
+                blur,
+            });
+        }
     }
 
     // Paint the background if this is not a text node.
@@ -639,24 +659,24 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     let bw = layout_box.width;
     let bh = layout_box.height;
     // Top border
-    if let Some((w, color)) = borders.top {
+    if let Some((w, color, ref style)) = borders.top {
         let color = multiply_alpha(color, opacity);
-        ops.push(RenderOp::FillRect { x: bx, y: by, width: bw, height: w, color });
+        emit_border_ops(ops, bx, by, bw, w, color, style, true);
     }
     // Bottom border
-    if let Some((w, color)) = borders.bottom {
+    if let Some((w, color, ref style)) = borders.bottom {
         let color = multiply_alpha(color, opacity);
-        ops.push(RenderOp::FillRect { x: bx, y: by + bh - w, width: bw, height: w, color });
+        emit_border_ops(ops, bx, by + bh - w, bw, w, color, style, true);
     }
     // Left border
-    if let Some((w, color)) = borders.left {
+    if let Some((w, color, ref style)) = borders.left {
         let color = multiply_alpha(color, opacity);
-        ops.push(RenderOp::FillRect { x: bx, y: by, width: w, height: bh, color });
+        emit_border_ops(ops, bx, by, w, bh, color, style, false);
     }
     // Right border
-    if let Some((w, color)) = borders.right {
+    if let Some((w, color, ref style)) = borders.right {
         let color = multiply_alpha(color, opacity);
-        ops.push(RenderOp::FillRect { x: bx + bw - w, y: by, width: w, height: bh, color });
+        emit_border_ops(ops, bx + bw - w, by, w, bh, color, style, false);
     }
 
     // Emit a Link op if this box has an href (i.e., it is an <a> element).
@@ -1376,12 +1396,67 @@ fn extract_font_family(style: &nova_mod_api::content::StyleMap) -> Option<String
     None
 }
 
-/// Per-side border info.
+/// Emit border render ops, handling dashed/dotted styles.
+///
+/// For `dashed` borders, emits a series of short `FillRect` dashes.
+/// For `dotted` borders, emits square dots.
+/// All other styles (solid, double, groove, etc.) render as solid.
+fn emit_border_ops(
+    ops: &mut Vec<RenderOp>,
+    x: f32, y: f32, width: f32, height: f32,
+    color: Color, style: &str, is_horizontal: bool,
+) {
+    match style {
+        "dashed" => {
+            let dash_len = if is_horizontal { height.max(3.0) * 3.0 } else { width.max(3.0) * 3.0 };
+            let gap_len = dash_len;
+            let total = if is_horizontal { width } else { height };
+            let mut offset = 0.0;
+            while offset < total {
+                let len = dash_len.min(total - offset);
+                if is_horizontal {
+                    ops.push(RenderOp::FillRect {
+                        x: x + offset, y, width: len, height, color,
+                    });
+                } else {
+                    ops.push(RenderOp::FillRect {
+                        x, y: y + offset, width, height: len, color,
+                    });
+                }
+                offset += dash_len + gap_len;
+            }
+        }
+        "dotted" => {
+            let dot_size = if is_horizontal { height.max(1.0) } else { width.max(1.0) };
+            let gap = dot_size;
+            let total = if is_horizontal { width } else { height };
+            let mut offset = 0.0;
+            while offset < total {
+                if is_horizontal {
+                    ops.push(RenderOp::FillRect {
+                        x: x + offset, y, width: dot_size, height, color,
+                    });
+                } else {
+                    ops.push(RenderOp::FillRect {
+                        x, y: y + offset, width, height: dot_size, color,
+                    });
+                }
+                offset += dot_size + gap;
+            }
+        }
+        _ => {
+            // solid, double, groove, ridge, etc. — render as solid.
+            ops.push(RenderOp::FillRect { x, y, width, height, color });
+        }
+    }
+}
+
+/// Per-side border info: `(width, color, style)`.
 struct BorderSides {
-    top: Option<(f32, Color)>,
-    right: Option<(f32, Color)>,
-    bottom: Option<(f32, Color)>,
-    left: Option<(f32, Color)>,
+    top: Option<(f32, Color, String)>,
+    right: Option<(f32, Color, String)>,
+    bottom: Option<(f32, Color, String)>,
+    left: Option<(f32, Color, String)>,
 }
 
 /// Extract per-side CSS border properties from a style map.
@@ -1419,14 +1494,14 @@ fn extract_borders_per_side(style: &nova_mod_api::content::StyleMap) -> BorderSi
         let _ = (target_width, target_color); // suppress unused
     }
 
-    let make_side = |i: usize| -> Option<(f32, Color)> {
+    let make_side = |i: usize| -> Option<(f32, Color, String)> {
         let style_val = side_style[i].as_deref().or(sh_style.as_deref()).unwrap_or("none");
         if style_val == "none" || style_val == "hidden" {
             return None;
         }
         let w = side_width[i].or(sh_width).unwrap_or(1.0);
         let c = side_color[i].or(sh_color).unwrap_or(Color::BLACK);
-        if w > 0.0 { Some((w, c)) } else { None }
+        if w > 0.0 { Some((w, c, style_val.to_string())) } else { None }
     };
 
     BorderSides {
@@ -2025,11 +2100,22 @@ mod tests {
         let mut ops = Vec::new();
         paint_box(&layout, &mut ops, &HashMap::new());
 
-        let shadow_pos = ops.iter().position(|op| matches!(op, RenderOp::BoxShadow { .. }));
-        let bg_pos = ops.iter().position(|op| matches!(op, RenderOp::FillRect { .. }));
-        assert!(shadow_pos.is_some(), "should emit a BoxShadow op");
+        // With blur > 0, box-shadow is now rendered as multiple FillRect ops
+        // (concentric expanding rects) before the background FillRect.
+        // The first FillRect should be a shadow rect (small alpha), and the
+        // background FillRect (white, alpha=1) should come after all shadow rects.
+        let first_fill = ops.iter().position(|op| matches!(op, RenderOp::FillRect { .. }));
+        assert!(first_fill.is_some(), "should emit FillRect ops for shadow blur");
+        // The background (white, alpha ~1.0) should exist somewhere after the shadow rects.
+        let bg_pos = ops.iter().position(|op| {
+            if let RenderOp::FillRect { color, .. } = op {
+                color.a > 0.9 && color.r > 0.9 && color.g > 0.9 && color.b > 0.9
+            } else {
+                false
+            }
+        });
         assert!(bg_pos.is_some(), "should emit a FillRect for the background");
-        assert!(shadow_pos.unwrap() < bg_pos.unwrap(), "shadow must come before background");
+        assert!(first_fill.unwrap() < bg_pos.unwrap(), "shadow rects must come before background");
     }
 
     #[test]

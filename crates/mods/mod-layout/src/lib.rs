@@ -226,7 +226,7 @@ fn compute_layout(dom: &DomNode, viewport: &Viewport) -> Result<LayoutBox, NovaE
     let mut taffy = TaffyTree::<NodeContext>::new();
 
     // Build the Taffy tree, returning the root node id.
-    let root_id = add_node(&mut taffy, dom, viewport.width, DEFAULT_FONT_SIZE, &[])?;
+    let root_id = add_node(&mut taffy, dom, viewport.width, DEFAULT_FONT_SIZE, &[], 0)?;
 
     // Compute layout at the viewport size.
     taffy
@@ -276,13 +276,14 @@ fn add_node(
     available_width: f32,
     parent_font_size: f32,
     parent_style_props: &[(String, StyleValue)],
+    depth: usize,
 ) -> Result<NodeId, NovaError> {
     match node {
         DomNode::Document { children } => {
             // The document root is a block container spanning the full width.
             let child_ids = children
                 .iter()
-                .map(|c| add_node(taffy, c, available_width, DEFAULT_FONT_SIZE, &[]))
+                .map(|c| add_node(taffy, c, available_width, DEFAULT_FONT_SIZE, &[], depth + 1))
                 .collect::<Result<Vec<_>, _>>()?;
 
             let style = Style {
@@ -314,6 +315,26 @@ fn add_node(
             children,
             attributes,
         } => {
+            // Skip elements that produce no visible output.
+            if matches!(tag.as_str(), "script" | "style" | "template" | "noscript" | "iframe") {
+                let ctx = NodeContext { content: LayoutContent::Block, style: StyleMap::default() };
+                return taffy
+                    .new_leaf_with_context(Style { display: Display::None, ..Style::DEFAULT }, ctx)
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+            }
+
+            // Depth limit: very deeply nested elements get simplified to avoid
+            // expensive layout computation on pages like Wikipedia.
+            if depth > 50 {
+                let ctx = NodeContext {
+                    content: LayoutContent::Block,
+                    style: StyleMap::default(),
+                };
+                return taffy
+                    .new_leaf_with_context(Style { display: Display::None, ..Style::DEFAULT }, ctx)
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+            }
+
             // ── Form elements → sized leaf nodes with placeholder text ──
             if matches!(tag.as_str(), "input" | "button" | "select" | "textarea") {
                 let font_size = resolve_font_size(tag, attributes, parent_font_size);
@@ -619,11 +640,11 @@ fn add_node(
             // wrap across lines, and share baselines.
             // Only apply IFC for block containers (not flex, grid, or table).
             let child_ids = if display == "block" {
-                build_children_with_ifc(taffy, children, available_width, font_size, &props)?
+                build_children_with_ifc(taffy, children, available_width, font_size, &props, depth)?
             } else {
                 children
                     .iter()
-                    .map(|c| add_node(taffy, c, available_width, font_size, &props))
+                    .map(|c| add_node(taffy, c, available_width, font_size, &props, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?
             };
             let taffy_style = build_taffy_style(&display, tag, attributes);
@@ -864,6 +885,7 @@ fn build_children_with_ifc(
     available_width: f32,
     parent_font_size: f32,
     parent_style_props: &[(String, StyleValue)],
+    depth: usize,
 ) -> Result<Vec<NodeId>, NovaError> {
     let mut result = Vec::new();
 
@@ -884,7 +906,7 @@ fn build_children_with_ifc(
             result.extend(line_ids);
         } else {
             // Block child — process normally, with margin collapsing.
-            let node_id = add_node(taffy, &children[i], available_width, parent_font_size, parent_style_props)?;
+            let node_id = add_node(taffy, &children[i], available_width, parent_font_size, parent_style_props, depth + 1)?;
 
             // Margin collapsing: if the previous child was also a block,
             // reduce the current child's top margin to simulate CSS margin collapse.
@@ -2697,47 +2719,72 @@ fn build_taffy_style(
             ..Style::DEFAULT
         },
 
-        "inline" => Style {
-            display: Display::Flex,
-            flex_direction: FlexDirection::Row,
-            flex_wrap: FlexWrap::Wrap,
-            position: taffy_position,
-            inset,
-            size: Size {
-                width: lp.width.unwrap_or(Dimension::Auto),
-                height: Dimension::Auto,
-            },
-            max_size: Size {
-                width: lp.max_width.unwrap_or(Dimension::Auto),
-                height: Dimension::Auto,
-            },
-            margin,
-            padding,
-            border,
-            box_sizing,
-            // Grid placement (for grid children).
-            grid_column: {
-                let col_start = lp.grid_column.map(|(s, _)| s);
-                let col_end = lp.grid_column.map(|(_, e)| e);
-                Line {
-                    start: col_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                    end: col_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                }
-            },
-            grid_row: {
-                let row_start = lp.grid_row.map(|(s, _)| s);
-                let row_end = lp.grid_row.map(|(_, e)| e);
-                Line {
-                    start: row_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                    end: row_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
-                }
-            },
-            align_self: if center_via_auto_margin {
+        "inline" => {
+            let inline_wrap = match lp.flex_wrap.as_deref() {
+                Some("wrap") => FlexWrap::Wrap,
+                Some("wrap-reverse") => FlexWrap::WrapReverse,
+                _ => FlexWrap::Wrap, // inline text should wrap by default
+            };
+            let (row_gap, col_gap) = lp.gap.unwrap_or((0.0, 0.0));
+            // Apply flex item properties from CSS (same as block case).
+            let inline_flex_grow = item_flex_grow.unwrap_or(0.0);
+            let inline_flex_shrink = item_flex_shrink.unwrap_or(1.0);
+            let inline_width = if let Some(basis) = item_flex_basis {
+                basis
+            } else {
+                lp.width.unwrap_or(Dimension::Auto)
+            };
+            let inline_align_self = if item_align_self.is_some() {
+                item_align_self
+            } else if center_via_auto_margin {
                 Some(AlignSelf::Center)
             } else {
                 None
-            },
-            ..Style::DEFAULT
+            };
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                flex_wrap: inline_wrap,
+                position: taffy_position,
+                inset,
+                flex_grow: inline_flex_grow,
+                flex_shrink: inline_flex_shrink,
+                size: Size {
+                    width: inline_width,
+                    height: Dimension::Auto,
+                },
+                max_size: Size {
+                    width: lp.max_width.unwrap_or(Dimension::Auto),
+                    height: Dimension::Auto,
+                },
+                margin,
+                padding,
+                border,
+                box_sizing,
+                gap: Size {
+                    width: LengthPercentage::Length(col_gap),
+                    height: LengthPercentage::Length(row_gap),
+                },
+                // Grid placement (for grid children).
+                grid_column: {
+                    let col_start = lp.grid_column.map(|(s, _)| s);
+                    let col_end = lp.grid_column.map(|(_, e)| e);
+                    Line {
+                        start: col_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                        end: col_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                    }
+                },
+                grid_row: {
+                    let row_start = lp.grid_row.map(|(s, _)| s);
+                    let row_end = lp.grid_row.map(|(_, e)| e);
+                    Line {
+                        start: row_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                        end: row_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                    }
+                },
+                align_self: inline_align_self,
+                ..Style::DEFAULT
+            }
         },
 
         // "block" and everything else: column flex container at full width.

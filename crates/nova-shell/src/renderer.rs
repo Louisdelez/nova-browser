@@ -601,6 +601,22 @@ impl Framebuffer {
                 }
             }
 
+            // Synthetic bold: draw glyph again offset by 1px for extra weight.
+            // This makes bold text visually thicker even at small sizes.
+            if matches!(variant, FontVariant::Bold | FontVariant::BoldItalic) {
+                for row in 0..bh {
+                    for col in 0..bw {
+                        let coverage = bitmap[row * bw + col];
+                        self.blend_glyph_pixel(
+                            gx + col as i32 + 1, // 1px offset
+                            gy + row as i32,
+                            coverage / 2, // Half coverage for the extra pass
+                            color,
+                        );
+                    }
+                }
+            }
+
             cx += metrics.advance_width as i32;
             if let Some(ls) = letter_spacing {
                 cx += ls.round() as i32;
@@ -781,6 +797,90 @@ impl Framebuffer {
                 }
                 RenderOp::ScrollContainerEnd => {
                     self.clip_stack.pop();
+                }
+                // Form field rendering: draw visual indicators on top of the
+                // background/text that the painter already emitted.
+                RenderOp::FormField { x, y, width, height, field_type, .. } => {
+                    let fx = *x - sx;
+                    let fy = *y + y_offset - scroll_y + sy_extra;
+                    let fw = *width;
+                    let fh = *height;
+
+                    match field_type.as_str() {
+                        "select" => {
+                            // Draw a 1px border around the select box.
+                            let border_color = Color::rgb(0.6, 0.6, 0.6);
+                            self.stroke_rect(fx, fy, fw, fh, border_color, 1.0);
+
+                            // Draw a separator line before the arrow area.
+                            let arrow_area_w = 20.0;
+                            let sep_x = fx + fw - arrow_area_w;
+                            let sep_color = Color::rgb(0.78, 0.78, 0.78);
+                            self.fill_rect(sep_x, fy + 1.0, 1.0, fh - 2.0, sep_color);
+
+                            // Draw a light background for the arrow area.
+                            let arrow_bg = Color::rgb(0.92, 0.92, 0.92);
+                            self.fill_rect(sep_x + 1.0, fy + 1.0, arrow_area_w - 2.0, fh - 2.0, arrow_bg);
+
+                            // Draw a downward triangle (▼) in the arrow area.
+                            let arrow_size = 6.0_f32;
+                            let arrow_cx = sep_x + arrow_area_w / 2.0;
+                            let arrow_cy = fy + (fh - arrow_size * 0.6) / 2.0;
+                            let arrow_color = Color::rgb(0.35, 0.35, 0.35);
+                            for row in 0..=(arrow_size as i32) {
+                                // Each row of the triangle is narrower.
+                                let half = ((arrow_size as i32 - row) as f32 / 2.0) as i32;
+                                let py = (arrow_cy + row as f32).round() as i32;
+                                for col in -half..=half {
+                                    let px = (arrow_cx + col as f32).round() as i32;
+                                    self.set_pixel(px, py, arrow_color);
+                                }
+                            }
+                        }
+                        "checkbox" => {
+                            // Draw a checkbox outline (square).
+                            let size = fw.min(fh).min(16.0);
+                            let cx = fx + (fw - size) / 2.0;
+                            let cy = fy + (fh - size) / 2.0;
+                            let outline_color = Color::rgb(0.4, 0.4, 0.4);
+                            // White fill inside.
+                            self.fill_rect(cx, cy, size, size, Color::WHITE);
+                            self.stroke_rect(cx, cy, size, size, outline_color, 1.0);
+                        }
+                        "radio" => {
+                            // Draw a radio circle (approximated with rounded rect).
+                            let size = fw.min(fh).min(16.0);
+                            let cx = fx + (fw - size) / 2.0;
+                            let cy = fy + (fh - size) / 2.0;
+                            let outline_color = Color::rgb(0.4, 0.4, 0.4);
+                            // White fill.
+                            let r = size / 2.0;
+                            self.fill_rounded_rect(cx, cy, size, size, Color::WHITE, [r, r, r, r]);
+                            // Border via stroke (square for now — the rounded fill gives the circle shape).
+                            // Draw circle outline using scanlines.
+                            let center_x = cx + r;
+                            let center_y = cy + r;
+                            for py_i in 0..=(size as i32) {
+                                for px_i in 0..=(size as i32) {
+                                    let dx = px_i as f32 - r;
+                                    let dy = py_i as f32 - r;
+                                    let dist = (dx * dx + dy * dy).sqrt();
+                                    if dist >= r - 1.0 && dist <= r {
+                                        self.set_pixel(
+                                            (cx + px_i as f32).round() as i32,
+                                            (cy + py_i as f32).round() as i32,
+                                            outline_color,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // Generic form field: just draw a subtle border.
+                            let border_color = Color::rgb(0.7, 0.7, 0.7);
+                            self.stroke_rect(fx, fy, fw, fh, border_color, 1.0);
+                        }
+                    }
                 }
                 // Link ops are metadata-only; they don't draw anything.
                 RenderOp::Link { .. } => {}

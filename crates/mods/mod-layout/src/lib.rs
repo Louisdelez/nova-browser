@@ -106,6 +106,34 @@ fn measure_text_width(text: &str, font_size: f32) -> f32 {
     })
 }
 
+/// Measure text width accounting for synthetic bold widening.
+///
+/// When the renderer draws bold text it blits the glyph a second time shifted
+/// 1 px to the right.  This makes each character visually ~1 px wider, but
+/// `fontdue::Font::rasterize` does not include that extra pixel in
+/// `advance_width`.  To keep layout and rendering in sync we add 1 px per
+/// character when `is_bold` is true.
+fn measure_text_width_with_weight(text: &str, font_size: f32, is_bold: bool) -> f32 {
+    let base = measure_text_width(text, font_size);
+    if is_bold {
+        base + text.chars().count() as f32 * 1.0
+    } else {
+        base
+    }
+}
+
+/// Check whether a style slice indicates bold weight (font-weight >= 700).
+fn style_is_bold(style: &[(String, StyleValue)]) -> bool {
+    style.iter()
+        .find(|(k, _)| k == "font-weight")
+        .map(|(_, v)| match v {
+            StyleValue::Keyword(k) | StyleValue::Str(k) => k == "bold" || k == "700" || k == "800" || k == "900",
+            StyleValue::Number(n) => *n >= 700.0,
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
 use nova_mod_api::{
     capability::CapabilityType,
     content::{
@@ -692,7 +720,8 @@ fn add_node(
             }
 
             let line_height = resolve_line_height(&text_props, font_size);
-            let space_width = measure_text_width(" ", font_size).max(1.0);
+            let bold = style_is_bold(&text_props);
+            let space_width = measure_text_width_with_weight(" ", font_size, bold).max(1.0);
 
             // Split the text into individual words.  When there are multiple
             // words we create one leaf node per word (plus thin "space" nodes
@@ -720,7 +749,7 @@ fn add_node(
             // Single word → return a single sized leaf (no wrapper needed).
             if words.len() == 1 {
                 let word = words[0];
-                let w = measure_text_width(word, font_size).min(available_width);
+                let w = measure_text_width_with_weight(word, font_size, bold).min(available_width);
                 let ctx = NodeContext {
                     content: LayoutContent::Text(word.to_string()),
                     style: StyleMap { properties: text_props },
@@ -767,7 +796,7 @@ fn add_node(
                     word_ids.push(space_id);
                 }
 
-                let w = measure_text_width(word, font_size).min(available_width);
+                let w = measure_text_width_with_weight(word, font_size, bold).min(available_width);
                 let word_ctx = NodeContext {
                     content: LayoutContent::Text(word.to_string()),
                     style: StyleMap { properties: text_props.clone() },
@@ -1249,8 +1278,8 @@ fn layout_inline_run(
             _ => None,
         })
         .unwrap_or("normal");
-    let break_all = word_break == "break-all";
-    let break_word = overflow_wrap == "break-word" || overflow_wrap == "anywhere";
+    let _break_all = word_break == "break-all";
+    let _break_word = overflow_wrap == "break-word" || overflow_wrap == "anywhere";
 
     // 2. Break items into lines.
     let mut lines: Vec<Vec<InlineItem>> = Vec::new();
@@ -1272,8 +1301,10 @@ fn layout_inline_run(
                 }
                 // Check if this word fits on the current line.
                 if current_width + *width > available_width && current_width > 0.0 {
-                    // Word doesn't fit. Check if we should break it.
-                    if (break_all || break_word) && *width > available_width {
+                    // Word doesn't fit — break it at character boundaries if
+                    // it's wider than the available width. This prevents text
+                    // from overflowing containers, matching real browser behavior.
+                    if *width > available_width {
                         // Break the long word at character boundaries.
                         let mut remaining = text.as_str();
                         let mut first = true;
@@ -1423,8 +1454,10 @@ fn layout_inline_run(
                             }
                         }
 
-                        // Measure the combined string for accurate width.
-                        let measured_width = measure_text_width(&run_text, fs);
+                        // Measure the combined string for accurate width,
+                        // accounting for synthetic bold widening in the renderer.
+                        let is_bold = style_is_bold(&run_style);
+                        let measured_width = measure_text_width_with_weight(&run_text, fs, is_bold);
 
                         let ctx = NodeContext {
                             content: LayoutContent::Text(run_text),
@@ -1892,6 +1925,10 @@ struct LayoutProps {
     grid_column: Option<(i16, i16)>,
     /// `grid-row: start / end` (1-based, converted to 0-based line index).
     grid_row: Option<(i16, i16)>,
+    /// Parsed `grid-auto-rows` track sizes for implicitly-created rows.
+    grid_auto_rows: Option<Vec<NonRepeatedTrackSizingFunction>>,
+    /// Parsed `grid-auto-columns` track sizes for implicitly-created columns.
+    grid_auto_columns: Option<Vec<NonRepeatedTrackSizingFunction>>,
     /// CSS `flex-wrap`: "nowrap" | "wrap" | "wrap-reverse"
     flex_wrap: Option<String>,
     /// CSS `align-items`
@@ -2335,6 +2372,22 @@ fn parse_layout_props(attributes: &[(String, String)]) -> LayoutProps {
                         props.gap = Some((row, px));
                     }
                 }
+                "grid-auto-rows" => {
+                    if let Some(tracks) = parse_track_list(val) {
+                        props.grid_auto_rows = Some(tracks.into_iter().map(|t| match t {
+                            TrackSizingFunction::Single(nr) => nr,
+                            _ => NonRepeatedTrackSizingFunction { min: MinTrackSizingFunction::Auto, max: MaxTrackSizingFunction::Auto },
+                        }).collect());
+                    }
+                }
+                "grid-auto-columns" => {
+                    if let Some(tracks) = parse_track_list(val) {
+                        props.grid_auto_columns = Some(tracks.into_iter().map(|t| match t {
+                            TrackSizingFunction::Single(nr) => nr,
+                            _ => NonRepeatedTrackSizingFunction { min: MinTrackSizingFunction::Auto, max: MaxTrackSizingFunction::Auto },
+                        }).collect());
+                    }
+                }
                 "grid-column" => {
                     props.grid_column = parse_grid_line_span(val);
                 }
@@ -2620,17 +2673,39 @@ fn build_taffy_style(
             let row_start = lp.grid_row.map(|(s, _)| s);
             let row_end = lp.grid_row.map(|(_, e)| e);
 
+            // Flex item properties when this grid container is itself a flex/grid child.
+            let grid_flex_grow = item_flex_grow.unwrap_or(0.0);
+            let grid_flex_shrink = item_flex_shrink.unwrap_or(1.0);
+            let grid_width = if let Some(basis) = item_flex_basis {
+                basis
+            } else {
+                lp.width.unwrap_or(Dimension::Percent(1.0))
+            };
+            let grid_align_self = if item_align_self.is_some() {
+                item_align_self
+            } else if center_via_auto_margin {
+                Some(AlignSelf::Center)
+            } else {
+                None
+            };
+
             Style {
                 display: Display::Grid,
                 position: taffy_position,
                 inset,
+                flex_grow: grid_flex_grow,
+                flex_shrink: grid_flex_shrink,
                 size: Size {
-                    width: lp.width.unwrap_or(Dimension::Percent(1.0)),
-                    height: Dimension::Auto,
+                    width: grid_width,
+                    height: lp.height.unwrap_or(Dimension::Auto),
+                },
+                min_size: Size {
+                    width: lp.min_width.unwrap_or(Dimension::Auto),
+                    height: lp.min_height.unwrap_or(Dimension::Auto),
                 },
                 max_size: Size {
                     width: lp.max_width.unwrap_or(Dimension::Auto),
-                    height: Dimension::Auto,
+                    height: lp.max_height.unwrap_or(Dimension::Auto),
                 },
                 margin,
                 padding,
@@ -2638,6 +2713,8 @@ fn build_taffy_style(
                 box_sizing,
                 grid_template_columns: columns,
                 grid_template_rows: rows,
+                grid_auto_rows: lp.grid_auto_rows.clone().unwrap_or_default(),
+                grid_auto_columns: lp.grid_auto_columns.clone().unwrap_or_default(),
                 gap: Size {
                     width: LengthPercentage::Length(col_gap),
                     height: LengthPercentage::Length(row_gap),
@@ -2651,11 +2728,7 @@ fn build_taffy_style(
                     start: row_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
                     end: row_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
                 },
-                align_self: if center_via_auto_margin {
-                    Some(AlignSelf::Center)
-                } else {
-                    None
-                },
+                align_self: grid_align_self,
                 ..Style::DEFAULT
             }
         }
@@ -2685,15 +2758,36 @@ fn build_taffy_style(
                 _ => None,
             };
             let (row_gap, col_gap) = lp.gap.unwrap_or((0.0, 0.0));
+            // Flex item properties when this flex container is itself a flex/grid child.
+            let flex_item_grow = item_flex_grow.unwrap_or(0.0);
+            let flex_item_shrink = item_flex_shrink.unwrap_or(1.0);
+            let flex_item_width = if let Some(basis) = item_flex_basis {
+                basis
+            } else {
+                lp.width.unwrap_or(Dimension::Percent(1.0))
+            };
+            let flex_item_align_self = if item_align_self.is_some() {
+                item_align_self
+            } else if center_via_auto_margin {
+                Some(AlignSelf::Center)
+            } else {
+                None
+            };
             Style {
                 display: Display::Flex,
                 flex_direction: direction,
                 flex_wrap,
                 position: taffy_position,
                 inset,
+                flex_grow: flex_item_grow,
+                flex_shrink: flex_item_shrink,
                 size: Size {
-                    width: lp.width.unwrap_or(Dimension::Percent(1.0)),
+                    width: flex_item_width,
                     height: lp.height.unwrap_or(Dimension::Auto),
+                },
+                min_size: Size {
+                    width: lp.min_width.unwrap_or(Dimension::Auto),
+                    height: lp.min_height.unwrap_or(Dimension::Auto),
                 },
                 max_size: Size {
                     width: lp.max_width.unwrap_or(Dimension::Auto),
@@ -2709,30 +2803,67 @@ fn build_taffy_style(
                     width: LengthPercentage::Length(col_gap),
                     height: LengthPercentage::Length(row_gap),
                 },
-                align_self: if center_via_auto_margin {
-                    Some(AlignSelf::Center)
-                } else {
-                    None
+                // Grid placement (for grid children).
+                grid_column: {
+                    let col_start = lp.grid_column.map(|(s, _)| s);
+                    let col_end = lp.grid_column.map(|(_, e)| e);
+                    Line {
+                        start: col_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                        end: col_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                    }
                 },
+                grid_row: {
+                    let row_start = lp.grid_row.map(|(s, _)| s);
+                    let row_end = lp.grid_row.map(|(_, e)| e);
+                    Line {
+                        start: row_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                        end: row_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                    }
+                },
+                align_self: flex_item_align_self,
                 ..Style::DEFAULT
             }
         }
 
         // Table row: horizontal flex container so cells sit side-by-side.
-        "table-row" => Style {
-            display: Display::Flex,
-            flex_direction: FlexDirection::Row,
-            position: taffy_position,
-            inset,
-            size: Size {
-                width: Dimension::Percent(1.0),
-                height: Dimension::Auto,
-            },
-            margin,
-            padding,
-            border,
-            box_sizing,
-            ..Style::DEFAULT
+        "table-row" => {
+            let (row_gap, col_gap) = lp.gap.unwrap_or((0.0, 0.0));
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                position: taffy_position,
+                inset,
+                size: Size {
+                    width: Dimension::Percent(1.0),
+                    height: Dimension::Auto,
+                },
+                margin,
+                padding,
+                border,
+                box_sizing,
+                gap: Size {
+                    width: LengthPercentage::Length(col_gap),
+                    height: LengthPercentage::Length(row_gap),
+                },
+                // Grid placement (for grid children).
+                grid_column: {
+                    let col_start = lp.grid_column.map(|(s, _)| s);
+                    let col_end = lp.grid_column.map(|(_, e)| e);
+                    Line {
+                        start: col_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                        end: col_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                    }
+                },
+                grid_row: {
+                    let row_start = lp.grid_row.map(|(s, _)| s);
+                    let row_end = lp.grid_row.map(|(_, e)| e);
+                    Line {
+                        start: row_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                        end: row_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                    }
+                },
+                ..Style::DEFAULT
+            }
         },
 
         // Table cell: flex item that grows to share available space.
@@ -2747,40 +2878,105 @@ fn build_taffy_style(
                 inset,
                 size: Size {
                     width: cell_width,
-                    height: Dimension::Auto,
+                    height: lp.height.unwrap_or(Dimension::Auto),
+                },
+                min_size: Size {
+                    width: lp.min_width.unwrap_or(Dimension::Auto),
+                    height: lp.min_height.unwrap_or(Dimension::Auto),
                 },
                 max_size: Size {
                     width: lp.max_width.unwrap_or(Dimension::Auto),
-                    height: Dimension::Auto,
+                    height: lp.max_height.unwrap_or(Dimension::Auto),
                 },
                 margin,
                 padding,
                 border,
                 box_sizing,
+                // Grid placement (for grid children).
+                grid_column: {
+                    let col_start = lp.grid_column.map(|(s, _)| s);
+                    let col_end = lp.grid_column.map(|(_, e)| e);
+                    Line {
+                        start: col_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                        end: col_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                    }
+                },
+                grid_row: {
+                    let row_start = lp.grid_row.map(|(s, _)| s);
+                    let row_end = lp.grid_row.map(|(_, e)| e);
+                    Line {
+                        start: row_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                        end: row_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                    }
+                },
                 ..Style::DEFAULT
             }
         },
 
         // inline-block: behaves like a block box that flows inline.
-        "inline-block" => Style {
-            display: Display::Flex,
-            flex_direction: FlexDirection::Column,
-            position: taffy_position,
-            inset,
-            size: Size {
-                width: lp.width.unwrap_or(Dimension::Auto),
-                height: Dimension::Auto,
-            },
-            max_size: Size {
-                width: lp.max_width.unwrap_or(Dimension::Auto),
-                height: Dimension::Auto,
-            },
-            margin,
-            padding,
-            border,
-            box_sizing,
-            flex_shrink: 0.0,
-            ..Style::DEFAULT
+        "inline-block" => {
+            let ib_flex_grow = item_flex_grow.unwrap_or(0.0);
+            let ib_flex_shrink = item_flex_shrink.unwrap_or(0.0);
+            let ib_width = if let Some(basis) = item_flex_basis {
+                basis
+            } else {
+                lp.width.unwrap_or(Dimension::Auto)
+            };
+            let ib_align_self = if item_align_self.is_some() {
+                item_align_self
+            } else if center_via_auto_margin {
+                Some(AlignSelf::Center)
+            } else {
+                None
+            };
+            let (row_gap, col_gap) = lp.gap.unwrap_or((0.0, 0.0));
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                position: taffy_position,
+                inset,
+                flex_grow: ib_flex_grow,
+                flex_shrink: ib_flex_shrink,
+                size: Size {
+                    width: ib_width,
+                    height: lp.height.unwrap_or(Dimension::Auto),
+                },
+                min_size: Size {
+                    width: lp.min_width.unwrap_or(Dimension::Auto),
+                    height: lp.min_height.unwrap_or(Dimension::Auto),
+                },
+                max_size: Size {
+                    width: lp.max_width.unwrap_or(Dimension::Auto),
+                    height: lp.max_height.unwrap_or(Dimension::Auto),
+                },
+                margin,
+                padding,
+                border,
+                box_sizing,
+                gap: Size {
+                    width: LengthPercentage::Length(col_gap),
+                    height: LengthPercentage::Length(row_gap),
+                },
+                // Grid placement (for grid children).
+                grid_column: {
+                    let col_start = lp.grid_column.map(|(s, _)| s);
+                    let col_end = lp.grid_column.map(|(_, e)| e);
+                    Line {
+                        start: col_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                        end: col_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                    }
+                },
+                grid_row: {
+                    let row_start = lp.grid_row.map(|(s, _)| s);
+                    let row_end = lp.grid_row.map(|(_, e)| e);
+                    Line {
+                        start: row_start.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                        end: row_end.map(|v| GridPlacement::Line(v.into())).unwrap_or(GridPlacement::Auto),
+                    }
+                },
+                align_self: ib_align_self,
+                ..Style::DEFAULT
+            }
         },
 
         "inline" => {
@@ -2860,7 +3056,12 @@ fn build_taffy_style(
             let is_floated = lp.float.as_deref().map_or(false, |f| f == "left" || f == "right");
             let has_h_margins = lp.margin_left.is_some() || lp.margin_right.is_some()
                 || is_floated;
-            let default_width = if has_h_margins || lp.width.is_some() || is_floated {
+            // If the element has flex item properties set in CSS, it's likely a
+            // flex child and should NOT default to 100% width.
+            let is_flex_child = lp.flex_grow.is_some() || lp.flex_shrink.is_some() || lp.flex_basis.is_some();
+            let default_width = if is_flex_child {
+                lp.width.unwrap_or(Dimension::Auto)
+            } else if has_h_margins || lp.width.is_some() || is_floated {
                 lp.width.unwrap_or(Dimension::Auto)
             } else {
                 Dimension::Percent(1.0)

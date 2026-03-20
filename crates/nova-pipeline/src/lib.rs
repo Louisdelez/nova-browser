@@ -121,7 +121,7 @@ impl PipelineEngine {
         }
 
         // Step 5: Compute styles (with external stylesheets)
-        let styles = self.compute_styles_with(&dom, stylesheets, &viewport).await?;
+        let styles = self.compute_styles_with(&dom, stylesheets.clone(), &viewport).await?;
 
         // Step 6: Layout
         let layout_tree = self.layout(&styles, viewport).await?;
@@ -145,19 +145,37 @@ impl PipelineEngine {
         );
 
         // Step 8: Paint (with decoded images)
-        let mut render_commands = self.paint_with_images(&layout_tree, images).await?;
+        let mut render_commands = self.paint_with_images(&layout_tree, images.clone()).await?;
 
         // Step 8b: Inject fetched @font-face fonts into the render commands
         // so the renderer can load and use them.
         if !custom_fonts.is_empty() {
             if let TypedData::RenderCommands(ref mut cmds) = render_commands {
-                cmds.fonts = custom_fonts;
+                cmds.fonts = custom_fonts.clone();
             }
         }
 
-        // Step 9: Execute scripts (after paint, so scripts don't block rendering)
+        // Step 9: Execute scripts
         self.execute_scripts(&sub_resources.scripts, &sub_resources.inline_scripts)
             .await;
+
+        // Re-render after JS execution: JS may have modified the DOM (added/removed
+        // elements, changed classes, modified styles). Re-run style computation,
+        // layout, and painting to reflect JS changes.
+        // For now, we only do one re-render pass. A full browser would have a
+        // mutation observer and requestAnimationFrame loop.
+        if !sub_resources.scripts.is_empty() || !sub_resources.inline_scripts.is_empty() {
+            info!("Pipeline: re-rendering after JS execution");
+            let styles2 = self.compute_styles_with(&dom, stylesheets, &viewport).await?;
+            let layout2 = self.layout(&styles2, viewport).await?;
+            let mut render2 = self.paint_with_images(&layout2, images).await?;
+            if !custom_fonts.is_empty() {
+                if let TypedData::RenderCommands(ref mut cmds) = render2 {
+                    cmds.fonts = custom_fonts;
+                }
+            }
+            render_commands = render2;
+        }
 
         info!("Pipeline: navigation complete");
         Ok(render_commands)

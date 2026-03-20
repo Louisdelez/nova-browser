@@ -255,6 +255,7 @@ impl Framebuffer {
         let size = (width * height * 4) as usize;
         let pixels = vec![255u8; size]; // White background
         let font_renderer = FontRenderer::new();
+        tracing::info!("Font renderer loaded: regular={}", font_renderer.is_some());
         Self {
             width,
             height,
@@ -528,6 +529,7 @@ impl Framebuffer {
         letter_spacing: Option<f32>,
     ) {
         if self.font_renderer.is_none() {
+            tracing::warn!("Using bitmap font fallback — TTF font not loaded");
             self.draw_text_bitmap(x, y, text, font_size, color);
             return;
         }
@@ -551,13 +553,13 @@ impl Framebuffer {
 
         let fb_width = self.width as i32;
 
-        let mut cx = x.round() as i32;
+        let mut cx = x;
         let mut cy = y.round() as i32;
         let line_height = (font_size * 1.2).round() as i32;
 
         for ch in text.chars() {
             if ch == '\n' {
-                cx = x.round() as i32;
+                cx = x;
                 cy += line_height;
                 continue;
             }
@@ -578,13 +580,13 @@ impl Framebuffer {
 
             // Line wrapping: if this glyph would exceed the framebuffer width,
             // wrap to the next line.
-            if cx + metrics.advance_width as i32 > fb_width && cx > x.round() as i32 {
-                cx = x.round() as i32;
+            if cx.round() as i32 + metrics.advance_width as i32 > fb_width && cx > x {
+                cx = x;
                 cy += line_height;
             }
 
-            // Blit the glyph bitmap.
-            let gx = cx + metrics.xmin;
+            // Blit the glyph bitmap with subpixel horizontal positioning.
+            let gx = cx.round() as i32 + metrics.xmin;
             let gy = cy - metrics.ymin; // fontdue ymin is distance from baseline up
             let bw = metrics.width;
             let bh = metrics.height;
@@ -617,9 +619,9 @@ impl Framebuffer {
                 }
             }
 
-            cx += metrics.advance_width as i32;
+            cx += metrics.advance_width;
             if let Some(ls) = letter_spacing {
-                cx += ls.round() as i32;
+                cx += ls;
             }
         }
 

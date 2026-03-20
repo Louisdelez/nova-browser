@@ -59,6 +59,30 @@ impl HitRegion {
     }
 }
 
+/// A scrollable container region on the page.
+#[derive(Debug, Clone)]
+struct ScrollRegion {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    content_height: f32,
+    scroll_offset: f32,
+}
+
+impl ScrollRegion {
+    /// Test whether a point (in page coordinates) falls inside this region.
+    fn contains(&self, px: f32, py: f32) -> bool {
+        px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
+    }
+
+    /// Clamp scroll offset to valid range.
+    fn clamp_scroll(&mut self) {
+        let max = (self.content_height - self.height).max(0.0);
+        self.scroll_offset = self.scroll_offset.clamp(0.0, max);
+    }
+}
+
 /// An interactive form field region on the page.
 #[derive(Debug, Clone)]
 struct FormFieldRegion {
@@ -123,6 +147,8 @@ pub struct BrowserWindow {
     content_height: f32,
     /// Total width of the rendered content in pixels.
     content_width: f32,
+    /// Per-container scroll regions (from `ScrollContainerStart` ops).
+    scroll_regions: Vec<ScrollRegion>,
 
     // -- Form field interaction state --
     /// Interactive form field regions extracted from `RenderOp::FormField` ops.
@@ -160,6 +186,7 @@ impl BrowserWindow {
     ) -> Self {
         let hit_regions = Self::extract_hit_regions(&commands);
         let form_fields = Self::extract_form_fields(&commands);
+        let scroll_regions = Self::extract_scroll_regions(&commands);
         let content_height = Self::compute_content_height(&commands);
         let content_width = Self::compute_content_width(&commands);
         let fb = Framebuffer::new(width, height);
@@ -189,6 +216,7 @@ impl BrowserWindow {
             scroll_x: 0.0,
             content_height,
             content_width,
+            scroll_regions,
             form_fields,
             focused_field: None,
             hit_regions,
@@ -214,6 +242,35 @@ impl BrowserWindow {
                         width: *width,
                         height: *height,
                         url: url.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Extract scroll container regions from render commands.
+    fn extract_scroll_regions(commands: &RenderCommands) -> Vec<ScrollRegion> {
+        commands
+            .ops
+            .iter()
+            .filter_map(|op| {
+                if let RenderOp::ScrollContainerStart {
+                    x,
+                    y,
+                    width,
+                    height,
+                    content_height,
+                } = op
+                {
+                    Some(ScrollRegion {
+                        x: *x,
+                        y: *y,
+                        width: *width,
+                        height: *height,
+                        content_height: *content_height,
+                        scroll_offset: 0.0,
                     })
                 } else {
                     None
@@ -851,6 +908,7 @@ impl BrowserWindow {
                 info!("In-place navigation successful! {} render ops", cmds.ops.len());
                 self.hit_regions = Self::extract_hit_regions(&cmds);
                 self.form_fields = Self::extract_form_fields(&cmds);
+                self.scroll_regions = Self::extract_scroll_regions(&cmds);
                 self.focused_field = None;
                 self.content_height = Self::compute_content_height(&cmds);
                 self.content_width = Self::compute_content_width(&cmds);
@@ -937,6 +995,10 @@ impl ApplicationHandler for BrowserWindow {
                     self.width = gpu.config.width;
                     self.height = gpu.config.height;
 
+                    // Update the viewport so subsequent navigations use the new size.
+                    self.viewport.width = self.width as f32;
+                    self.viewport.height = self.height as f32;
+
                     // Re-clamp scroll and re-render at the new size.
                     self.clamp_scroll();
                     self.rebuild_framebuffer();
@@ -953,18 +1015,43 @@ impl ApplicationHandler for BrowserWindow {
                     MouseScrollDelta::PixelDelta(pos) => (-pos.x as f32, -pos.y as f32),
                 };
 
-                let mut changed = false;
-                if dy.abs() > 0.01 {
-                    self.scroll_y += dy;
-                    changed = true;
+                // Check if the cursor is inside a scroll container.
+                // If so, route the scroll event to that container instead
+                // of the global scroll offset.
+                let page_x = self.cursor_x as f32 + self.scroll_x;
+                let page_y = (self.cursor_y as f32 - URL_BAR_HEIGHT) + self.scroll_y;
+                let mut handled_by_container = false;
+
+                if (self.cursor_y as f32) > URL_BAR_HEIGHT {
+                    for region in &mut self.scroll_regions {
+                        if region.contains(page_x, page_y) && region.content_height > region.height
+                        {
+                            if dy.abs() > 0.01 {
+                                region.scroll_offset += dy;
+                                region.clamp_scroll();
+                                handled_by_container = true;
+                            }
+                            break;
+                        }
+                    }
                 }
-                if dx.abs() > 0.01 {
-                    self.scroll_x += dx;
-                    changed = true;
-                }
-                if changed {
-                    self.clamp_scroll();
+
+                if handled_by_container {
                     self.request_redraw();
+                } else {
+                    let mut changed = false;
+                    if dy.abs() > 0.01 {
+                        self.scroll_y += dy;
+                        changed = true;
+                    }
+                    if dx.abs() > 0.01 {
+                        self.scroll_x += dx;
+                        changed = true;
+                    }
+                    if changed {
+                        self.clamp_scroll();
+                        self.request_redraw();
+                    }
                 }
             }
 

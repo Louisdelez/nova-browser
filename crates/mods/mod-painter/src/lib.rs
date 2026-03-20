@@ -691,8 +691,12 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                     letter_spacing,
                 });
 
-                // Draw underline if text-decoration: underline is set.
-                if has_text_decoration_underline(&layout_box.style) {
+                // Draw underline if text-decoration: underline is set,
+                // or if this text node is a link (href present) so links
+                // remain visually distinguishable even when the site
+                // overrides color/decoration.
+                let is_link = extract_href(&layout_box.style).is_some();
+                if has_text_decoration_underline(&layout_box.style) || is_link {
                     let underline_y = layout_box.y + font_size + 2.0;
                     ops.push(RenderOp::FillRect {
                         x: layout_box.x,
@@ -2669,5 +2673,82 @@ mod tests {
         style.properties.push(("z-index".into(), StyleValue::Number(5.0)));
         style.properties.push(("position".into(), StyleValue::Keyword("relative".into())));
         assert!(creates_stacking_context(&style));
+    }
+
+    #[test]
+    fn segments_produce_colored_draw_text() {
+        // A text node with nova-text-segments should produce multiple DrawText
+        // ops with different colors.
+        let mut style = StyleMap::default();
+        style.properties.push(("font-size".into(), StyleValue::Px(16.0)));
+        style.properties.push(("color".into(), StyleValue::Str("#000000".into())));
+        // Segments: "Hello " (0:6) is black, "world" (6:11) is blue.
+        style.properties.push((
+            "nova-text-segments".into(),
+            StyleValue::Str("0:6:0:#000000::;6:11:50:#0000ee::underline".into()),
+        ));
+        let layout = LayoutBox {
+            x: 0.0, y: 0.0, width: 200.0, height: 20.0,
+            content: LayoutContent::Text("Hello world".into()),
+            style,
+            children: vec![],
+            z_index: 0,
+        };
+        let mut ops = Vec::new();
+        paint_box(&layout, &mut ops, &HashMap::new());
+
+        // Should have at least 2 DrawText ops (one per segment).
+        let draw_texts: Vec<_> = ops.iter().filter(|op| matches!(op, RenderOp::DrawText { .. })).collect();
+        assert!(
+            draw_texts.len() >= 2,
+            "should have at least 2 DrawText ops for 2 segments, got {}",
+            draw_texts.len()
+        );
+
+        // Check that one of them has blue color.
+        let has_blue = ops.iter().any(|op| {
+            if let RenderOp::DrawText { color, .. } = op {
+                color.b > 0.8 && color.r < 0.1 && color.g < 0.1
+            } else {
+                false
+            }
+        });
+        assert!(has_blue, "one DrawText should have blue color for the link segment");
+
+        // Check that there's an underline (FillRect) for the link segment.
+        let has_underline = ops.iter().any(|op| matches!(op, RenderOp::FillRect { .. }));
+        assert!(has_underline, "should have FillRect for underline");
+    }
+
+    #[test]
+    fn single_style_link_text_has_color() {
+        // A text node with only link color (no segments needed) should use that color.
+        let mut style = StyleMap::default();
+        style.properties.push(("font-size".into(), StyleValue::Px(16.0)));
+        style.properties.push(("color".into(), StyleValue::Str("#0000ee".into())));
+        style.properties.push(("text-decoration".into(), StyleValue::Keyword("underline".into())));
+        let layout = LayoutBox {
+            x: 0.0, y: 0.0, width: 200.0, height: 20.0,
+            content: LayoutContent::Text("Link Text".into()),
+            style,
+            children: vec![],
+            z_index: 0,
+        };
+        let mut ops = Vec::new();
+        paint_box(&layout, &mut ops, &HashMap::new());
+
+        // Check that the DrawText has blue color.
+        let has_blue = ops.iter().any(|op| {
+            if let RenderOp::DrawText { color, .. } = op {
+                color.b > 0.8 && color.r < 0.1 && color.g < 0.1
+            } else {
+                false
+            }
+        });
+        assert!(has_blue, "DrawText should have blue color for link text");
+
+        // Check underline.
+        let has_underline = ops.iter().any(|op| matches!(op, RenderOp::FillRect { .. }));
+        assert!(has_underline, "should have FillRect for underline");
     }
 }

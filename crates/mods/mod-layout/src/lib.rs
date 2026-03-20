@@ -851,11 +851,18 @@ fn add_node(
             }
 
             // ── Inline Formatting Context ──────────────────────────
-            // For block containers, group consecutive inline children
-            // into inline formatting contexts so they flow together,
-            // wrap across lines, and share baselines.
-            // Only apply IFC for block containers (not flex, grid, or table).
-            let child_ids = if display == "block" {
+            // For block-like containers (block, table-cell, list-item),
+            // group consecutive inline children into inline formatting
+            // contexts so they flow together, wrap across lines, and
+            // share baselines.  This is critical for correct colored
+            // segments: the IFC merges adjacent inline items (with
+            // potentially different styles) into a single Taffy node
+            // and encodes per-segment style data for the painter.
+            let use_ifc = matches!(
+                display.as_str(),
+                "block" | "table-cell" | "list-item" | "table-caption"
+            );
+            let child_ids = if use_ifc {
                 build_children_with_ifc(taffy, children, available_width, font_size, &props, depth)?
             } else {
                 children

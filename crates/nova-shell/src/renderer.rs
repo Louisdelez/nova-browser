@@ -477,17 +477,61 @@ impl Framebuffer {
     }
 
     /// Fill a rectangle.
+    ///
+    /// Uses fast row-based operations: opaque fills use `copy_from_slice` per
+    /// row (no per-pixel branch), semi-transparent fills alpha-blend in bulk.
+    /// Fully transparent colours are skipped entirely.
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
-        let x0 = x.round() as i32;
-        let y0 = y.round() as i32;
-        let x1 = (x + w).round() as i32;
-        let y1 = (y + h).round() as i32;
+        let x0 = x.round().max(0.0) as usize;
+        let y0 = y.round().max(0.0) as usize;
+        let x1 = (x + w).round().min(self.width as f32) as usize;
+        let y1 = (y + h).round().min(self.height as f32) as usize;
 
-        for py in y0..y1 {
-            for px in x0..x1 {
-                self.set_pixel(px, py, color);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+
+        let r = (color.r * 255.0).round().clamp(0.0, 255.0) as u8;
+        let g = (color.g * 255.0).round().clamp(0.0, 255.0) as u8;
+        let b = (color.b * 255.0).round().clamp(0.0, 255.0) as u8;
+        let a = (color.a * 255.0).round().clamp(0.0, 255.0) as u8;
+
+        let fb_w = self.width as usize;
+
+        if a == 255 {
+            // Opaque: direct write, no blending needed.
+            let pixel = [r, g, b, 255u8];
+            for row in y0..y1 {
+                let row_start = row * fb_w * 4 + x0 * 4;
+                let row_end = row * fb_w * 4 + x1 * 4;
+                if row_end <= self.pixels.len() {
+                    for chunk in self.pixels[row_start..row_end].chunks_exact_mut(4) {
+                        chunk.copy_from_slice(&pixel);
+                    }
+                }
+            }
+        } else if a > 0 {
+            // Semi-transparent: alpha blend per pixel.
+            let alpha = color.a;
+            let inv_alpha = 1.0 - alpha;
+            for row in y0..y1 {
+                for col in x0..x1 {
+                    let idx = (row * fb_w + col) * 4;
+                    if idx + 3 < self.pixels.len() {
+                        let bg_r = self.pixels[idx] as f32 / 255.0;
+                        let bg_g = self.pixels[idx + 1] as f32 / 255.0;
+                        let bg_b = self.pixels[idx + 2] as f32 / 255.0;
+                        self.pixels[idx] = ((color.r * alpha + bg_r * inv_alpha) * 255.0) as u8;
+                        self.pixels[idx + 1] =
+                            ((color.g * alpha + bg_g * inv_alpha) * 255.0) as u8;
+                        self.pixels[idx + 2] =
+                            ((color.b * alpha + bg_b * inv_alpha) * 255.0) as u8;
+                        self.pixels[idx + 3] = 255;
+                    }
+                }
             }
         }
+        // a == 0 → fully transparent, nothing to draw.
     }
 
     /// Fill a rectangle with rounded corners using an SDF-based approach.
@@ -811,9 +855,22 @@ impl Framebuffer {
         }
 
         let sx = scroll_x;
+        let fb_height = self.height as f32;
 
         for op in &commands.ops {
             let sy_extra = self.translate_y_offset;
+
+            // ---- Off-screen culling ----
+            // Skip ops whose vertical position is entirely above or below the
+            // visible viewport. We use a generous margin (1000px below the
+            // element's y and 100px past the bottom) to avoid clipping
+            // tall elements or text that overflows its origin.
+            if let Some(op_y) = get_op_y(op) {
+                let screen_y = op_y + y_offset - scroll_y + sy_extra;
+                if screen_y > fb_height + 100.0 || screen_y + 1000.0 < 0.0 {
+                    continue;
+                }
+            }
             match op {
                 RenderOp::FillRect { x, y, width, height, color } => {
                     self.fill_rect(*x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, *color);
@@ -1134,6 +1191,38 @@ impl Framebuffer {
                 self.set_pixel(px, py, Color { r, g, b, a });
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Off-screen culling helper
+// ---------------------------------------------------------------------------
+
+/// Extract the Y coordinate from a `RenderOp`, if applicable.
+///
+/// Returns `None` for ops that are purely structural (e.g. `PopClip`,
+/// `StickyEnd`, `Save`, `Restore`) — those should never be skipped.
+fn get_op_y(op: &RenderOp) -> Option<f32> {
+    match op {
+        RenderOp::FillRect { y, .. }
+        | RenderOp::DrawText { y, .. }
+        | RenderOp::StrokeRect { y, .. }
+        | RenderOp::DrawImage { y, .. }
+        | RenderOp::FillRoundedRect { y, .. }
+        | RenderOp::BoxShadow { y, .. }
+        | RenderOp::FormField { y, .. }
+        | RenderOp::DrawTexture { y, .. } => Some(*y),
+        // Structural / state ops — never cull these.
+        RenderOp::PushClip { .. }
+        | RenderOp::PopClip
+        | RenderOp::StickyStart { .. }
+        | RenderOp::StickyEnd
+        | RenderOp::ScrollContainerStart { .. }
+        | RenderOp::ScrollContainerEnd
+        | RenderOp::Link { .. }
+        | RenderOp::Translate { .. }
+        | RenderOp::Save
+        | RenderOp::Restore => None,
     }
 }
 

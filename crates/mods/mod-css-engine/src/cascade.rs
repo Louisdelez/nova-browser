@@ -572,8 +572,11 @@ fn compute_element_style_impl(
     // 2. Stylesheet rules — use the index to only check candidate rules.
     //    Performance: limit candidate evaluation to avoid O(n) blowup on
     //    elements that match many rules (e.g. `.mw-parser-output` on Wikipedia).
+    //    Elements with classes get a higher limit since they're more likely to
+    //    match important layout rules (e.g. Wikipedia's flex layout containers).
     let candidates = index.candidates_for(tag, attributes);
-    for &rule_idx in candidates.iter().take(200) {
+    let max_rules = if attributes.iter().any(|(k, _)| k == "class") { 500 } else { 200 };
+    for &rule_idx in candidates.iter().take(max_rules) {
         let rule = &rules[rule_idx];
         if rule.selector.matches(node, ancestors, siblings) {
             let spec = rule.selector.specificity();

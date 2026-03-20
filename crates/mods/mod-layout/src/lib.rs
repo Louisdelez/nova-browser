@@ -1358,59 +1358,83 @@ fn layout_inline_run(
     }
 
     // 3. Create Taffy nodes for each line box.
+    //
+    // KEY DESIGN: Instead of one Taffy node per word, we merge consecutive
+    // text items (words + spaces) that share the same style into a single
+    // combined text node.  This means the renderer draws "This domain is
+    // for use" as ONE DrawText call instead of 6 separate ones, eliminating
+    // measurement drift that causes words to overlap or stick together.
     let mut line_box_ids = Vec::new();
     for line in &lines {
         let mut item_ids = Vec::new();
         let mut max_height = line_height;
 
-        for item in line {
-            match &item {
-                InlineItem::Word { text, width, style } => {
-                    let fs = style.iter()
-                        .find(|(k, _)| k == "font-size")
-                        .and_then(|(_, v)| if let StyleValue::Px(px) = v { Some(*px) } else { None })
-                        .unwrap_or(parent_font_size);
-                    let lh = resolve_line_height(style, fs);
-                    max_height = max_height.max(lh);
+        // Merge runs of text items with compatible styles.
+        let mut i = 0;
+        while i < line.len() {
+            match &line[i] {
+                InlineItem::Word { style, .. } | InlineItem::Space { style, .. } => {
+                    // Collect a run of consecutive Word/Space items with the same
+                    // font size, color, weight, style, and family.
+                    let run_style = style.clone();
+                    let mut run_text = String::new();
+                    let mut run_width: f32 = 0.0;
+                    let mut j = i;
+                    while j < line.len() {
+                        match &line[j] {
+                            InlineItem::Word { text, width, style: s } => {
+                                if styles_compatible_for_merge(&run_style, s) {
+                                    run_text.push_str(text);
+                                    run_width += width;
+                                    j += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            InlineItem::Space { width, style: s, .. } => {
+                                if styles_compatible_for_merge(&run_style, s) {
+                                    run_text.push(' ');
+                                    run_width += width;
+                                    j += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            InlineItem::Image { .. } => break,
+                        }
+                    }
 
-                    let ctx = NodeContext {
-                        content: LayoutContent::Text(text.clone()),
-                        style: StyleMap { properties: style.clone() },
-                    };
-                    let id = taffy
-                        .new_leaf_with_context(
-                            Style {
-                                display: Display::Flex,
-                                size: Size {
-                                    width: Dimension::Length(*width),
-                                    height: Dimension::Length(lh),
+                    if !run_text.is_empty() {
+                        let fs = run_style.iter()
+                            .find(|(k, _)| k == "font-size")
+                            .and_then(|(_, v)| if let StyleValue::Px(px) = v { Some(*px) } else { None })
+                            .unwrap_or(parent_font_size);
+                        let lh = resolve_line_height(&run_style, fs);
+                        max_height = max_height.max(lh);
+
+                        // Measure the combined string for accurate width.
+                        let measured_width = measure_text_width(&run_text, fs);
+
+                        let ctx = NodeContext {
+                            content: LayoutContent::Text(run_text),
+                            style: StyleMap { properties: run_style },
+                        };
+                        let id = taffy
+                            .new_leaf_with_context(
+                                Style {
+                                    display: Display::Flex,
+                                    size: Size {
+                                        width: Dimension::Length(measured_width),
+                                        height: Dimension::Length(lh),
+                                    },
+                                    ..Style::DEFAULT
                                 },
-                                ..Style::DEFAULT
-                            },
-                            ctx,
-                        )
-                        .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
-                    item_ids.push(id);
-                }
-                InlineItem::Space { width, style } => {
-                    let ctx = NodeContext {
-                        content: LayoutContent::Text(" ".to_string()),
-                        style: StyleMap { properties: style.clone() },
-                    };
-                    let id = taffy
-                        .new_leaf_with_context(
-                            Style {
-                                display: Display::Flex,
-                                size: Size {
-                                    width: Dimension::Length(*width),
-                                    height: Dimension::Length(line_height),
-                                },
-                                ..Style::DEFAULT
-                            },
-                            ctx,
-                        )
-                        .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
-                    item_ids.push(id);
+                                ctx,
+                            )
+                            .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
+                        item_ids.push(id);
+                    }
+                    i = j;
                 }
                 InlineItem::Image { src, width, height } => {
                     max_height = max_height.max(*height);
@@ -1432,6 +1456,7 @@ fn layout_inline_run(
                         )
                         .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
                     item_ids.push(id);
+                    i += 1;
                 }
             }
         }
@@ -1479,6 +1504,34 @@ fn layout_inline_run(
     }
 
     Ok(line_box_ids)
+}
+
+/// Check if two style property lists are compatible for merging into a
+/// single text run.  Two runs are compatible if they share the same font
+/// size, color, font-weight, font-style, font-family, and text-decoration.
+fn styles_compatible_for_merge(a: &[(String, StyleValue)], b: &[(String, StyleValue)]) -> bool {
+    let get = |props: &[(String, StyleValue)], key: &str| -> Option<String> {
+        props.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| match v {
+                StyleValue::Px(px) => format!("{px}"),
+                StyleValue::Keyword(k) | StyleValue::Str(k) => k.clone(),
+                StyleValue::Number(n) => format!("{n}"),
+                StyleValue::Color(c) => format!("{},{},{},{}", c.r, c.g, c.b, c.a),
+                StyleValue::Percent(p) => format!("{p}%"),
+            })
+    };
+
+    static MERGE_KEYS: &[&str] = &[
+        "font-size", "color", "font-weight", "font-style",
+        "font-family", "text-decoration",
+    ];
+    for &key in MERGE_KEYS {
+        if get(a, key) != get(b, key) {
+            return false;
+        }
+    }
+    true
 }
 
 // ── Box model helpers ──────────────────────────────────────────────────
@@ -3501,9 +3554,9 @@ mod phase4_tests {
     }
 
     #[test]
-    fn multi_word_text_creates_multiple_children() {
-        // A text node with multiple words should produce a wrapper containing
-        // multiple word leaf nodes.
+    fn multi_word_text_creates_line_with_combined_text() {
+        // A text node with multiple words should produce a line box containing
+        // a single combined text node (words merged for consistent rendering).
         let dom = DomNode::Document {
             children: vec![DomNode::Element {
                 tag: "body".into(),
@@ -3513,18 +3566,23 @@ mod phase4_tests {
         };
         let root = compute_layout(&dom, &viewport()).expect("layout ok");
         let body = &root.children[0];
-        // body has one child: the inline wrapper for the text.
         assert!(
             !body.children.is_empty(),
             "body should have children for the text"
         );
-        // The text wrapper should have multiple children (word nodes + space nodes).
-        let text_wrapper = &body.children[0];
+        // The line box should contain merged text run(s).
+        let line_box = &body.children[0];
         assert!(
-            text_wrapper.children.len() >= 3,
-            "text wrapper should have >=3 children (words + spaces), got {}",
-            text_wrapper.children.len()
+            !line_box.children.is_empty(),
+            "line box should have at least one text run"
         );
+        // The first child should contain the combined text.
+        if let LayoutContent::Text(ref text) = line_box.children[0].content {
+            assert!(
+                text.contains("Hello") && text.contains("World") && text.contains("Foo"),
+                "combined text should contain all words, got: {text}"
+            );
+        }
     }
 
     #[test]

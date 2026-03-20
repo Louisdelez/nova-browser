@@ -1446,6 +1446,15 @@ fn parse_dimension(val: &str) -> Option<Dimension> {
     if val == "auto" {
         return Some(Dimension::Auto);
     }
+    // Handle calc() expressions.
+    if val.starts_with("calc(") {
+        if let Some(inner) = val.strip_prefix("calc(").and_then(|s| s.strip_suffix(')')) {
+            if let Some(px) = mod_css_engine::values::eval_calc(inner, 0.0) {
+                return Some(Dimension::Length(px));
+            }
+        }
+        return None;
+    }
     if let Some(px) = val.strip_suffix("px").and_then(|s| s.trim().parse::<f32>().ok()) {
         return Some(Dimension::Length(px));
     }

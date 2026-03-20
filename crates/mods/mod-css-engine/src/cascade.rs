@@ -591,6 +591,19 @@ fn compute_element_style_impl(
         }
     }
 
+    // 7b. Resolve calc() expressions in property values.
+    for (_prop, val) in &mut final_props {
+        if val.contains("calc(") {
+            if let Some(inner) = val.strip_prefix("calc(").and_then(|s| s.strip_suffix(')')) {
+                if !inner.contains('%') && !inner.contains("vw") && !inner.contains("vh") {
+                    if let Some(px) = values::eval_calc(inner, 0.0) {
+                        *val = format!("{px}px");
+                    }
+                }
+            }
+        }
+    }
+
     // 8. Serialize as inline CSS string.
     final_props
         .iter()

@@ -70,15 +70,20 @@ impl NetworkMod {
     /// Maximum number of HTTP redirects to follow.
     const MAX_REDIRECTS: u8 = 10;
 
-    /// Perform a real HTTP/HTTPS GET request, following redirects.
+    /// Perform a real HTTP/HTTPS request, following redirects.
+    ///
+    /// Handles 301, 302, 303, 307, and 308 status codes:
+    /// - 301/302/303: redirect, method changes to GET (for 303 this is required by spec)
+    /// - 307/308: redirect, original method is preserved
     async fn fetch_real(&self, url_str: &str, _headers: &[(String, String)]) -> Result<HttpResponse, NovaError> {
         let mut current_url = url_str.to_string();
+        let mut method = "GET".to_string();
 
         for redirect_count in 0..=Self::MAX_REDIRECTS {
-            let response = self.fetch_single(&current_url).await?;
+            let response = self.fetch_single(&current_url, &method).await?;
 
-            // Follow redirects for 301, 302, 307, 308.
-            if matches!(response.status, 301 | 302 | 307 | 308) {
+            // Follow redirects for 301, 302, 303, 307, 308.
+            if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
                 let location = response
                     .headers
                     .iter()
@@ -92,19 +97,30 @@ impl NetworkMod {
                     let resolved = base.join(&loc)
                         .map_err(|e| NovaError::NetworkError(format!("invalid redirect URL '{loc}': {e}")))?;
 
-                    debug!(
+                    info!(
                         from = %current_url,
                         to = %resolved,
                         status = response.status,
                         redirect = redirect_count + 1,
-                        "following redirect"
+                        "following HTTP redirect"
                     );
+
+                    // For 303, always switch to GET.
+                    // For 301/302, switch to GET (common browser behavior).
+                    // For 307/308, preserve the original method.
+                    if matches!(response.status, 301 | 302 | 303) {
+                        method = "GET".to_string();
+                    }
+
                     current_url = resolved.to_string();
                     continue;
                 }
             }
 
-            return Ok(response);
+            // Update the response URL to reflect the final URL after redirects.
+            let mut final_response = response;
+            final_response.url = current_url;
+            return Ok(final_response);
         }
 
         Err(NovaError::NetworkError(format!(
@@ -113,8 +129,8 @@ impl NetworkMod {
         )))
     }
 
-    /// Perform a single HTTP GET request (no redirect following).
-    async fn fetch_single(&self, url_str: &str) -> Result<HttpResponse, NovaError> {
+    /// Perform a single HTTP request (no redirect following).
+    async fn fetch_single(&self, url_str: &str, method: &str) -> Result<HttpResponse, NovaError> {
         let parsed = url::Url::parse(url_str)
             .map_err(|e| NovaError::NetworkError(format!("invalid URL: {e}")))?;
 
@@ -139,7 +155,7 @@ impl NetworkMod {
 
         // Build HTTP/1.1 request manually (simple, no heavy framework overhead).
         let request = format!(
-            "GET {path} HTTP/1.1\r\n\
+            "{method} {path} HTTP/1.1\r\n\
              Host: {host}\r\n\
              User-Agent: NOVA/0.1.0\r\n\
              Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n\
@@ -369,6 +385,58 @@ mod tests {
         let resp = parse_http_response(raw, "http://test.com").unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body.as_ref(), b"hello world");
+    }
+
+    #[test]
+    fn parse_redirect_response_301() {
+        let raw = b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://example.com/\r\n\r\n";
+        let resp = parse_http_response(raw, "http://example.com").unwrap();
+        assert_eq!(resp.status, 301);
+        assert_eq!(resp.header("location"), Some("https://example.com/"));
+    }
+
+    #[test]
+    fn parse_redirect_response_302() {
+        let raw = b"HTTP/1.1 302 Found\r\nLocation: /new-page\r\n\r\n";
+        let resp = parse_http_response(raw, "http://example.com/old").unwrap();
+        assert_eq!(resp.status, 302);
+        assert_eq!(resp.header("location"), Some("/new-page"));
+    }
+
+    #[test]
+    fn parse_redirect_response_303() {
+        let raw = b"HTTP/1.1 303 See Other\r\nLocation: /result\r\n\r\n";
+        let resp = parse_http_response(raw, "http://example.com/submit").unwrap();
+        assert_eq!(resp.status, 303);
+        assert_eq!(resp.header("location"), Some("/result"));
+    }
+
+    #[test]
+    fn parse_redirect_response_307() {
+        let raw = b"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://example.com/temp\r\n\r\n";
+        let resp = parse_http_response(raw, "http://example.com").unwrap();
+        assert_eq!(resp.status, 307);
+    }
+
+    #[test]
+    fn parse_redirect_response_308() {
+        let raw = b"HTTP/1.1 308 Permanent Redirect\r\nLocation: https://example.com/perm\r\n\r\n";
+        let resp = parse_http_response(raw, "http://example.com").unwrap();
+        assert_eq!(resp.status, 308);
+    }
+
+    #[test]
+    fn relative_url_resolution() {
+        // Verify that url::Url::join handles relative Location headers correctly.
+        let base = url::Url::parse("http://example.com/old/page").unwrap();
+        let resolved = base.join("/new-path").unwrap();
+        assert_eq!(resolved.as_str(), "http://example.com/new-path");
+
+        let resolved2 = base.join("sibling").unwrap();
+        assert_eq!(resolved2.as_str(), "http://example.com/old/sibling");
+
+        let resolved3 = base.join("https://other.com/foo").unwrap();
+        assert_eq!(resolved3.as_str(), "https://other.com/foo");
     }
 
     #[tokio::test]

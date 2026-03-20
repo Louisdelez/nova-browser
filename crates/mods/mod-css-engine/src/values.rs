@@ -44,6 +44,34 @@ fn is_color_property(property: &str) -> bool {
     )
 }
 
+/// Evaluate a `calc()` CSS expression with a context value for resolving
+/// percentages and viewport-relative units.
+///
+/// `expr` is the inner part of `calc(...)` (without the outer `calc(` and `)`).
+/// `context_px` is the reference size in pixels used to resolve `%` and `vw`
+/// units (e.g., the parent element's width).
+///
+/// Returns the computed value in pixels, or `None` if the expression cannot
+/// be parsed.
+///
+/// # Supported operands
+///
+/// - `<n>px` — pixels
+/// - `<n>%` — percentage of `context_px`
+/// - `<n>em` / `<n>rem` — approximated at 16px per unit
+/// - `<n>vw` — 1% of `context_px`
+/// - `<n>pt` — 1pt = 1.333px
+/// - bare numbers — treated as pixels
+///
+/// # Supported operators
+///
+/// `+`, `-`, `*`, `/` with standard precedence (`*`/`/` before `+`/`-`),
+/// and parentheses for grouping. Nested `calc()` calls are also supported.
+pub fn eval_calc(expr: &str, context_px: f32) -> Option<f32> {
+    let tokens = tokenise_calc_ctx(expr, context_px)?;
+    eval_tokens(&tokens)
+}
+
 /// Resolve a `calc(...)` CSS expression.
 ///
 /// If all operands are in `px` (or plain numbers), evaluates the expression fully
@@ -165,6 +193,121 @@ fn tokenise_calc(expr: &str) -> Option<Vec<CalcToken>> {
             "em" | "rem" => num * 16.0,
             "pt" => num * 1.333,
             _ => return None, // Unknown unit — bail out.
+        };
+        tokens.push(CalcToken::Value(px));
+    }
+
+    Some(tokens)
+}
+
+/// Convert a calc expression string into a flat list of tokens, resolving
+/// `%` and `vw` units against `context_px`.
+///
+/// Also handles nested `calc(...)` calls by stripping the inner `calc` prefix
+/// and recursively evaluating.
+fn tokenise_calc_ctx(expr: &str, context_px: f32) -> Option<Vec<CalcToken>> {
+    let expr = expr.trim();
+    let mut tokens: Vec<CalcToken> = Vec::new();
+    let chars: Vec<char> = expr.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Skip whitespace.
+        if chars[i].is_whitespace() {
+            i += 1;
+            continue;
+        }
+
+        // Detect nested calc(...) — strip it and recurse.
+        if i + 5 <= len {
+            let word: String = chars[i..i + 5].iter().collect();
+            if word == "calc(" {
+                // Find the matching closing paren.
+                let start = i + 5;
+                let mut depth = 1usize;
+                let mut j = start;
+                while j < len && depth > 0 {
+                    if chars[j] == '(' {
+                        depth += 1;
+                    } else if chars[j] == ')' {
+                        depth -= 1;
+                    }
+                    j += 1;
+                }
+                let sub: String = chars[start..j - 1].iter().collect();
+                let val = eval_calc(&sub, context_px)?;
+                tokens.push(CalcToken::Value(val));
+                i = j;
+                continue;
+            }
+        }
+
+        // Nested parentheses — recursively evaluate the sub-expression.
+        if chars[i] == '(' {
+            let start = i + 1;
+            let mut depth = 1usize;
+            i += 1;
+            while i < len && depth > 0 {
+                if chars[i] == '(' {
+                    depth += 1;
+                } else if chars[i] == ')' {
+                    depth -= 1;
+                }
+                i += 1;
+            }
+            let sub: String = chars[start..i - 1].iter().collect();
+            let val = eval_calc(&sub, context_px)?;
+            tokens.push(CalcToken::Value(val));
+            continue;
+        }
+
+        // Operator characters.
+        if matches!(chars[i], '+' | '*' | '/') {
+            tokens.push(CalcToken::Op(chars[i]));
+            i += 1;
+            continue;
+        }
+
+        // A '-' that follows an existing value token is a subtraction operator.
+        if chars[i] == '-' {
+            let after_op = tokens.last().map_or(true, |t| matches!(t, CalcToken::Op(_)));
+            if !after_op {
+                tokens.push(CalcToken::Op('-'));
+                i += 1;
+                continue;
+            }
+        }
+
+        // Parse a number literal (possibly with a unit suffix).
+        let start = i;
+        if i < len && chars[i] == '-' {
+            i += 1;
+        }
+        while i < len && (chars[i].is_ascii_digit() || chars[i] == '.') {
+            i += 1;
+        }
+        // Consume unit suffix (letters or %).
+        let unit_start = i;
+        if i < len && chars[i] == '%' {
+            i += 1;
+        } else {
+            while i < len && chars[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+        }
+
+        let num_str: String = chars[start..unit_start].iter().collect();
+        let unit: String = chars[unit_start..i].iter().collect();
+
+        let num: f32 = num_str.parse().ok()?;
+        let px = match unit.as_str() {
+            "px" | "" => num,
+            "%" => num / 100.0 * context_px,
+            "em" | "rem" => num * 16.0,
+            "vw" => num / 100.0 * context_px,
+            "pt" => num * 1.333,
+            _ => return None,
         };
         tokens.push(CalcToken::Value(px));
     }
@@ -673,5 +816,63 @@ mod tests {
             StyleValue::Str(s) => assert_eq!(s, "calc(100% - 20px)"),
             other => panic!("expected Str, got {other:?}"),
         }
+    }
+
+    // ── eval_calc() with context tests ───────────────────────────────────────
+
+    #[test]
+    fn eval_calc_percent_minus_px() {
+        // calc(100% - 20px) with context 800 → 780.0
+        let result = eval_calc("100% - 20px", 800.0);
+        assert_eq!(result, Some(780.0));
+    }
+
+    #[test]
+    fn eval_calc_percent_plus_px() {
+        // calc(50% + 10px) with context 400 → 210.0
+        let result = eval_calc("50% + 10px", 400.0);
+        assert_eq!(result, Some(210.0));
+    }
+
+    #[test]
+    fn eval_calc_percent_division() {
+        // calc(100% / 3) with context 900 → 300.0
+        let result = eval_calc("100% / 3", 900.0);
+        assert!((result.unwrap() - 300.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn eval_calc_em_plus_px() {
+        // calc(2em + 4px) → 36.0
+        let result = eval_calc("2em + 4px", 0.0);
+        assert_eq!(result, Some(36.0));
+    }
+
+    #[test]
+    fn eval_calc_nested_calc() {
+        // calc(calc(50%) + 10px) with context 400 → 210.0
+        let result = eval_calc("calc(50%) + 10px", 400.0);
+        assert_eq!(result, Some(210.0));
+    }
+
+    #[test]
+    fn eval_calc_operator_precedence() {
+        // calc(10px + 20px * 3) → 10 + 60 = 70
+        let result = eval_calc("10px + 20px * 3", 0.0);
+        assert_eq!(result, Some(70.0));
+    }
+
+    #[test]
+    fn eval_calc_parentheses() {
+        // calc((10px + 20px) * 3) → 90
+        let result = eval_calc("(10px + 20px) * 3", 0.0);
+        assert_eq!(result, Some(90.0));
+    }
+
+    #[test]
+    fn eval_calc_vw() {
+        // calc(50vw - 10px) with context 1000 → 490.0
+        let result = eval_calc("50vw - 10px", 1000.0);
+        assert_eq!(result, Some(490.0));
     }
 }

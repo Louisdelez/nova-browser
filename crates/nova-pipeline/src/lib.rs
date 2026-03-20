@@ -6,6 +6,7 @@
 //! The pipeline doesn't do any work itself. It sequences requests
 //! to the capability registry, which routes them to the right mods.
 
+use std::io::Cursor;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -349,9 +350,8 @@ impl PipelineEngine {
 
     /// Fetch `@font-face` font files in parallel.
     ///
-    /// Only `.ttf` and `.otf` fonts are fetched (fontdue can parse them natively).
-    /// `.woff` and `.woff2` URLs are logged as warnings and skipped because
-    /// fontdue cannot decode compressed WOFF containers.
+    /// Supports `.ttf`, `.otf`, `.woff`, and `.woff2` fonts. WOFF/WOFF2 files
+    /// are decompressed to TTF after fetching so that fontdue can parse them.
     ///
     /// Returns `(family_name, font_bytes)` pairs for successfully fetched fonts.
     async fn fetch_fonts_parallel(&self, font_urls: &[FontFaceUrl]) -> Vec<(String, Vec<u8>)> {
@@ -369,21 +369,16 @@ impl PipelineEngine {
     }
 
     /// Fetch a single font file, returning `None` on failure or unsupported format.
+    ///
+    /// Supports `.ttf`, `.otf`, `.woff`, and `.woff2`. WOFF/WOFF2 files are
+    /// decompressed to raw TTF/OTF bytes after fetching.
     async fn fetch_font(&self, family: &str, url: &str) -> Option<(String, Vec<u8>)> {
         // Determine the format from the URL extension.
         let path = url.split('?').next().unwrap_or(url);
         let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
 
         match ext.as_str() {
-            "ttf" | "otf" => {}
-            "woff" | "woff2" => {
-                warn!(
-                    family = %family,
-                    url = %url,
-                    "skipping @font-face font: .{ext} format is not supported by fontdue"
-                );
-                return None;
-            }
+            "ttf" | "otf" | "woff" | "woff2" => {}
             _ => {
                 warn!(
                     family = %family,
@@ -395,17 +390,8 @@ impl PipelineEngine {
             }
         }
 
-        match self.fetch(url).await {
-            Ok(response) => {
-                let bytes = response.body.to_vec();
-                info!(
-                    family = %family,
-                    url = %url,
-                    size = bytes.len(),
-                    "fetched @font-face font"
-                );
-                Some((family.to_string(), bytes))
-            }
+        let response = match self.fetch(url).await {
+            Ok(r) => r,
             Err(e) => {
                 warn!(
                     family = %family,
@@ -413,9 +399,71 @@ impl PipelineEngine {
                     error = %e,
                     "failed to fetch @font-face font, skipping"
                 );
-                None
+                return None;
             }
-        }
+        };
+
+        let raw_bytes = response.body.to_vec();
+        info!(
+            family = %family,
+            url = %url,
+            size = raw_bytes.len(),
+            format = %ext,
+            "fetched @font-face font"
+        );
+
+        // Decompress WOFF/WOFF2 to raw TTF/OTF bytes.
+        let font_bytes = match ext.as_str() {
+            "woff2" => {
+                match woff2_patched::decode::convert_woff2_to_ttf(
+                    &mut Cursor::new(&raw_bytes),
+                ) {
+                    Ok(ttf) => {
+                        info!(
+                            family = %family,
+                            original_size = raw_bytes.len(),
+                            decoded_size = ttf.len(),
+                            "decoded WOFF2 → TTF"
+                        );
+                        ttf
+                    }
+                    Err(e) => {
+                        warn!(
+                            family = %family,
+                            url = %url,
+                            error = ?e,
+                            "failed to decode WOFF2 font, skipping"
+                        );
+                        return None;
+                    }
+                }
+            }
+            "woff" => {
+                match woff::version1::decompress(&raw_bytes) {
+                    Some(ttf) => {
+                        info!(
+                            family = %family,
+                            original_size = raw_bytes.len(),
+                            decoded_size = ttf.len(),
+                            "decoded WOFF → TTF"
+                        );
+                        ttf
+                    }
+                    None => {
+                        warn!(
+                            family = %family,
+                            url = %url,
+                            "failed to decode WOFF font, skipping"
+                        );
+                        return None;
+                    }
+                }
+            }
+            // TTF/OTF — already in the right format.
+            _ => raw_bytes,
+        };
+
+        Some((family.to_string(), font_bytes))
     }
 
     /// Fetch and decode images in parallel.

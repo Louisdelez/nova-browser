@@ -73,8 +73,8 @@ pub async fn connect(host: &str, port: u16, use_tls: bool) -> Result<Transport, 
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
-        // Configure ALPN protocols: prefer h2, fall back to http/1.1.
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        // Configure ALPN protocols: prefer http/1.1 (h2 framing not yet implemented).
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
         let connector = TlsConnector::from(Arc::new(config));
 

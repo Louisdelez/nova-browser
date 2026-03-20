@@ -126,10 +126,18 @@ impl PipelineEngine {
         // Step 6: Layout
         let layout_tree = self.layout(&styles, viewport).await?;
 
+        // Step 6b: Extract background-image URLs from computed styles.
+        let mut all_images = sub_resources.images.clone();
+        if let TypedData::Dom(ref styled_dom) = styles {
+            let bg_images = extract_background_image_urls(styled_dom, &base_url);
+            if !bg_images.is_empty() {
+                info!("Pipeline: found {} background-image URL(s)", bg_images.len());
+                all_images.extend(bg_images);
+            }
+        }
+
         // Step 7: Fetch and decode images (in parallel)
-        // Images are keyed by the original src attribute (what the layout uses),
-        // but fetched via the resolved URL.
-        let images = self.fetch_and_decode_images_parallel(&sub_resources.images).await;
+        let images = self.fetch_and_decode_images_parallel(&all_images).await;
         info!(
             "Pipeline: decoded {}/{} images",
             images.len(),
@@ -804,6 +812,64 @@ fn resolve_url(href: &str, base_url: &Option<Url>) -> String {
     } else {
         href.to_string()
     }
+}
+
+/// Extract background-image URLs from a styled DOM tree.
+///
+/// Walks all elements with `data-nova-style` and looks for `background-image: url(...)`.
+fn extract_background_image_urls(node: &DomNode, base_url: &Option<Url>) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    walk_for_bg_images(node, base_url, &mut result);
+    result
+}
+
+fn walk_for_bg_images(node: &DomNode, base_url: &Option<Url>, out: &mut Vec<(String, String)>) {
+    match node {
+        DomNode::Element { attributes, children, .. } => {
+            if let Some(style) = attributes.iter().find(|(k, _)| k == "data-nova-style") {
+                for decl in style.1.split(';') {
+                    let parts: Vec<&str> = decl.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        let prop = parts[0].trim();
+                        let val = parts[1].trim();
+                        if (prop == "background-image" || prop == "background") && val.contains("url(") {
+                            if let Some(url) = extract_css_url_from_value(val) {
+                                let resolved = resolve_url(&url, base_url);
+                                out.push((url, resolved));
+                            }
+                        }
+                    }
+                }
+            }
+            for child in children {
+                walk_for_bg_images(child, base_url, out);
+            }
+        }
+        DomNode::Document { children } => {
+            for child in children {
+                walk_for_bg_images(child, base_url, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract a URL from a CSS `url(...)` value string.
+fn extract_css_url_from_value(value: &str) -> Option<String> {
+    let idx = value.find("url(")?;
+    let after = &value[idx + 4..];
+    let trimmed = after.trim_start();
+    let url_str = if trimmed.starts_with('"') {
+        let inner = &trimmed[1..];
+        &inner[..inner.find('"')?]
+    } else if trimmed.starts_with('\'') {
+        let inner = &trimmed[1..];
+        &inner[..inner.find('\'')?]
+    } else {
+        &trimmed[..trimmed.find(')')?]
+    };
+    let url_str = url_str.trim();
+    if url_str.is_empty() { None } else { Some(url_str.to_string()) }
 }
 
 #[cfg(test)]

@@ -274,6 +274,33 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         }
     }
 
+    // Paint background-image (url() or linear-gradient).
+    if let Some(bg_image) = extract_background_image_value(&layout_box.style) {
+        if bg_image.starts_with("url(") {
+            // Background image from URL.
+            if let Some(url) = extract_css_url(&bg_image) {
+                if let Some(decoded) = images.get(&url) {
+                    if decoded.len() >= 8 {
+                        let iw = u32::from_le_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]);
+                        let ih = u32::from_le_bytes([decoded[4], decoded[5], decoded[6], decoded[7]]);
+                        let px = decoded[8..].to_vec();
+                        ops.push(RenderOp::DrawImage {
+                            x: layout_box.x, y: layout_box.y,
+                            width: layout_box.width, height: layout_box.height,
+                            img_width: iw, img_height: ih, pixels: px,
+                        });
+                    }
+                }
+            }
+        } else if bg_image.contains("linear-gradient(") {
+            // Render linear gradient as horizontal strips.
+            paint_linear_gradient(
+                &bg_image, layout_box.x, layout_box.y,
+                layout_box.width, layout_box.height, opacity, ops,
+            );
+        }
+    }
+
     // Paint text content.
     if let LayoutContent::Text(ref text) = layout_box.content {
         if !text.trim().is_empty() {
@@ -1026,6 +1053,173 @@ fn extract_font_size(style: &nova_mod_api::content::StyleMap) -> f32 {
         }
     }
     16.0
+}
+
+/// Extract `background-image` CSS value from a style map.
+fn extract_background_image_value(style: &nova_mod_api::content::StyleMap) -> Option<String> {
+    for (key, value) in &style.properties {
+        if key == "background-image" || key == "background" {
+            let s = match value {
+                StyleValue::Str(s) | StyleValue::Keyword(s) => s.as_str(),
+                _ => continue,
+            };
+            if s.contains("url(") || s.contains("gradient(") {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract a URL from a CSS `url(...)` value.
+fn extract_css_url(value: &str) -> Option<String> {
+    let idx = value.find("url(")?;
+    let after = &value[idx + 4..];
+    let trimmed = after.trim_start();
+    let (url_str, _) = if trimmed.starts_with('"') {
+        let inner = &trimmed[1..];
+        let end = inner.find('"')?;
+        (&inner[..end], &inner[end + 1..])
+    } else if trimmed.starts_with('\'') {
+        let inner = &trimmed[1..];
+        let end = inner.find('\'')?;
+        (&inner[..end], &inner[end + 1..])
+    } else {
+        let end = trimmed.find(')')?;
+        (trimmed[..end].trim(), &trimmed[end..])
+    };
+    if url_str.is_empty() { None } else { Some(url_str.to_string()) }
+}
+
+/// Render a CSS `linear-gradient(...)` as horizontal color strips.
+fn paint_linear_gradient(
+    value: &str,
+    x: f32, y: f32, width: f32, height: f32,
+    opacity: f32,
+    ops: &mut Vec<RenderOp>,
+) {
+    // Extract the content inside linear-gradient(...).
+    let inner = if let Some(s) = value.strip_prefix("linear-gradient(") {
+        s.strip_suffix(')').unwrap_or(s)
+    } else if let Some(idx) = value.find("linear-gradient(") {
+        let after = &value[idx + "linear-gradient(".len()..];
+        after.strip_suffix(')').unwrap_or(after)
+    } else {
+        return;
+    };
+
+    // Parse color stops. Simple approach: split by comma, parse each as "color [position%]".
+    let parts: Vec<&str> = split_gradient_args(inner);
+    if parts.len() < 2 {
+        return;
+    }
+
+    // Check if first part is a direction.
+    let (is_vertical, color_parts) = if parts[0].starts_with("to ") || parts[0].ends_with("deg") {
+        let dir = parts[0].trim();
+        let horizontal = dir == "to right" || dir == "to left" || dir == "90deg" || dir == "270deg";
+        (!horizontal, &parts[1..])
+    } else {
+        (true, &parts[..]) // default: to bottom (vertical)
+    };
+
+    // Parse color stops.
+    let mut stops: Vec<(f32, Color)> = Vec::new();
+    for (i, part) in color_parts.iter().enumerate() {
+        let part = part.trim();
+        // Try to extract percentage at the end.
+        let (color_str, pct) = if let Some(pct_idx) = part.rfind('%') {
+            let before_pct = part[..pct_idx].trim();
+            // Find the last space before the percentage number.
+            if let Some(space_idx) = before_pct.rfind(' ') {
+                let num_str = &before_pct[space_idx + 1..];
+                let color = &before_pct[..space_idx].trim();
+                let p = num_str.parse::<f32>().unwrap_or(0.0) / 100.0;
+                (*color, p)
+            } else {
+                (part, i as f32 / (color_parts.len() - 1).max(1) as f32)
+            }
+        } else {
+            (part, i as f32 / (color_parts.len() - 1).max(1) as f32)
+        };
+
+        if let Some(color) = parse_color_string(color_str) {
+            stops.push((pct, color));
+        }
+    }
+
+    if stops.len() < 2 {
+        return;
+    }
+
+    // Render strips.
+    let steps = if is_vertical { height as usize } else { width as usize };
+    for step in 0..steps.max(1) {
+        let t = step as f32 / (steps - 1).max(1) as f32;
+        let color = interpolate_gradient(&stops, t);
+        let color = multiply_alpha(color, opacity);
+
+        if is_vertical {
+            ops.push(RenderOp::FillRect {
+                x, y: y + step as f32, width, height: 1.0, color,
+            });
+        } else {
+            ops.push(RenderOp::FillRect {
+                x: x + step as f32, y, width: 1.0, height, color,
+            });
+        }
+    }
+}
+
+/// Split gradient arguments respecting nested parentheses.
+fn split_gradient_args(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < s.len() {
+        parts.push(s[start..].trim());
+    }
+    parts
+}
+
+/// Interpolate between gradient color stops at position t (0.0–1.0).
+fn interpolate_gradient(stops: &[(f32, Color)], t: f32) -> Color {
+    if stops.is_empty() {
+        return Color::TRANSPARENT;
+    }
+    if t <= stops[0].0 {
+        return stops[0].1;
+    }
+    if t >= stops[stops.len() - 1].0 {
+        return stops[stops.len() - 1].1;
+    }
+    // Find the two stops that bracket t.
+    for i in 0..stops.len() - 1 {
+        let (t0, c0) = stops[i];
+        let (t1, c1) = stops[i + 1];
+        if t >= t0 && t <= t1 {
+            let range = t1 - t0;
+            let frac = if range > 0.0 { (t - t0) / range } else { 0.0 };
+            return Color::rgba(
+                c0.r + (c1.r - c0.r) * frac,
+                c0.g + (c1.g - c0.g) * frac,
+                c0.b + (c1.b - c0.b) * frac,
+                c0.a + (c1.a - c0.a) * frac,
+            );
+        }
+    }
+    stops.last().unwrap().1
 }
 
 #[cfg(test)]

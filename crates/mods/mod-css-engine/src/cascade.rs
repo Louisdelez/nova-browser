@@ -197,6 +197,10 @@ fn compute_element_style(
         });
     }
 
+    // 1b. Deprecated HTML presentational attributes (lowest precedence).
+    // These map old HTML attributes to CSS equivalents.
+    convert_presentational_attributes(attributes, &mut declarations);
+
     // 2. Stylesheet rules (sorted by specificity).
     for rule in rules {
         if rule.selector.matches(node, ancestors) {
@@ -389,6 +393,88 @@ fn style_value_to_css(val: &nova_mod_api::content::StyleValue) -> String {
         }
         StyleValue::Str(s) => s.clone(),
         StyleValue::Number(n) => format!("{n}"),
+    }
+}
+
+/// Convert deprecated HTML presentational attributes to CSS declarations.
+///
+/// Maps attributes like `bgcolor`, `color`, `align`, `width`, `height`,
+/// `border` to their CSS equivalents. These are given UserAgent origin
+/// so any real CSS rule will override them.
+fn convert_presentational_attributes(
+    attributes: &[(String, String)],
+    declarations: &mut Vec<CascadedDeclaration>,
+) {
+    for (attr, value) in attributes {
+        let (prop, css_val) = match attr.as_str() {
+            "bgcolor" => ("background-color", format_color_attr(value)),
+            "color" => ("color", format_color_attr(value)),
+            "align" => match value.to_lowercase().as_str() {
+                "center" => ("text-align", "center".into()),
+                "right" => ("text-align", "right".into()),
+                "left" => ("text-align", "left".into()),
+                _ => continue,
+            },
+            "valign" => match value.to_lowercase().as_str() {
+                "middle" => ("vertical-align", "middle".into()),
+                "bottom" => ("vertical-align", "bottom".into()),
+                "top" => ("vertical-align", "top".into()),
+                _ => continue,
+            },
+            "width" => {
+                if value.ends_with('%') {
+                    ("width", value.clone())
+                } else if let Ok(_) = value.parse::<f32>() {
+                    ("width", format!("{value}px"))
+                } else {
+                    continue;
+                }
+            }
+            "height" => {
+                if value.ends_with('%') {
+                    ("height", value.clone())
+                } else if let Ok(_) = value.parse::<f32>() {
+                    ("height", format!("{value}px"))
+                } else {
+                    continue;
+                }
+            }
+            "border" => {
+                if let Ok(n) = value.parse::<f32>() {
+                    if n > 0.0 {
+                        ("border-width", format!("{n}px"))
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+
+        declarations.push(CascadedDeclaration {
+            property: prop.into(),
+            value: css_val,
+            specificity: Specificity(0, 0, 0),
+            origin: CascadeOrigin::UserAgent,
+        });
+    }
+}
+
+/// Format a color attribute value: ensure `#` prefix for hex values.
+fn format_color_attr(value: &str) -> String {
+    let trimmed = value.trim();
+    // If it looks like a hex color without #, add it.
+    if trimmed.len() == 6
+        && trimmed.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        format!("#{trimmed}")
+    } else if trimmed.starts_with('#') || trimmed.starts_with("rgb") {
+        trimmed.to_string()
+    } else {
+        // Could be a named color.
+        trimmed.to_string()
     }
 }
 

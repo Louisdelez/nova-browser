@@ -23,8 +23,10 @@ use nova_registry::CapabilityRegistry;
 struct SubResources {
     /// External stylesheet URLs.
     stylesheets: Vec<String>,
-    /// Image URLs (from `<img src="...">` and `<picture><source>`).
-    images: Vec<String>,
+    /// Image entries: `(original_src, resolved_url)`.
+    /// The original_src is the raw HTML attribute value (used as key in the
+    /// painter's image lookup), the resolved_url is used for fetching.
+    images: Vec<(String, String)>,
     /// External script URLs.
     scripts: Vec<String>,
     /// Inline script text (from `<script>...</script>`).
@@ -98,6 +100,8 @@ impl PipelineEngine {
         let layout_tree = self.layout(&styles, viewport).await?;
 
         // Step 7: Fetch and decode images (in parallel)
+        // Images are keyed by the original src attribute (what the layout uses),
+        // but fetched via the resolved URL.
         let images = self.fetch_and_decode_images_parallel(&sub_resources.images).await;
         info!(
             "Pipeline: decoded {}/{} images",
@@ -268,17 +272,19 @@ impl PipelineEngine {
     }
 
     /// Fetch and decode images in parallel.
+    /// Input: `(original_src, resolved_url)` pairs.
+    /// Output: `(original_src, decoded_bytes)` pairs (keyed by original src for painter lookup).
     async fn fetch_and_decode_images_parallel(
         &self,
-        urls: &[String],
+        entries: &[(String, String)],
     ) -> Vec<(String, Vec<u8>)> {
-        if urls.is_empty() {
+        if entries.is_empty() {
             return vec![];
         }
 
-        let futures: Vec<_> = urls
+        let futures: Vec<_> = entries
             .iter()
-            .map(|url| self.fetch_and_decode_image_safe(url))
+            .map(|(original, resolved)| self.fetch_and_decode_image_safe(original, resolved))
             .collect();
         let results = futures::future::join_all(futures).await;
 
@@ -286,11 +292,16 @@ impl PipelineEngine {
     }
 
     /// Fetch and decode a single image, returning None on failure.
-    async fn fetch_and_decode_image_safe(&self, url: &str) -> Option<(String, Vec<u8>)> {
-        match self.fetch_and_decode_image(url).await {
-            Ok(decoded) => Some((url.to_string(), decoded)),
+    /// Returns `(original_src, decoded_bytes)`.
+    async fn fetch_and_decode_image_safe(
+        &self,
+        original_src: &str,
+        resolved_url: &str,
+    ) -> Option<(String, Vec<u8>)> {
+        match self.fetch_and_decode_image(resolved_url).await {
+            Ok(decoded) => Some((original_src.to_string(), decoded)),
             Err(e) => {
-                warn!(url = %url, error = %e, "failed to fetch/decode image, skipping");
+                warn!(url = %resolved_url, error = %e, "failed to fetch/decode image, skipping");
                 None
             }
         }
@@ -496,12 +507,12 @@ fn walk_dom_for_resources(node: &DomNode, base_url: &Option<Url>, resources: &mu
                     if let Some(srcset) = attributes.iter().find(|(k, _)| k == "srcset") {
                         if let Some(best) = pick_srcset_url(&srcset.1) {
                             let resolved = resolve_url(&best, base_url);
-                            resources.images.push(resolved);
+                            resources.images.push((best, resolved));
                         }
                     } else if let Some(src) = attributes.iter().find(|(k, _)| k == "src") {
                         if !src.1.is_empty() {
                             let resolved = resolve_url(&src.1, base_url);
-                            resources.images.push(resolved);
+                            resources.images.push((src.1.clone(), resolved));
                         }
                     }
                 }
@@ -521,7 +532,7 @@ fn walk_dom_for_resources(node: &DomNode, base_url: &Option<Url>, resources: &mu
                                 {
                                     if let Some(best) = pick_srcset_url(&srcset.1) {
                                         let resolved = resolve_url(&best, base_url);
-                                        resources.images.push(resolved);
+                                        resources.images.push((best, resolved));
                                     }
                                 }
                             }
@@ -646,7 +657,8 @@ mod tests {
         let base = Url::parse("https://example.com/page").ok();
         let res = extract_sub_resources(&dom, &base);
         assert_eq!(res.images.len(), 1);
-        assert_eq!(res.images[0], "https://example.com/logo.png");
+        assert_eq!(res.images[0].0, "/logo.png"); // original src
+        assert_eq!(res.images[0].1, "https://example.com/logo.png"); // resolved
     }
 
     #[test]
@@ -778,8 +790,8 @@ mod tests {
         let res = extract_sub_resources(&dom, &None);
         // Should extract both the <source srcset> and the <img src>.
         assert_eq!(res.images.len(), 2);
-        assert!(res.images.contains(&"photo.webp".to_string()));
-        assert!(res.images.contains(&"photo.jpg".to_string()));
+        assert!(res.images.iter().any(|(orig, _)| orig == "photo.webp"));
+        assert!(res.images.iter().any(|(orig, _)| orig == "photo.jpg"));
     }
 
     #[test]
@@ -797,6 +809,6 @@ mod tests {
         let res = extract_sub_resources(&dom, &None);
         // srcset takes precedence over src.
         assert_eq!(res.images.len(), 1);
-        assert_eq!(res.images[0], "better.webp");
+        assert_eq!(res.images[0].0, "better.webp");
     }
 }

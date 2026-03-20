@@ -281,6 +281,70 @@ fn add_node(
                     .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
             }
 
+            // Special case: <li> gets a bullet/number marker.
+            if tag == "li" {
+                // Determine bullet type from parent context.
+                let is_ordered = parent_style_props
+                    .iter()
+                    .any(|(k, v)| k == "list-style" && matches!(v, StyleValue::Keyword(s) if s == "ordered"));
+
+                let bullet = if is_ordered { "• " } else { "• " };
+
+                // Create bullet text node.
+                let bullet_ctx = NodeContext {
+                    content: LayoutContent::Text(bullet.into()),
+                    style: StyleMap {
+                        properties: vec![("font-size".into(), StyleValue::Px(parent_font_size))],
+                    },
+                };
+                let bullet_style = Style {
+                    display: Display::Flex,
+                    size: Size {
+                        width: Dimension::Length(CHAR_WIDTH_AT_16PX * 2.0 * (parent_font_size / 16.0)),
+                        height: Dimension::Length(parent_font_size * LINE_HEIGHT_FACTOR),
+                    },
+                    flex_shrink: 0.0,
+                    ..Style::DEFAULT
+                };
+                let bullet_id = taffy
+                    .new_leaf_with_context(bullet_style, bullet_ctx)
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
+
+                // Build children normally.
+                let mut child_ids = vec![bullet_id];
+                let content_children: Vec<NodeId> = children
+                    .iter()
+                    .map(|c| add_node(taffy, c, available_width - 16.0, parent_font_size, parent_style_props))
+                    .collect::<Result<Vec<_>, _>>()?;
+                child_ids.extend(content_children);
+
+                let li_style = Style {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
+                    size: Size {
+                        width: Dimension::Percent(1.0),
+                        height: Dimension::Auto,
+                    },
+                    ..Style::DEFAULT
+                };
+
+                let ctx = NodeContext {
+                    content: LayoutContent::Block,
+                    style: StyleMap {
+                        properties: vec![("display".into(), StyleValue::Keyword("list-item".into()))],
+                    },
+                };
+
+                return taffy
+                    .new_with_children(li_style, &child_ids)
+                    .map(|id| {
+                        taffy.set_node_context(id, Some(ctx)).ok();
+                        id
+                    })
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+            }
+
             // Special case: table elements get flex-based table layout.
             if is_table_element(tag) {
                 return add_table_node(taffy, tag, children, attributes, available_width, parent_font_size, parent_style_props);

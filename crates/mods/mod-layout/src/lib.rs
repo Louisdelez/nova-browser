@@ -232,6 +232,11 @@ fn add_node(
             children,
             attributes,
         } => {
+            // Special case: table elements get flex-based table layout.
+            if is_table_element(tag) {
+                return add_table_node(taffy, tag, children, attributes, available_width, parent_font_size, parent_style_props);
+            }
+
             // Special case: <img> is a replaced element with intrinsic dimensions.
             if tag == "img" {
                 let src = attributes
@@ -887,6 +892,383 @@ fn estimate_text_size(text: &str, font_size: f32, available_width: f32) -> (f32,
     (effective_width, line_count * line_height)
 }
 
+// ── Table layout (flex-based simulation) ────────────────────────────────
+
+/// Returns `true` for HTML tags that are part of table layout.
+fn is_table_element(tag: &str) -> bool {
+    matches!(
+        tag,
+        "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption" | "colgroup" | "col"
+    )
+}
+
+/// Build a Taffy node for a table-related element.
+///
+/// Maps table elements to flex layout:
+/// - `<table>` → flex column, full width
+/// - `<thead>/<tbody>/<tfoot>` → flex column (pass-through)
+/// - `<tr>` → flex row
+/// - `<td>/<th>` → flex item with `flex-grow: 1` (equal width)
+/// - `<caption>` → block element above the table
+/// - `<colgroup>/<col>` → hidden (layout hints only)
+fn add_table_node(
+    taffy: &mut TaffyTree<NodeContext>,
+    tag: &str,
+    children: &[DomNode],
+    attributes: &[(String, String)],
+    available_width: f32,
+    parent_font_size: f32,
+    parent_style_props: &[(String, StyleValue)],
+) -> Result<NodeId, NovaError> {
+    let font_size = resolve_font_size(tag, attributes, parent_font_size);
+
+    // Build style properties for this node.
+    let mut props = vec![
+        ("font-size".into(), StyleValue::Px(font_size)),
+    ];
+
+    // Parse data-nova-style if present.
+    if let Some(nova_style) = attributes.iter().find(|(k, _)| k == "data-nova-style") {
+        for decl in nova_style.1.split(';') {
+            let parts: Vec<&str> = decl.splitn(2, ':').collect();
+            if parts.len() == 2 {
+                let prop = parts[0].trim().to_string();
+                let val = parts[1].trim();
+                if prop == "font-size" {
+                    continue;
+                }
+                if let Some(px) = val.strip_suffix("px").and_then(|s| s.parse::<f32>().ok()) {
+                    props.push((prop, StyleValue::Px(px)));
+                } else if val.starts_with("rgb") || val.starts_with('#') {
+                    props.push((prop, StyleValue::Str(val.to_string())));
+                } else {
+                    props.push((prop, StyleValue::Keyword(val.to_string())));
+                }
+            }
+        }
+    }
+
+    // Parse cellpadding from <table> attributes.
+    let cellpadding = if tag == "table" {
+        attributes
+            .iter()
+            .find(|(k, _)| k == "cellpadding")
+            .and_then(|(_, v)| v.parse::<f32>().ok())
+            .unwrap_or(1.0)
+    } else {
+        0.0
+    };
+
+    // Parse cellspacing from <table> attributes.
+    let cellspacing = if tag == "table" {
+        attributes
+            .iter()
+            .find(|(k, _)| k == "cellspacing")
+            .and_then(|(_, v)| v.parse::<f32>().ok())
+            .unwrap_or(2.0)
+    } else {
+        0.0
+    };
+
+    debug!(tag = tag, children = children.len(), "table layout: processing element");
+
+    match tag {
+        "table" => {
+            // Parse table width attribute.
+            let table_width = attributes
+                .iter()
+                .find(|(k, _)| k == "width")
+                .and_then(|(_, v)| {
+                    if let Some(pct) = v.strip_suffix('%') {
+                        pct.parse::<f32>().ok().map(|p| Dimension::Percent(p / 100.0))
+                    } else {
+                        v.parse::<f32>().ok().map(Dimension::Length)
+                    }
+                })
+                .unwrap_or(Dimension::Percent(1.0));
+
+            let lp = parse_layout_props(attributes);
+
+            let child_ids = children
+                .iter()
+                .map(|c| add_node(taffy, c, available_width, font_size, &props))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let style = Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                size: Size {
+                    width: table_width,
+                    height: Dimension::Auto,
+                },
+                gap: Size {
+                    width: LengthPercentage::Length(cellspacing),
+                    height: LengthPercentage::Length(cellspacing),
+                },
+                padding: Rect {
+                    top: LengthPercentage::Length(cellspacing),
+                    right: LengthPercentage::Length(cellspacing),
+                    bottom: LengthPercentage::Length(cellspacing),
+                    left: LengthPercentage::Length(cellspacing),
+                },
+                margin: Rect {
+                    top: lp.margin_top.unwrap_or(LengthPercentageAuto::Length(0.0)),
+                    right: lp.margin_right.unwrap_or(LengthPercentageAuto::Length(0.0)),
+                    bottom: lp.margin_bottom.unwrap_or(LengthPercentageAuto::Length(0.0)),
+                    left: lp.margin_left.unwrap_or(LengthPercentageAuto::Length(0.0)),
+                },
+                ..Style::DEFAULT
+            };
+
+            props.insert(0, ("display".into(), StyleValue::Keyword("table".into())));
+            let ctx = NodeContext {
+                content: LayoutContent::Block,
+                style: StyleMap { properties: props },
+            };
+
+            taffy
+                .new_with_children(style, &child_ids)
+                .map(|id| {
+                    taffy.set_node_context(id, Some(ctx)).ok();
+                    id
+                })
+                .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))
+        }
+
+        "thead" | "tbody" | "tfoot" => {
+            // Pass-through column container.
+            let child_ids = children
+                .iter()
+                .map(|c| add_node(taffy, c, available_width, font_size, &props))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let style = Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                size: Size {
+                    width: Dimension::Percent(1.0),
+                    height: Dimension::Auto,
+                },
+                ..Style::DEFAULT
+            };
+
+            let ctx = NodeContext {
+                content: LayoutContent::Block,
+                style: StyleMap { properties: props },
+            };
+
+            taffy
+                .new_with_children(style, &child_ids)
+                .map(|id| {
+                    taffy.set_node_context(id, Some(ctx)).ok();
+                    id
+                })
+                .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))
+        }
+
+        "tr" => {
+            // Row: flex row container.
+            let child_ids = children
+                .iter()
+                .map(|c| add_node(taffy, c, available_width, font_size, &props))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // After building children, set the last non-zero-width cell
+            // to flex-grow: 1 so it fills remaining space. This simulates
+            // table column auto-sizing where the widest column expands.
+            for &child_id in child_ids.iter().rev() {
+                if let Some(ctx) = taffy.get_node_context(child_id) {
+                    if matches!(ctx.content, LayoutContent::Block) {
+                        let mut style = taffy.style(child_id).unwrap().clone();
+                        if style.flex_grow == 0.0 && style.size.width == Dimension::Auto {
+                            style.flex_grow = 1.0;
+                            taffy.set_style(child_id, style).ok();
+                        }
+                        break;
+                    }
+                }
+            }
+
+            let style = Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                flex_wrap: FlexWrap::NoWrap,
+                size: Size {
+                    width: Dimension::Percent(1.0),
+                    height: Dimension::Auto,
+                },
+                ..Style::DEFAULT
+            };
+
+            let ctx = NodeContext {
+                content: LayoutContent::Block,
+                style: StyleMap { properties: props },
+            };
+
+            taffy
+                .new_with_children(style, &child_ids)
+                .map(|id| {
+                    taffy.set_node_context(id, Some(ctx)).ok();
+                    id
+                })
+                .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))
+        }
+
+        "td" | "th" => {
+            // Cell: flex item that grows to fill available space.
+            let child_ids = children
+                .iter()
+                .map(|c| add_node(taffy, c, available_width, font_size, &props))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // Parse colspan for proportional sizing.
+            let colspan = attributes
+                .iter()
+                .find(|(k, _)| k == "colspan")
+                .and_then(|(_, v)| v.parse::<f32>().ok())
+                .unwrap_or(1.0);
+
+            // Parse explicit width on cells.
+            let cell_width = attributes
+                .iter()
+                .find(|(k, _)| k == "width")
+                .and_then(|(_, v)| {
+                    if let Some(pct) = v.strip_suffix('%') {
+                        pct.parse::<f32>().ok().map(|p| Dimension::Percent(p / 100.0))
+                    } else {
+                        v.parse::<f32>().ok().map(Dimension::Length)
+                    }
+                });
+
+            // Also check data-nova-style for width.
+            let css_width = if cell_width.is_none() {
+                parse_layout_props(attributes).width
+            } else {
+                None
+            };
+            let final_width = cell_width.or(css_width).unwrap_or(Dimension::Auto);
+
+            // Cells size to content by default (flex-grow: 0).
+            // Cells with colspan > 1 grow proportionally.
+            let has_explicit_width = cell_width.is_some() || css_width.is_some();
+            let flex_grow = if has_explicit_width {
+                0.0
+            } else if colspan > 1.0 {
+                colspan
+            } else {
+                0.0
+            };
+
+            // Parse valign attribute.
+            let valign = attributes
+                .iter()
+                .find(|(k, _)| k == "valign")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("top");
+
+            let align_items = match valign {
+                "middle" | "center" => Some(AlignItems::Center),
+                "bottom" => Some(AlignItems::FlexEnd),
+                _ => Some(AlignItems::FlexStart), // top (default)
+            };
+
+            // Determine cell padding.
+            let cell_pad = parse_layout_props(attributes);
+            let default_pad = LengthPercentage::Length(2.0);
+
+            let style = Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                flex_grow,
+                flex_shrink: 1.0,
+                flex_basis: Dimension::Auto,
+                size: Size {
+                    width: final_width,
+                    height: Dimension::Auto,
+                },
+                min_size: Size {
+                    width: Dimension::Auto,
+                    height: Dimension::Auto,
+                },
+                padding: Rect {
+                    top: cell_pad.padding_top.unwrap_or(default_pad),
+                    right: cell_pad.padding_right.unwrap_or(default_pad),
+                    bottom: cell_pad.padding_bottom.unwrap_or(default_pad),
+                    left: cell_pad.padding_left.unwrap_or(default_pad),
+                },
+                align_items,
+                ..Style::DEFAULT
+            };
+
+            // Bold text for <th>.
+            if tag == "th" {
+                props.push(("font-weight".into(), StyleValue::Keyword("bold".into())));
+            }
+
+            let ctx = NodeContext {
+                content: LayoutContent::Block,
+                style: StyleMap { properties: props },
+            };
+
+            taffy
+                .new_with_children(style, &child_ids)
+                .map(|id| {
+                    taffy.set_node_context(id, Some(ctx)).ok();
+                    id
+                })
+                .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))
+        }
+
+        "caption" => {
+            // Caption: block element displayed above the table.
+            let child_ids = children
+                .iter()
+                .map(|c| add_node(taffy, c, available_width, font_size, &props))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let style = Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                size: Size {
+                    width: Dimension::Percent(1.0),
+                    height: Dimension::Auto,
+                },
+                ..Style::DEFAULT
+            };
+
+            let ctx = NodeContext {
+                content: LayoutContent::Block,
+                style: StyleMap { properties: props },
+            };
+
+            taffy
+                .new_with_children(style, &child_ids)
+                .map(|id| {
+                    taffy.set_node_context(id, Some(ctx)).ok();
+                    id
+                })
+                .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))
+        }
+
+        // colgroup / col: invisible layout hints, not rendered.
+        _ => {
+            let ctx = NodeContext {
+                content: LayoutContent::Block,
+                style: StyleMap::default(),
+            };
+            taffy
+                .new_leaf_with_context(
+                    Style {
+                        display: Display::None,
+                        ..Style::DEFAULT
+                    },
+                    ctx,
+                )
+                .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))
+        }
+    }
+}
+
 // ── Tag-level defaults ─────────────────────────────────────────────────
 
 /// Get the default display type for a tag (simplified user-agent defaults).
@@ -894,7 +1276,10 @@ fn display_for_tag(tag: &str) -> &'static str {
     match tag {
         "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "body" | "html" | "section"
         | "article" | "header" | "footer" | "nav" | "main" | "ul" | "ol" | "li"
-        | "blockquote" | "pre" | "form" | "table" | "hr" => "block",
+        | "blockquote" | "pre" | "form" | "hr" => "block",
+        // Table elements are handled by add_table_node, but keep them as block
+        // for the display_for_tag fallback.
+        "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption" => "block",
         "span" | "a" | "em" | "strong" | "b" | "i" | "u" | "code" | "small" | "br" | "img"
         | "input" | "label" => "inline",
         "head" | "title" | "meta" | "link" | "style" | "script" => "none",
@@ -1305,6 +1690,95 @@ mod tests {
             (div.width - 400.0).abs() < 0.01,
             "div width should be 400 (50% of 800), got {}",
             div.width
+        );
+    }
+
+    #[test]
+    fn table_row_cells_side_by_side() {
+        // A table with one row and three cells: narrow, narrow, wide.
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "table".into(),
+                attributes: vec![],
+                children: vec![DomNode::Element {
+                    tag: "tbody".into(),
+                    attributes: vec![],
+                    children: vec![DomNode::Element {
+                        tag: "tr".into(),
+                        attributes: vec![],
+                        children: vec![
+                            DomNode::Element {
+                                tag: "td".into(),
+                                attributes: vec![],
+                                children: vec![DomNode::Text("1.".into())],
+                            },
+                            DomNode::Element {
+                                tag: "td".into(),
+                                attributes: vec![],
+                                children: vec![DomNode::Text("^".into())],
+                            },
+                            DomNode::Element {
+                                tag: "td".into(),
+                                attributes: vec![],
+                                children: vec![DomNode::Text(
+                                    "A long title that should take the remaining space".into(),
+                                )],
+                            },
+                        ],
+                    }],
+                }],
+            }],
+        };
+        let viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+            scale_factor: 1.0,
+        };
+        let root = compute_layout(&dom, &viewport).expect("layout should succeed");
+
+        // Dig into table > tbody > tr
+        let table = &root.children[0];
+        let tbody = &table.children[0];
+        let tr = &tbody.children[0];
+
+        assert_eq!(
+            tr.children.len(),
+            3,
+            "tr should have 3 children (cells)"
+        );
+
+        let cell1 = &tr.children[0];
+        let cell2 = &tr.children[1];
+        let cell3 = &tr.children[2];
+
+        // Cells should be side by side (increasing x positions).
+        assert!(
+            cell2.x > cell1.x,
+            "cell2.x ({}) should be > cell1.x ({})",
+            cell2.x,
+            cell1.x
+        );
+        assert!(
+            cell3.x > cell2.x,
+            "cell3.x ({}) should be > cell2.x ({})",
+            cell3.x,
+            cell2.x
+        );
+
+        // The last cell should be wider than the first two (it has more content + flex-grow).
+        assert!(
+            cell3.width > cell1.width,
+            "cell3.width ({}) should be > cell1.width ({})",
+            cell3.width,
+            cell1.width
+        );
+
+        // All cells should be on the same y position.
+        assert!(
+            (cell1.y - cell2.y).abs() < 1.0,
+            "cells should be on the same row: cell1.y={}, cell2.y={}",
+            cell1.y,
+            cell2.y
         );
     }
 }

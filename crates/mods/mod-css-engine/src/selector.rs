@@ -1,7 +1,8 @@
 //! CSS selector parsing and matching.
 //!
-//! Supports: tag, class, id, universal, descendant combinator, selector
-//! lists (comma-separated), and `:nth-child(An+B)` / `:nth-of-type(An+B)`
+//! Supports: tag, class, id, universal, descendant/child/adjacent-sibling/
+//! general-sibling combinators, attribute selectors, selector lists
+//! (comma-separated), and `:nth-child(An+B)` / `:nth-of-type(An+B)`
 //! pseudo-classes. Computes specificity for cascade ordering.
 
 use nova_mod_api::content::DomNode;
@@ -13,15 +14,32 @@ pub struct SelectorList {
     pub selectors: Vec<Selector>,
 }
 
+/// Combinator between two compound selectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Combinator {
+    /// Whitespace — matches any descendant.
+    Descendant,
+    /// `>` — matches only a direct child.
+    Child,
+    /// `+` — matches the immediately following sibling element.
+    Adjacent,
+    /// `~` — matches any following sibling element.
+    General,
+}
+
 /// A single CSS selector (a sequence of simple selectors with combinators).
 ///
 /// Stored as a list of compound selectors with the relationship between each
-/// pair (currently only descendant combinator is supported).
+/// pair tracked in `combinators`.
 #[derive(Debug, Clone)]
 pub struct Selector {
     /// Compound selectors from outermost (leftmost) to innermost (rightmost).
     /// e.g., `div .foo p` => [CompoundSelector(div), CompoundSelector(.foo), CompoundSelector(p)]
     pub parts: Vec<CompoundSelector>,
+    /// Combinators between consecutive parts. `combinators[i]` is the
+    /// relationship between `parts[i]` and `parts[i+1]`.
+    /// Length is always `parts.len() - 1` (or 0 when parts is empty).
+    pub combinators: Vec<Combinator>,
     /// Optional pseudo-element (`::before`, `::after`) attached to this selector.
     pub pseudo_element: Option<PseudoElement>,
 }
@@ -40,6 +58,32 @@ pub struct CompoundSelector {
     pub universal: bool,
     /// Pseudo-classes attached to this compound selector.
     pub pseudos: Vec<PseudoClass>,
+    /// Attribute selectors (e.g. `[href]`, `[type="text"]`).
+    pub attributes: Vec<AttributeSelector>,
+}
+
+/// An attribute selector such as `[href]` or `[type="text"]`.
+#[derive(Debug, Clone)]
+pub struct AttributeSelector {
+    /// Attribute name.
+    pub name: String,
+    /// Matching operation.
+    pub op: AttributeOp,
+}
+
+/// The kind of attribute match.
+#[derive(Debug, Clone)]
+pub enum AttributeOp {
+    /// `[attr]` — attribute must exist.
+    Exists,
+    /// `[attr=val]` — attribute value must equal.
+    Equals(String),
+    /// `[attr^=val]` — attribute value must start with.
+    StartsWith(String),
+    /// `[attr$=val]` — attribute value must end with.
+    EndsWith(String),
+    /// `[attr*=val]` — attribute value must contain.
+    Contains(String),
 }
 
 /// A CSS pseudo-class.
@@ -235,20 +279,65 @@ impl Selector {
             input
         };
 
-        // Split by whitespace for descendant combinator.
+        // Tokenize into compound-selector strings and combinator characters.
+        // We split by whitespace, then detect `>`, `+`, `~` as combinator
+        // tokens.  We also handle cases where combinators are glued to
+        // selectors (e.g. `div>p`).
         let tokens: Vec<&str> = selector_str.split_whitespace().collect();
-        let mut parts = Vec::new();
+        let mut parts: Vec<CompoundSelector> = Vec::new();
+        let mut combinators: Vec<Combinator> = Vec::new();
+        // pending_combinator: the combinator to use before the next compound selector.
+        let mut pending_combinator: Option<Combinator> = None;
 
-        for token in tokens {
-            if let Some(compound) = CompoundSelector::parse(token) {
-                parts.push(compound);
+        for token in &tokens {
+            match *token {
+                ">" => {
+                    pending_combinator = Some(Combinator::Child);
+                    continue;
+                }
+                "+" => {
+                    pending_combinator = Some(Combinator::Adjacent);
+                    continue;
+                }
+                "~" => {
+                    pending_combinator = Some(Combinator::General);
+                    continue;
+                }
+                _ => {}
+            }
+
+            // The token may contain glued combinators, e.g. `div>p`, `a+b`,
+            // `h1~h2`, or even `div>p+span`.  We split on `>`, `+`, `~`
+            // while preserving the combinator character.
+            let sub_parts = split_token_on_combinators(token);
+            for (fragment, comb_after) in &sub_parts {
+                if fragment.is_empty() {
+                    // This can happen for leading combinator, e.g. `>p` at start.
+                    // Just record the combinator.
+                    if let Some(c) = comb_after {
+                        pending_combinator = Some(*c);
+                    }
+                    continue;
+                }
+                if let Some(compound) = CompoundSelector::parse(fragment) {
+                    if !parts.is_empty() {
+                        // Record combinator between previous part and this one.
+                        combinators.push(pending_combinator.unwrap_or(Combinator::Descendant));
+                        pending_combinator = None;
+                    }
+                    parts.push(compound);
+                }
+                // If there's a combinator after this fragment, store it for next.
+                if let Some(c) = comb_after {
+                    pending_combinator = Some(*c);
+                }
             }
         }
 
         if parts.is_empty() {
             None
         } else {
-            Some(Selector { parts, pseudo_element })
+            Some(Selector { parts, combinators, pseudo_element })
         }
     }
 
@@ -261,6 +350,7 @@ impl Selector {
     fn without_pseudo_element(&self) -> Selector {
         Selector {
             parts: self.parts.clone(),
+            combinators: self.combinators.clone(),
             pseudo_element: None,
         }
     }
@@ -276,6 +366,10 @@ impl Selector {
     }
 
     /// Check if this selector matches the given element.
+    ///
+    /// `ancestors` is the chain from root to parent (not including the node).
+    /// `siblings` provides sibling context for the *target* node (rightmost
+    /// compound) so that sibling combinators and pseudo-classes can be evaluated.
     fn matches(
         &self,
         node: &DomNode,
@@ -297,26 +391,126 @@ impl Selector {
             return true;
         }
 
-        // Walk the remaining parts right-to-left against ancestors (descendant combinator).
-        // Each part must match some ancestor, and we go from inner to outer.
-        // Ancestor parts don't get sibling context (we don't have that info).
-        let mut part_idx = self.parts.len() - 2; // Start from second-to-last
-        let mut ancestor_idx = ancestors.len(); // Start from direct parent
+        // Walk the remaining parts right-to-left.
+        // `current_node` is the node that just matched `parts[part_idx + 1]`.
+        // `current_siblings` is the sibling context for `current_node`.
+        // `current_ancestors` is the ancestor slice for `current_node`.
+        self.match_remaining(
+            self.parts.len() - 2,
+            ancestors,
+            siblings,
+        )
+    }
 
-        loop {
-            if ancestor_idx == 0 {
-                // No more ancestors to check; if we haven't matched all parts, fail.
-                return false;
-            }
-            ancestor_idx -= 1;
+    /// Recursively match `parts[0..=part_idx]` against the context.
+    ///
+    /// `ancestors` is the ancestor chain for the node that matched `parts[part_idx + 1]`.
+    /// `siblings` is the sibling context for that same node.
+    fn match_remaining(
+        &self,
+        part_idx: usize,
+        ancestors: &[&DomNode],
+        siblings: Option<SiblingContext<'_>>,
+    ) -> bool {
+        let compound = &self.parts[part_idx];
+        let combinator = self.combinators[part_idx]; // combinator between part_idx and part_idx+1
 
-            if self.parts[part_idx].matches(ancestors[ancestor_idx], None) {
-                if part_idx == 0 {
-                    return true; // All parts matched.
+        match combinator {
+            Combinator::Descendant => {
+                // Check any ancestor (from innermost outward).
+                let mut anc_idx = ancestors.len();
+                while anc_idx > 0 {
+                    anc_idx -= 1;
+                    if compound.matches(ancestors[anc_idx], None) {
+                        if part_idx == 0 {
+                            return true;
+                        }
+                        // Continue matching further parts against the remaining ancestors.
+                        if self.match_remaining(
+                            part_idx - 1,
+                            &ancestors[..anc_idx],
+                            None, // we don't have sibling context for ancestors
+                        ) {
+                            return true;
+                        }
+                        // If that didn't work, keep trying further ancestors.
+                    }
                 }
-                part_idx -= 1;
+                false
             }
-            // Otherwise, keep looking at further ancestors (descendant, not child).
+            Combinator::Child => {
+                // Must match the immediate parent (last ancestor).
+                if ancestors.is_empty() {
+                    return false;
+                }
+                let parent = ancestors[ancestors.len() - 1];
+                if !compound.matches(parent, None) {
+                    return false;
+                }
+                if part_idx == 0 {
+                    return true;
+                }
+                self.match_remaining(
+                    part_idx - 1,
+                    &ancestors[..ancestors.len() - 1],
+                    None,
+                )
+            }
+            Combinator::Adjacent => {
+                // Must match the immediately preceding sibling element.
+                let ctx = match siblings {
+                    Some(ctx) => ctx,
+                    None => return false,
+                };
+                // Find the immediately preceding element sibling.
+                if let Some((prev_idx, prev_node)) = preceding_element_sibling(ctx.siblings, ctx.index) {
+                    if compound.matches(prev_node, None) {
+                        if part_idx == 0 {
+                            return true;
+                        }
+                        // The preceding sibling shares the same parent/ancestors.
+                        let prev_sib_ctx = SiblingContext {
+                            siblings: ctx.siblings,
+                            index: prev_idx,
+                        };
+                        return self.match_remaining(
+                            part_idx - 1,
+                            ancestors,
+                            Some(prev_sib_ctx),
+                        );
+                    }
+                }
+                false
+            }
+            Combinator::General => {
+                // Must match any preceding sibling element.
+                let ctx = match siblings {
+                    Some(ctx) => ctx,
+                    None => return false,
+                };
+                // Iterate all preceding element siblings.
+                for i in (0..ctx.index).rev() {
+                    if matches!(ctx.siblings[i], DomNode::Element { .. }) {
+                        if compound.matches(&ctx.siblings[i], None) {
+                            if part_idx == 0 {
+                                return true;
+                            }
+                            let prev_sib_ctx = SiblingContext {
+                                siblings: ctx.siblings,
+                                index: i,
+                            };
+                            if self.match_remaining(
+                                part_idx - 1,
+                                ancestors,
+                                Some(prev_sib_ctx),
+                            ) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
         }
     }
 
@@ -332,6 +526,8 @@ impl Selector {
             b += part.classes.len() as u32;
             // Pseudo-classes count as class-level specificity.
             b += part.pseudos.len() as u32;
+            // Attribute selectors count as class-level specificity.
+            b += part.attributes.len() as u32;
             if part.tag.is_some() {
                 c += 1;
             }
@@ -381,6 +577,27 @@ impl CompoundSelector {
                     current.clear();
                     current_type = Some(ch);
                     chars.next();
+                }
+                '[' => {
+                    // Flush any pending simple selector part first.
+                    flush(&mut sel, current_type, &current);
+                    current.clear();
+                    current_type = None;
+                    chars.next(); // consume '['
+
+                    // Read everything until ']'.
+                    let mut attr_content = String::new();
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if c == ']' {
+                            break;
+                        }
+                        attr_content.push(c);
+                    }
+
+                    if let Some(attr_sel) = AttributeSelector::parse(&attr_content) {
+                        sel.attributes.push(attr_sel);
+                    }
                 }
                 ':' => {
                     // Flush any pending simple selector part first.
@@ -451,8 +668,12 @@ impl CompoundSelector {
         }
         flush(&mut sel, current_type, &current);
 
-        // If nothing was set (no tag, id, classes, or pseudos), treat as invalid.
-        if sel.tag.is_none() && sel.id.is_none() && sel.classes.is_empty() && sel.pseudos.is_empty()
+        // If nothing was set (no tag, id, classes, pseudos, or attributes), treat as invalid.
+        if sel.tag.is_none()
+            && sel.id.is_none()
+            && sel.classes.is_empty()
+            && sel.pseudos.is_empty()
+            && sel.attributes.is_empty()
         {
             return None;
         }
@@ -510,6 +731,13 @@ impl CompoundSelector {
                         if !actual_classes.contains(&cls.as_str()) {
                             return false;
                         }
+                    }
+                }
+
+                // Check attribute selectors.
+                for attr_sel in &self.attributes {
+                    if !attr_sel.matches(attributes) {
+                        return false;
                     }
                 }
 
@@ -604,6 +832,128 @@ fn is_last_element(siblings: &[DomNode], index: usize) -> bool {
         }
     }
     true
+}
+
+/// Find the immediately preceding element sibling (skipping text/comment nodes).
+///
+/// Returns `(index, &DomNode)` of the preceding element, or `None`.
+fn preceding_element_sibling(siblings: &[DomNode], index: usize) -> Option<(usize, &DomNode)> {
+    for i in (0..index).rev() {
+        if matches!(siblings[i], DomNode::Element { .. }) {
+            return Some((i, &siblings[i]));
+        }
+    }
+    None
+}
+
+/// Split a single token on combinator characters (`>`, `+`, `~`) that are
+/// glued to selectors (e.g. `div>p` -> `[("div", Some(Child)), ("p", None)]`).
+///
+/// Parenthesized and bracketed content is preserved as-is (e.g. `:nth-child(2n+1)`
+/// won't split on the `+`).
+///
+/// Returns a vec of `(fragment, combinator_after)` pairs.
+fn split_token_on_combinators(token: &str) -> Vec<(String, Option<Combinator>)> {
+    let mut results: Vec<(String, Option<Combinator>)> = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0u32;
+    let mut bracket_depth = 0u32;
+
+    for ch in token.chars() {
+        match ch {
+            '(' => { paren_depth += 1; current.push(ch); }
+            ')' => { paren_depth = paren_depth.saturating_sub(1); current.push(ch); }
+            '[' => { bracket_depth += 1; current.push(ch); }
+            ']' => { bracket_depth = bracket_depth.saturating_sub(1); current.push(ch); }
+            '>' | '+' | '~' if paren_depth == 0 && bracket_depth == 0 => {
+                let comb = match ch {
+                    '>' => Combinator::Child,
+                    '+' => Combinator::Adjacent,
+                    '~' => Combinator::General,
+                    _ => unreachable!(),
+                };
+                results.push((std::mem::take(&mut current), Some(comb)));
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+    // Push the trailing fragment (no combinator after it).
+    results.push((current, None));
+    results
+}
+
+impl AttributeSelector {
+    /// Parse the content inside `[...]`.
+    ///
+    /// Supports: `attr`, `attr=val`, `attr^=val`, `attr$=val`, `attr*=val`.
+    /// Values may be unquoted, single-quoted, or double-quoted.
+    fn parse(input: &str) -> Option<Self> {
+        let s = input.trim();
+        if s.is_empty() {
+            return None;
+        }
+
+        // Try to find an operator.
+        // Order matters: check two-char operators first.
+        let (name, op) = if let Some(pos) = s.find("^=") {
+            let val = unquote(s[pos + 2..].trim());
+            (s[..pos].trim(), AttributeOp::StartsWith(val))
+        } else if let Some(pos) = s.find("$=") {
+            let val = unquote(s[pos + 2..].trim());
+            (s[..pos].trim(), AttributeOp::EndsWith(val))
+        } else if let Some(pos) = s.find("*=") {
+            let val = unquote(s[pos + 2..].trim());
+            (s[..pos].trim(), AttributeOp::Contains(val))
+        } else if let Some(pos) = s.find('=') {
+            let val = unquote(s[pos + 1..].trim());
+            (s[..pos].trim(), AttributeOp::Equals(val))
+        } else {
+            (s, AttributeOp::Exists)
+        };
+
+        if name.is_empty() {
+            return None;
+        }
+
+        Some(AttributeSelector {
+            name: name.to_ascii_lowercase(),
+            op,
+        })
+    }
+
+    /// Check if this attribute selector matches the given attributes list.
+    fn matches(&self, attributes: &[(String, String)]) -> bool {
+        let value = attributes
+            .iter()
+            .find(|(k, _)| k.to_ascii_lowercase() == self.name)
+            .map(|(_, v)| v.as_str());
+
+        match &self.op {
+            AttributeOp::Exists => value.is_some(),
+            AttributeOp::Equals(expected) => value == Some(expected.as_str()),
+            AttributeOp::StartsWith(prefix) => {
+                value.is_some_and(|v| v.starts_with(prefix.as_str()))
+            }
+            AttributeOp::EndsWith(suffix) => {
+                value.is_some_and(|v| v.ends_with(suffix.as_str()))
+            }
+            AttributeOp::Contains(needle) => {
+                value.is_some_and(|v| v.contains(needle.as_str()))
+            }
+        }
+    }
+}
+
+/// Strip surrounding quotes (single or double) from a value string.
+fn unquote(s: &str) -> String {
+    let s = s.trim();
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1037,5 +1387,267 @@ mod tests {
         let sel = SelectorList::parse("a:hover").unwrap();
         let node = elem("a", &[]);
         assert!(sel.matches(&node, &[], None));
+    }
+
+    // ── Child combinator tests ──
+
+    #[test]
+    fn child_combinator_direct_child() {
+        // `div > p` should match p whose immediate parent is div.
+        let sel = SelectorList::parse("div > p").unwrap();
+        let div = elem("div", &[]);
+        let p = elem("p", &[]);
+        assert!(sel.matches(&p, &[&div], None));
+    }
+
+    #[test]
+    fn child_combinator_not_grandchild() {
+        // `div > p` should NOT match p whose parent is span, grandparent is div.
+        let sel = SelectorList::parse("div > p").unwrap();
+        let div = elem("div", &[]);
+        let span = elem("span", &[]);
+        let p = elem("p", &[]);
+        assert!(!sel.matches(&p, &[&div, &span], None));
+    }
+
+    #[test]
+    fn child_combinator_no_spaces() {
+        // `div>p` (no spaces) should also work.
+        let sel = SelectorList::parse("div>p").unwrap();
+        let div = elem("div", &[]);
+        let p = elem("p", &[]);
+        assert!(sel.matches(&p, &[&div], None));
+    }
+
+    #[test]
+    fn descendant_still_matches_grandchild() {
+        // `div p` (descendant) should match p as a grandchild of div.
+        let sel = SelectorList::parse("div p").unwrap();
+        let div = elem("div", &[]);
+        let span = elem("span", &[]);
+        let p = elem("p", &[]);
+        assert!(sel.matches(&p, &[&div, &span], None));
+    }
+
+    // ── Adjacent sibling combinator tests ──
+
+    #[test]
+    fn adjacent_sibling_matches_immediately_following() {
+        // `div + p` matches p immediately after a div sibling.
+        let sel = SelectorList::parse("div + p").unwrap();
+        let siblings = make_siblings(&["div", "p", "span"]);
+        let ctx = SiblingContext {
+            siblings: &siblings,
+            index: 1, // the p
+        };
+        assert!(sel.matches(&siblings[1], &[], Some(ctx)));
+    }
+
+    #[test]
+    fn adjacent_sibling_not_non_adjacent() {
+        // `div + p` should NOT match p if there's a span between div and p.
+        let sel = SelectorList::parse("div + p").unwrap();
+        let siblings = make_siblings(&["div", "span", "p"]);
+        let ctx = SiblingContext {
+            siblings: &siblings,
+            index: 2, // the p
+        };
+        assert!(!sel.matches(&siblings[2], &[], Some(ctx)));
+    }
+
+    #[test]
+    fn adjacent_sibling_no_spaces() {
+        // `div+p` (no spaces) should also work.
+        let sel = SelectorList::parse("div+p").unwrap();
+        let siblings = make_siblings(&["div", "p"]);
+        let ctx = SiblingContext {
+            siblings: &siblings,
+            index: 1,
+        };
+        assert!(sel.matches(&siblings[1], &[], Some(ctx)));
+    }
+
+    #[test]
+    fn adjacent_sibling_first_element_no_match() {
+        // `div + p` should not match if p is the first element.
+        let sel = SelectorList::parse("div + p").unwrap();
+        let siblings = make_siblings(&["p", "div"]);
+        let ctx = SiblingContext {
+            siblings: &siblings,
+            index: 0,
+        };
+        assert!(!sel.matches(&siblings[0], &[], Some(ctx)));
+    }
+
+    // ── General sibling combinator tests ──
+
+    #[test]
+    fn general_sibling_matches_any_preceding() {
+        // `div ~ p` matches p that has any preceding div sibling.
+        let sel = SelectorList::parse("div ~ p").unwrap();
+        let siblings = make_siblings(&["div", "span", "p"]);
+        let ctx = SiblingContext {
+            siblings: &siblings,
+            index: 2, // the p
+        };
+        assert!(sel.matches(&siblings[2], &[], Some(ctx)));
+    }
+
+    #[test]
+    fn general_sibling_matches_immediately_adjacent_too() {
+        // `div ~ p` should also match if div is immediately before p.
+        let sel = SelectorList::parse("div ~ p").unwrap();
+        let siblings = make_siblings(&["div", "p"]);
+        let ctx = SiblingContext {
+            siblings: &siblings,
+            index: 1,
+        };
+        assert!(sel.matches(&siblings[1], &[], Some(ctx)));
+    }
+
+    #[test]
+    fn general_sibling_not_following() {
+        // `div ~ p` should NOT match if div comes AFTER p.
+        let sel = SelectorList::parse("div ~ p").unwrap();
+        let siblings = make_siblings(&["p", "div"]);
+        let ctx = SiblingContext {
+            siblings: &siblings,
+            index: 0,
+        };
+        assert!(!sel.matches(&siblings[0], &[], Some(ctx)));
+    }
+
+    #[test]
+    fn general_sibling_no_spaces() {
+        // `div~p` (no spaces).
+        let sel = SelectorList::parse("div~p").unwrap();
+        let siblings = make_siblings(&["div", "span", "p"]);
+        let ctx = SiblingContext {
+            siblings: &siblings,
+            index: 2,
+        };
+        assert!(sel.matches(&siblings[2], &[], Some(ctx)));
+    }
+
+    // ── Attribute selector tests ──
+
+    #[test]
+    fn attribute_exists() {
+        // `a[href]` matches <a href="...">.
+        let sel = SelectorList::parse("a[href]").unwrap();
+        let node = elem("a", &[("href", "https://example.com")]);
+        assert!(sel.matches(&node, &[], None));
+    }
+
+    #[test]
+    fn attribute_exists_no_match() {
+        // `a[href]` does NOT match <a> without href.
+        let sel = SelectorList::parse("a[href]").unwrap();
+        let node = elem("a", &[]);
+        assert!(!sel.matches(&node, &[], None));
+    }
+
+    #[test]
+    fn attribute_equals() {
+        // `[type="text"]` matches input with type=text.
+        let sel = SelectorList::parse("[type=\"text\"]").unwrap();
+        let node = elem("input", &[("type", "text")]);
+        assert!(sel.matches(&node, &[], None));
+    }
+
+    #[test]
+    fn attribute_equals_no_match() {
+        let sel = SelectorList::parse("[type=\"text\"]").unwrap();
+        let node = elem("input", &[("type", "password")]);
+        assert!(!sel.matches(&node, &[], None));
+    }
+
+    #[test]
+    fn attribute_starts_with() {
+        let sel = SelectorList::parse("[href^=\"https\"]").unwrap();
+        let node = elem("a", &[("href", "https://example.com")]);
+        assert!(sel.matches(&node, &[], None));
+
+        let node2 = elem("a", &[("href", "http://example.com")]);
+        assert!(!sel.matches(&node2, &[], None));
+    }
+
+    #[test]
+    fn attribute_ends_with() {
+        let sel = SelectorList::parse("[src$=\".png\"]").unwrap();
+        let node = elem("img", &[("src", "photo.png")]);
+        assert!(sel.matches(&node, &[], None));
+
+        let node2 = elem("img", &[("src", "photo.jpg")]);
+        assert!(!sel.matches(&node2, &[], None));
+    }
+
+    #[test]
+    fn attribute_contains() {
+        let sel = SelectorList::parse("[class*=\"btn\"]").unwrap();
+        let node = elem("div", &[("class", "my-btn-primary")]);
+        assert!(sel.matches(&node, &[], None));
+
+        let node2 = elem("div", &[("class", "link")]);
+        assert!(!sel.matches(&node2, &[], None));
+    }
+
+    #[test]
+    fn attribute_selector_with_tag() {
+        // `input[type="text"]` combines tag + attribute.
+        let sel = SelectorList::parse("input[type=\"text\"]").unwrap();
+        let input = elem("input", &[("type", "text")]);
+        assert!(sel.matches(&input, &[], None));
+
+        // Wrong tag should not match.
+        let div = elem("div", &[("type", "text")]);
+        assert!(!sel.matches(&div, &[], None));
+    }
+
+    #[test]
+    fn attribute_specificity() {
+        // [type="text"] counts as class-level specificity (0, 1, 0).
+        let sel = SelectorList::parse("[type=\"text\"]").unwrap();
+        assert_eq!(sel.specificity(), Specificity(0, 1, 0));
+
+        // input[type="text"] = (0, 1, 1).
+        let sel2 = SelectorList::parse("input[type=\"text\"]").unwrap();
+        assert_eq!(sel2.specificity(), Specificity(0, 1, 1));
+    }
+
+    // ── Mixed combinator tests ──
+
+    #[test]
+    fn child_and_descendant_combined() {
+        // `div > ul li` — ul must be direct child of div, li is descendant of ul.
+        let sel = SelectorList::parse("div > ul li").unwrap();
+        let div = elem("div", &[]);
+        let ul = elem("ul", &[]);
+        let li = elem("li", &[]);
+        // ancestors for li: [div, ul]
+        assert!(sel.matches(&li, &[&div, &ul], None));
+    }
+
+    #[test]
+    fn combinator_parsing_preserves_order() {
+        let sel = SelectorList::parse("a > b + c ~ d").unwrap();
+        assert_eq!(sel.selectors[0].parts.len(), 4);
+        assert_eq!(sel.selectors[0].combinators.len(), 3);
+        assert_eq!(sel.selectors[0].combinators[0], Combinator::Child);
+        assert_eq!(sel.selectors[0].combinators[1], Combinator::Adjacent);
+        assert_eq!(sel.selectors[0].combinators[2], Combinator::General);
+    }
+
+    #[test]
+    fn nth_child_with_plus_not_confused_with_combinator() {
+        // `:nth-child(2n+1)` — the `+` inside parens must NOT be treated as a combinator.
+        let sel = SelectorList::parse("li:nth-child(2n+1)").unwrap();
+        assert_eq!(sel.selectors[0].parts.len(), 1);
+        let compound = &sel.selectors[0].parts[0];
+        assert_eq!(compound.tag, Some("li".into()));
+        match &compound.pseudos[0] {
+            PseudoClass::NthChild(f) => assert_eq!(*f, NthFormula { a: 2, b: 1 }),
+            _ => panic!("Expected NthChild"),
+        }
     }
 }

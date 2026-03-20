@@ -849,38 +849,125 @@ fn flatten_node_recursive(
 ) {
     match node {
         DomNode::Text(text) => {
-            let words: Vec<&str> = text.split_whitespace().collect();
             let space_width = (font_size * 0.25).max(1.0);
-            for (i, word) in words.iter().enumerate() {
-                if i > 0 {
-                    items.push(InlineItem::Space {
-                        width: space_width,
-                        style: style_props.to_vec(),
-                    });
+
+            // Check white-space property to decide how to split text.
+            let white_space = style_props.iter()
+                .find(|(k, _)| k == "white-space")
+                .and_then(|(_, v)| match v {
+                    StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("normal");
+
+            match white_space {
+                "pre" | "pre-wrap" => {
+                    // Preserve whitespace: split by newlines, then keep spaces.
+                    for (line_idx, line) in text.split('\n').enumerate() {
+                        if line_idx > 0 {
+                            // Force line break.
+                            items.push(InlineItem::Word {
+                                text: "\n".to_string(),
+                                width: 0.0,
+                                style: style_props.to_vec(),
+                            });
+                        }
+                        for ch in line.chars() {
+                            if ch == ' ' || ch == '\t' {
+                                items.push(InlineItem::Space {
+                                    width: if ch == '\t' { space_width * 4.0 } else { space_width },
+                                    style: style_props.to_vec(),
+                                });
+                            } else {
+                                // Accumulate non-space characters into words.
+                                let should_append = if let Some(InlineItem::Word { text: t, .. }) = items.last() {
+                                    !t.is_empty() && t != "\n"
+                                } else { false };
+                                if should_append {
+                                    if let Some(InlineItem::Word { text: t, width: w, .. }) = items.last_mut() {
+                                        t.push(ch);
+                                        *w = measure_text_width(t, font_size);
+                                        continue;
+                                    }
+                                }
+                                let s = ch.to_string();
+                                let w = measure_text_width(&s, font_size);
+                                items.push(InlineItem::Word {
+                                    text: s,
+                                    width: w,
+                                    style: style_props.to_vec(),
+                                });
+                            }
+                        }
+                    }
                 }
-                let w = measure_text_width(word, font_size);
-                items.push(InlineItem::Word {
-                    text: word.to_string(),
-                    width: w,
-                    style: style_props.to_vec(),
-                });
-            }
-            // If text starts with whitespace and we already have items, add a leading space.
-            if !items.is_empty() && text.starts_with(char::is_whitespace) && !words.is_empty() {
-                // The space was already handled above (first word has no leading space
-                // but the run continues from a previous item). We need to insert a space
-                // before the first word of this text if there were preceding items.
-                if let Some(InlineItem::Word { .. }) = items.get(items.len().saturating_sub(words.len() + 1)) {
-                    // Already have items before; insert space before first word of this text.
-                    let pos = items.len() - words.len();
-                    if pos > 0 {
-                        // Check if there's already a space.
-                        if !matches!(items.get(pos - 1), Some(InlineItem::Space { .. })) {
-                            items.insert(pos, InlineItem::Space {
+                "nowrap" => {
+                    // Collapse whitespace but don't allow wrapping — just put everything
+                    // in one run. The line-breaker won't break these since they're words.
+                    let words: Vec<&str> = text.split_whitespace().collect();
+                    for (i, word) in words.iter().enumerate() {
+                        if i > 0 {
+                            items.push(InlineItem::Space {
                                 width: space_width,
                                 style: style_props.to_vec(),
                             });
                         }
+                        let w = measure_text_width(word, font_size);
+                        items.push(InlineItem::Word {
+                            text: word.to_string(),
+                            width: w,
+                            style: style_props.to_vec(),
+                        });
+                    }
+                }
+                "pre-line" => {
+                    // Collapse spaces but preserve newlines.
+                    for (line_idx, line) in text.split('\n').enumerate() {
+                        if line_idx > 0 {
+                            items.push(InlineItem::Word {
+                                text: "\n".to_string(),
+                                width: 0.0,
+                                style: style_props.to_vec(),
+                            });
+                        }
+                        let words: Vec<&str> = line.split_whitespace().collect();
+                        for (i, word) in words.iter().enumerate() {
+                            if i > 0 {
+                                items.push(InlineItem::Space {
+                                    width: space_width,
+                                    style: style_props.to_vec(),
+                                });
+                            }
+                            let w = measure_text_width(word, font_size);
+                            items.push(InlineItem::Word {
+                                text: word.to_string(),
+                                width: w,
+                                style: style_props.to_vec(),
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    // "normal": collapse whitespace, allow wrapping.
+                    let had_items = !items.is_empty();
+                    let starts_with_space = text.starts_with(char::is_whitespace);
+                    let words: Vec<&str> = text.split_whitespace().collect();
+                    for (i, word) in words.iter().enumerate() {
+                        if i > 0 || (i == 0 && had_items && starts_with_space) {
+                            // Add space between words, or leading space if continuing from previous items.
+                            if !matches!(items.last(), Some(InlineItem::Space { .. })) {
+                                items.push(InlineItem::Space {
+                                    width: space_width,
+                                    style: style_props.to_vec(),
+                                });
+                            }
+                        }
+                        let w = measure_text_width(word, font_size);
+                        items.push(InlineItem::Word {
+                            text: word.to_string(),
+                            width: w,
+                            style: style_props.to_vec(),
+                        });
                     }
                 }
             }
@@ -1093,6 +1180,19 @@ fn layout_inline_run(
         }
 
         // Create the line box container (flex-row, items aligned to baseline).
+        // Apply text-align from parent style.
+        let justify = match parent_style_props.iter()
+            .find(|(k, _)| k == "text-align")
+            .and_then(|(_, v)| match v {
+                StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.as_str()),
+                _ => None,
+            }) {
+            Some("center") => Some(JustifyContent::Center),
+            Some("right") | Some("end") => Some(JustifyContent::FlexEnd),
+            Some("justify") => Some(JustifyContent::SpaceBetween),
+            _ => None, // left / default
+        };
+
         let line_ctx = NodeContext {
             content: LayoutContent::Inline,
             style: StyleMap::default(),
@@ -1103,6 +1203,7 @@ fn layout_inline_run(
                     display: Display::Flex,
                     flex_direction: FlexDirection::Row,
                     align_items: Some(AlignItems::Baseline),
+                    justify_content: justify,
                     size: Size {
                         width: Dimension::Percent(1.0),
                         height: Dimension::Auto,

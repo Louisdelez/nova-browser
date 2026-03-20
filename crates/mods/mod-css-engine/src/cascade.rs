@@ -2029,6 +2029,39 @@ mod pseudo_element_injection_tests {
         }
     }
 
+    fn make_dom(html_body: Vec<DomNode>) -> DomNode {
+        DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "html".into(),
+                attributes: vec![],
+                children: vec![DomNode::Element {
+                    tag: "body".into(),
+                    attributes: vec![],
+                    children: html_body,
+                }],
+            }],
+        }
+    }
+
+    fn find_tag<'a>(node: &'a DomNode, target: &str) -> Option<&'a DomNode> {
+        match node {
+            DomNode::Element { tag, children, .. } => {
+                if tag == target { return Some(node); }
+                for child in children {
+                    if let Some(found) = find_tag(child, target) { return Some(found); }
+                }
+                None
+            }
+            DomNode::Document { children } => {
+                for child in children {
+                    if let Some(found) = find_tag(child, target) { return Some(found); }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     #[test]
     fn link_gets_blue_color_from_ua_defaults() {
         // An <a> element should get color: #0000ee from UA defaults.
@@ -2046,27 +2079,7 @@ mod pseudo_element_injection_tests {
         }]);
 
         let result = compute_styles(dom, &[], 1280.0);
-
-        fn find_a(node: &DomNode) -> Option<&DomNode> {
-            match node {
-                DomNode::Element { tag, children, .. } => {
-                    if tag == "a" { return Some(node); }
-                    for child in children {
-                        if let Some(found) = find_a(child) { return Some(found); }
-                    }
-                    None
-                }
-                DomNode::Document { children } => {
-                    for child in children {
-                        if let Some(found) = find_a(child) { return Some(found); }
-                    }
-                    None
-                }
-                _ => None,
-            }
-        }
-
-        let a = find_a(&result).expect("should find <a>");
+        let a = find_tag(&result, "a").expect("should find <a>");
         let style = a.attr("data-nova-style").expect("a should have data-nova-style");
         assert!(
             style.contains("color: #0000ee"),
@@ -2100,27 +2113,7 @@ mod pseudo_element_injection_tests {
         ]);
 
         let result = compute_styles(dom, &[], 1280.0);
-
-        fn find_a(node: &DomNode) -> Option<&DomNode> {
-            match node {
-                DomNode::Element { tag, children, .. } => {
-                    if tag == "a" { return Some(node); }
-                    for child in children {
-                        if let Some(found) = find_a(child) { return Some(found); }
-                    }
-                    None
-                }
-                DomNode::Document { children } => {
-                    for child in children {
-                        if let Some(found) = find_a(child) { return Some(found); }
-                    }
-                    None
-                }
-                _ => None,
-            }
-        }
-
-        let a = find_a(&result).expect("should find <a>");
+        let a = find_tag(&result, "a").expect("should find <a>");
         let style = a.attr("data-nova-style").expect("a should have data-nova-style");
         assert!(
             style.contains("color: #0000ee"),

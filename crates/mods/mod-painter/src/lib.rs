@@ -577,28 +577,110 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
             if has_text_overflow_ellipsis(&layout_box.style) && layout_box.width > 0.0 {
                 transformed_text = truncate_with_ellipsis(&transformed_text, font_size, layout_box.width);
             }
-            ops.push(RenderOp::DrawText {
-                x: layout_box.x,
-                y: layout_box.y + font_size, // baseline offset
-                text: transformed_text.clone(),
-                font_size,
-                color: text_color,
-                font_weight,
-                font_style,
-                font_family,
-                letter_spacing,
-            });
 
-            // Draw underline if text-decoration: underline is set.
-            if has_text_decoration_underline(&layout_box.style) {
-                let underline_y = layout_box.y + font_size + 2.0;
-                ops.push(RenderOp::FillRect {
+            // Check for multi-style segment data from the layout engine.
+            // Only use segments if text-transform didn't change the byte
+            // length (uppercase/lowercase can shift offsets for non-ASCII).
+            let has_transform = transformed_text.len() != text.len();
+            let segments_str = if has_transform {
+                None
+            } else {
+                layout_box.style.properties.iter()
+                    .find(|(k, _)| k == "nova-text-segments")
+                    .and_then(|(_, v)| if let StyleValue::Str(s) = v { Some(s.clone()) } else { None })
+            };
+
+            if let Some(seg_str) = segments_str {
+                // Multi-style merged node: emit one DrawText per segment
+                // with the correct color, weight, and x-offset.
+                for seg in seg_str.split(';') {
+                    let parts: Vec<&str> = seg.split(':').collect();
+                    if parts.len() >= 6 {
+                        let start: usize = parts[0].parse().unwrap_or(0);
+                        let end: usize = parts[1].parse().unwrap_or(0);
+                        let x_off: f32 = parts[2].parse().unwrap_or(0.0);
+                        let seg_color_str = parts[3];
+                        let seg_weight_str = parts[4];
+                        let seg_texdec = parts[5];
+
+                        if start < end && end <= transformed_text.len() {
+                            let seg_text = &transformed_text[start..end];
+                            let seg_color = if !seg_color_str.is_empty() {
+                                let c = parse_color_string(seg_color_str).unwrap_or(text_color);
+                                let c = multiply_alpha(c, opacity);
+                                if let Some(ref f) = css_filter { apply_filter_to_color(c, f) } else { c }
+                            } else {
+                                text_color
+                            };
+                            let seg_weight = if !seg_weight_str.is_empty() {
+                                match seg_weight_str {
+                                    "bold" => Some(700u16),
+                                    "bolder" => Some(700),
+                                    "lighter" => Some(300),
+                                    "normal" => Some(400),
+                                    _ => seg_weight_str.parse::<u16>().ok().or(font_weight),
+                                }
+                            } else {
+                                font_weight
+                            };
+
+                            ops.push(RenderOp::DrawText {
+                                x: layout_box.x + x_off,
+                                y: layout_box.y + font_size,
+                                text: seg_text.to_string(),
+                                font_size,
+                                color: seg_color,
+                                font_weight: seg_weight,
+                                font_style: font_style.clone(),
+                                font_family: font_family.clone(),
+                                letter_spacing,
+                            });
+
+                            // Per-segment underline.
+                            if seg_texdec.contains("underline") {
+                                let seg_width = if end < transformed_text.len() {
+                                    // Width = next segment's x_off - this x_off.
+                                    // We approximate with estimate_text_width for the segment.
+                                    estimate_text_width(seg_text, font_size)
+                                } else {
+                                    layout_box.width - x_off
+                                };
+                                ops.push(RenderOp::FillRect {
+                                    x: layout_box.x + x_off,
+                                    y: layout_box.y + font_size + 2.0,
+                                    width: seg_width,
+                                    height: 1.0,
+                                    color: seg_color,
+                                });
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Single-style text node: emit one DrawText as before.
+                ops.push(RenderOp::DrawText {
                     x: layout_box.x,
-                    y: underline_y,
-                    width: layout_box.width,
-                    height: 1.0,
+                    y: layout_box.y + font_size, // baseline offset
+                    text: transformed_text.clone(),
+                    font_size,
                     color: text_color,
+                    font_weight,
+                    font_style,
+                    font_family,
+                    letter_spacing,
                 });
+
+                // Draw underline if text-decoration: underline is set.
+                if has_text_decoration_underline(&layout_box.style) {
+                    let underline_y = layout_box.y + font_size + 2.0;
+                    ops.push(RenderOp::FillRect {
+                        x: layout_box.x,
+                        y: underline_y,
+                        width: layout_box.width,
+                        height: 1.0,
+                        color: text_color,
+                    });
+                }
             }
         }
     }

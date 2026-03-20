@@ -179,6 +179,9 @@ pub struct BrowserWindow {
     /// When `true`, the window requests periodic redraws (~60 fps) for animations.
     /// Set this to `true` when the page contains CSS animations or transitions.
     needs_animation: bool,
+    /// Instant when the last page load completed. Used to drive a 2-second
+    /// animation window after navigation (e.g. fade-in, smooth scrollbar).
+    page_load_time: Option<std::time::Instant>,
 }
 
 impl BrowserWindow {
@@ -235,6 +238,7 @@ impl BrowserWindow {
             tokio_handle,
             viewport,
             needs_animation: false,
+            page_load_time: None,
         }
     }
 
@@ -970,6 +974,10 @@ impl BrowserWindow {
                     w.set_title(&format!("NOVA - {}", self.url_bar_text));
                 }
 
+                // Start a 2-second animation window for fade-in / smooth rendering.
+                self.page_load_time = Some(std::time::Instant::now());
+                self.needs_animation = true;
+
                 self.request_redraw();
             }
             Ok(_) => {
@@ -1029,6 +1037,21 @@ impl ApplicationHandler for BrowserWindow {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
+                // Expire the animation window after 2 seconds.
+                if let Some(load_time) = self.page_load_time {
+                    if load_time.elapsed().as_secs_f32() > 2.0 {
+                        self.needs_animation = false;
+                        self.page_load_time = None;
+                    }
+                }
+
+                // During animation, rebuild the framebuffer each frame so that
+                // time-varying effects (scrollbar fade, future opacity
+                // interpolation) are visible.
+                if self.needs_animation {
+                    self.rebuild_framebuffer();
+                }
+
                 self.render_frame();
 
                 // If animation mode is active, schedule the next frame at ~60 fps.

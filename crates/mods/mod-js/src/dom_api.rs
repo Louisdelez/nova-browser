@@ -141,6 +141,10 @@ pub struct JsDomTree {
     /// After script execution the caller can check this field to determine
     /// whether the script requested a navigation.
     pub navigation_url: Option<String>,
+    /// Whether the `DOMContentLoaded` event has already been fired for this
+    /// tree.  Prevents re-dispatching when `eval_script_with_env` is called
+    /// recursively (e.g. from inside a DOMContentLoaded callback).
+    pub dcl_fired: bool,
 }
 
 impl JsDomTree {
@@ -153,6 +157,7 @@ impl JsDomTree {
             listeners: HashMap::new(),
             pending_events: Vec::new(),
             navigation_url: None,
+            dcl_fired: false,
         };
 
         // Reserve handle 0 for the document root.
@@ -882,6 +887,35 @@ pub fn eval_script_with_env(
 
         // Evaluate and update last value.
         last_value = eval_statement(line, &mut env, Arc::clone(&tree));
+    }
+
+    // Dispatch DOMContentLoaded event.
+    // After all scripts are evaluated, fire any callbacks that were registered
+    // via `document.addEventListener('DOMContentLoaded', callback)`.
+    // The document root is handle 0, which is where `document.addEventListener`
+    // stores its listeners.  The `dcl_fired` flag prevents infinite recursion
+    // when a DOMContentLoaded callback itself triggers `eval_script_with_env`.
+    let dcl_callbacks = {
+        let mut t = tree.lock().unwrap();
+        if t.dcl_fired {
+            vec![]
+        } else {
+            t.dcl_fired = true;
+            t.dispatch_event(0, "DOMContentLoaded")
+        }
+    };
+    for (cb_source, captured_env) in dcl_callbacks {
+        debug!(len = cb_source.len(), "executing DOMContentLoaded callback");
+        // Merge the captured env with the current env so the callback can
+        // reference variables from both the registration scope and the
+        // current script scope.
+        let mut merged_env: Vec<(String, ElementHandle)> = captured_env;
+        for (k, v) in &env {
+            if !merged_env.iter().any(|(mk, _)| mk == k) {
+                merged_env.push((k.clone(), *v));
+            }
+        }
+        last_value = eval_script_with_env(&cb_source, Arc::clone(&tree), &merged_env);
     }
 
     last_value
@@ -1998,12 +2032,13 @@ mod tests {
     }
 
     #[test]
-    fn document_addeventlistener_noop() {
+    fn document_addeventlistener_registers_and_fires() {
         let dom = make_simple_dom();
         let tree = JsDomTree::from_dom(&dom);
 
         // `document` is pre-seeded as handle 0 (root), so addEventListener
-        // should store a listener on the root without crashing.
+        // stores a listener on the root.  DOMContentLoaded fires after
+        // script evaluation completes.
         let script = r#"
             document.addEventListener("DOMContentLoaded", function() {
                 console.log("loaded");
@@ -2229,5 +2264,105 @@ mod tests {
         assert_eq!(super::camel_to_kebab("fontSize"), "font-size");
         assert_eq!(super::camel_to_kebab("display"), "display");
         assert_eq!(super::camel_to_kebab("borderTopWidth"), "border-top-width");
+    }
+
+    // ── DOMContentLoaded tests ──────────────────────────────────────────────
+
+    #[test]
+    fn dom_content_loaded_fires_after_script() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        // Register a DOMContentLoaded listener that mutates the DOM.
+        // It should fire automatically after script evaluation.
+        let script = r#"
+            var el = document.getElementById("main");
+            document.addEventListener("DOMContentLoaded", function() {
+                el.setAttribute("data-ready", "true");
+            });
+        "#;
+        eval_script(script, Arc::clone(&tree));
+
+        let t = tree.lock().unwrap();
+        let handle = t.get_element_by_id("main").unwrap();
+        assert_eq!(
+            t.get_attribute(handle, "data-ready"),
+            Some("true".into()),
+            "DOMContentLoaded callback should have set data-ready attribute"
+        );
+    }
+
+    #[test]
+    fn dom_content_loaded_fires_only_once() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        // First script registers a DOMContentLoaded listener.
+        let script1 = r#"
+            var el = document.getElementById("main");
+            document.addEventListener("DOMContentLoaded", function() {
+                el.textContent = "loaded";
+            });
+        "#;
+        eval_script(script1, Arc::clone(&tree));
+
+        // Verify it fired.
+        {
+            let t = tree.lock().unwrap();
+            let handle = t.get_element_by_id("main").unwrap();
+            assert_eq!(t.get_text_content(handle), "loaded");
+        }
+
+        // Second call to eval_script should NOT fire DOMContentLoaded again
+        // (dcl_fired flag is set).
+        {
+            let mut t = tree.lock().unwrap();
+            let handle = t.get_element_by_id("main").unwrap();
+            t.set_text_content(handle, "reset");
+        }
+
+        let script2 = r#"
+            // This script does nothing, but DOMContentLoaded should not re-fire.
+        "#;
+        eval_script_with_env(script2, Arc::clone(&tree), &[]);
+
+        let t = tree.lock().unwrap();
+        let handle = t.get_element_by_id("main").unwrap();
+        assert_eq!(
+            t.get_text_content(handle),
+            "reset",
+            "DOMContentLoaded should not fire a second time"
+        );
+    }
+
+    #[test]
+    fn dom_content_loaded_multiple_listeners() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        // Register two DOMContentLoaded listeners.
+        let script = r#"
+            var el = document.getElementById("main");
+            document.addEventListener("DOMContentLoaded", function() {
+                el.setAttribute("data-first", "yes");
+            });
+            document.addEventListener("DOMContentLoaded", function() {
+                el.setAttribute("data-second", "yes");
+            });
+        "#;
+        eval_script(script, Arc::clone(&tree));
+
+        let t = tree.lock().unwrap();
+        let handle = t.get_element_by_id("main").unwrap();
+        assert_eq!(
+            t.get_attribute(handle, "data-first"),
+            Some("yes".into()),
+            "first DOMContentLoaded callback should have fired"
+        );
+        assert_eq!(
+            t.get_attribute(handle, "data-second"),
+            Some("yes".into()),
+            "second DOMContentLoaded callback should have fired"
+        );
     }
 }

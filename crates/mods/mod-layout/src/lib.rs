@@ -1588,35 +1588,34 @@ fn layout_inline_run(
         let mut item_ids = Vec::new();
         let mut max_height = line_height;
 
-        // Merge runs of text items with compatible styles.
+        // Merge ALL consecutive text/space items on a line into ONE
+        // Taffy node, regardless of style differences.  This eliminates
+        // measurement drift between separately-positioned text nodes.
+        // Style information for each segment is encoded in a custom
+        // `nova-text-segments` property so the painter can emit
+        // per-segment DrawText ops with the correct colors/weights.
         let mut i = 0;
         while i < line.len() {
             match &line[i] {
                 InlineItem::Word { style, .. } | InlineItem::Space { style, .. } => {
-                    // Collect a run of consecutive Word/Space items with the same
-                    // font size, color, weight, style, and family.
-                    let run_style = style.clone();
+                    let first_style = style.clone();
                     let mut run_text = String::new();
-                    let mut run_width: f32 = 0.0;
                     let mut j = i;
+                    // Collect (byte_start, byte_end, style) for each segment.
+                    let mut segments: Vec<(usize, usize, Vec<(String, StyleValue)>)> = Vec::new();
+
                     while j < line.len() {
                         match &line[j] {
-                            InlineItem::Word { text, width, style: s } => {
-                                if styles_compatible_for_merge(&run_style, s) {
-                                    run_text.push_str(text);
-                                    run_width += width;
-                                    j += 1;
-                                } else {
-                                    break;
-                                }
+                            InlineItem::Word { text, style: s, .. } => {
+                                let start = run_text.len();
+                                run_text.push_str(text);
+                                segments.push((start, run_text.len(), s.clone()));
+                                j += 1;
                             }
-                            InlineItem::Space { width, .. } => {
-                                // Spaces always merge into the current run,
-                                // regardless of their inherited style. This
-                                // ensures inter-element spacing ("points by")
-                                // is included in the text run.
+                            InlineItem::Space { style: s, .. } => {
+                                let start = run_text.len();
                                 run_text.push(' ');
-                                run_width += width;
+                                segments.push((start, run_text.len(), s.clone()));
                                 j += 1;
                             }
                             InlineItem::Image { .. } => break,
@@ -1624,32 +1623,70 @@ fn layout_inline_run(
                     }
 
                     if !run_text.is_empty() {
-                        let fs = run_style.iter()
+                        let fs = first_style.iter()
                             .find(|(k, _)| k == "font-size")
                             .and_then(|(_, v)| if let StyleValue::Px(px) = v { Some(*px) } else { None })
                             .unwrap_or(parent_font_size);
-                        let lh = resolve_line_height(&run_style, fs);
+                        let lh = resolve_line_height(&first_style, fs);
                         max_height = max_height.max(lh);
 
-                        // If the next item is a Word with a different style
-                        // (i.e. a style break), and our run doesn't already
-                        // end with a space, append a trailing space.  This
-                        // ensures visible separation between adjacent styled
-                        // runs like "<span>points</span> by <a>user</a>".
-                        if !run_text.ends_with(' ') && j < line.len() {
-                            if let InlineItem::Word { .. } = &line[j] {
-                                run_text.push(' ');
+                        let is_bold = style_is_bold(&first_style);
+                        let measured_width = measure_text_width_with_weight(&run_text, fs, is_bold);
+
+                        // Build segment data with pre-computed x-offsets so
+                        // the painter doesn't need its own font metrics.
+                        // Format: "start:end:xoff:color:weight:texdec"
+                        let mut segment_data = Vec::new();
+                        let mut all_same_style = true;
+                        for (idx, (start, end, seg_style)) in segments.iter().enumerate() {
+                            // Compute x-offset = width of run_text[..start].
+                            let x_off = if *start == 0 {
+                                0.0
+                            } else {
+                                measure_text_width_with_weight(&run_text[..*start], fs, is_bold)
+                            };
+                            let color = seg_style.iter()
+                                .find(|(k, _)| k == "color")
+                                .map(|(_, v)| match v {
+                                    StyleValue::Str(s) | StyleValue::Keyword(s) => s.clone(),
+                                    StyleValue::Color(c) => format!("#{:02x}{:02x}{:02x}{:02x}", c.r, c.g, c.b, (c.a * 255.0) as u8),
+                                    _ => String::new(),
+                                })
+                                .unwrap_or_default();
+                            let weight = seg_style.iter()
+                                .find(|(k, _)| k == "font-weight")
+                                .map(|(_, v)| match v {
+                                    StyleValue::Keyword(s) | StyleValue::Str(s) => s.clone(),
+                                    StyleValue::Number(n) => format!("{n}"),
+                                    _ => String::new(),
+                                })
+                                .unwrap_or_default();
+                            let texdec = seg_style.iter()
+                                .find(|(k, _)| k == "text-decoration")
+                                .map(|(_, v)| match v {
+                                    StyleValue::Keyword(s) | StyleValue::Str(s) => s.clone(),
+                                    _ => String::new(),
+                                })
+                                .unwrap_or_default();
+                            segment_data.push(format!("{start}:{end}:{x_off}:{color}:{weight}:{texdec}"));
+                            // Check if this segment differs from the first.
+                            if idx > 0 && all_same_style {
+                                if !styles_compatible_for_merge(&first_style, seg_style) {
+                                    all_same_style = false;
+                                }
                             }
                         }
 
-                        // Measure the combined string for accurate width,
-                        // accounting for synthetic bold widening in the renderer.
-                        let is_bold = style_is_bold(&run_style);
-                        let measured_width = measure_text_width_with_weight(&run_text, fs, is_bold);
+                        let mut props = first_style;
+                        // Only attach segment data when styles actually differ;
+                        // single-style lines skip the overhead.
+                        if !all_same_style && !segment_data.is_empty() {
+                            props.push(("nova-text-segments".into(), StyleValue::Str(segment_data.join(";"))));
+                        }
 
                         let ctx = NodeContext {
                             content: LayoutContent::Text(run_text),
-                            style: StyleMap { properties: run_style },
+                            style: StyleMap { properties: props },
                         };
                         let id = taffy
                             .new_leaf_with_context(

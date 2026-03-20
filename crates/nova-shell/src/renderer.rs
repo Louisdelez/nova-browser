@@ -106,6 +106,17 @@ impl FontRenderer {
             "Font renderer initialized with variants"
         );
 
+        // Debug: verify proportional metrics — 'i' should be much narrower than 'm'.
+        {
+            let (mi, _) = regular.rasterize('i', 16.0);
+            let (mm, _) = regular.rasterize('m', 16.0);
+            tracing::info!(
+                i_advance = mi.advance_width,
+                m_advance = mm.advance_width,
+                "Font metrics at 16px: 'i' vs 'm' advance widths (proportional check)"
+            );
+        }
+
         Some(Self {
             regular,
             bold,

@@ -548,10 +548,19 @@ fn add_node(
                 }
             }
 
-            let child_ids = children
-                .iter()
-                .map(|c| add_node(taffy, c, available_width, font_size, &props))
-                .collect::<Result<Vec<_>, _>>()?;
+            // ── Inline Formatting Context ──────────────────────────
+            // For block containers, group consecutive inline children
+            // into inline formatting contexts so they flow together,
+            // wrap across lines, and share baselines.
+            // Only apply IFC for block containers (not flex, grid, or table).
+            let child_ids = if display == "block" {
+                build_children_with_ifc(taffy, children, available_width, font_size, &props)?
+            } else {
+                children
+                    .iter()
+                    .map(|c| add_node(taffy, c, available_width, font_size, &props))
+                    .collect::<Result<Vec<_>, _>>()?
+            };
             let taffy_style = build_taffy_style(&display, tag, attributes);
 
             let content_type = match display.as_str() {
@@ -739,6 +748,401 @@ fn add_node(
     }
 }
 
+// ── Inline Formatting Context (IFC) ────────────────────────────────────
+//
+// When a block container has inline children (text, <span>, <a>, <em>, etc.),
+// they must flow together in an inline formatting context. Instead of each
+// child becoming an independent flex item, consecutive inline children are
+// collected into "inline runs", flattened into a sequence of inline items
+// (words, spaces, inline element boundaries), then broken into line boxes.
+//
+// This is the core of correct text layout in a browser.
+
+/// An item in the flattened inline sequence.
+#[derive(Debug, Clone)]
+enum InlineItem {
+    /// A word of text with its measured width.
+    Word {
+        text: String,
+        width: f32,
+        style: Vec<(String, StyleValue)>,
+    },
+    /// A space between words.
+    Space { width: f32, style: Vec<(String, StyleValue)> },
+    /// An inline image.
+    Image { src: String, width: f32, height: f32 },
+}
+
+/// Check if a DOM node is inline (text, inline element, or <br>).
+fn is_inline_node(node: &DomNode) -> bool {
+    match node {
+        DomNode::Text(_) => true,
+        DomNode::Comment(_) => true,
+        DomNode::Element { tag, attributes, .. } => {
+            let display = resolve_display(tag, attributes);
+            matches!(display.as_str(), "inline" | "inline-block")
+                || tag == "br" || tag == "img"
+        }
+        _ => false,
+    }
+}
+
+/// Build child Taffy nodes for a block container, using inline formatting
+/// contexts for runs of consecutive inline children.
+///
+/// Block children are processed normally via `add_node`. Consecutive inline
+/// children are grouped and laid out together using `layout_inline_run`.
+fn build_children_with_ifc(
+    taffy: &mut TaffyTree<NodeContext>,
+    children: &[DomNode],
+    available_width: f32,
+    parent_font_size: f32,
+    parent_style_props: &[(String, StyleValue)],
+) -> Result<Vec<NodeId>, NovaError> {
+    let mut result = Vec::new();
+
+    // Partition children into inline runs and block items.
+    let mut i = 0;
+    while i < children.len() {
+        if is_inline_node(&children[i]) {
+            // Collect consecutive inline children.
+            let start = i;
+            while i < children.len() && is_inline_node(&children[i]) {
+                i += 1;
+            }
+            let inline_run = &children[start..i];
+            // Flatten the inline run and create line boxes.
+            let line_ids = layout_inline_run(
+                taffy, inline_run, available_width, parent_font_size, parent_style_props,
+            )?;
+            result.extend(line_ids);
+        } else {
+            // Block child — process normally.
+            let node_id = add_node(taffy, &children[i], available_width, parent_font_size, parent_style_props)?;
+            result.push(node_id);
+            i += 1;
+        }
+    }
+
+    Ok(result)
+}
+
+/// Flatten an inline run (consecutive inline children) into InlineItems.
+fn flatten_inline_content(
+    nodes: &[DomNode],
+    font_size: f32,
+    parent_style_props: &[(String, StyleValue)],
+) -> Vec<InlineItem> {
+    let mut items = Vec::new();
+    for node in nodes {
+        flatten_node_recursive(node, font_size, parent_style_props, &mut items);
+    }
+    items
+}
+
+/// Recursively flatten a single DOM node into inline items.
+fn flatten_node_recursive(
+    node: &DomNode,
+    font_size: f32,
+    style_props: &[(String, StyleValue)],
+    items: &mut Vec<InlineItem>,
+) {
+    match node {
+        DomNode::Text(text) => {
+            let words: Vec<&str> = text.split_whitespace().collect();
+            let space_width = (font_size * 0.25).max(1.0);
+            for (i, word) in words.iter().enumerate() {
+                if i > 0 {
+                    items.push(InlineItem::Space {
+                        width: space_width,
+                        style: style_props.to_vec(),
+                    });
+                }
+                let w = measure_text_width(word, font_size);
+                items.push(InlineItem::Word {
+                    text: word.to_string(),
+                    width: w,
+                    style: style_props.to_vec(),
+                });
+            }
+            // If text starts with whitespace and we already have items, add a leading space.
+            if !items.is_empty() && text.starts_with(char::is_whitespace) && !words.is_empty() {
+                // The space was already handled above (first word has no leading space
+                // but the run continues from a previous item). We need to insert a space
+                // before the first word of this text if there were preceding items.
+                if let Some(InlineItem::Word { .. }) = items.get(items.len().saturating_sub(words.len() + 1)) {
+                    // Already have items before; insert space before first word of this text.
+                    let pos = items.len() - words.len();
+                    if pos > 0 {
+                        // Check if there's already a space.
+                        if !matches!(items.get(pos - 1), Some(InlineItem::Space { .. })) {
+                            items.insert(pos, InlineItem::Space {
+                                width: space_width,
+                                style: style_props.to_vec(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        DomNode::Element { tag, children, attributes, .. } => {
+            if tag == "br" {
+                // Line break: insert a special zero-width "word" that forces a break.
+                // We'll handle this during line-breaking.
+                items.push(InlineItem::Word {
+                    text: "\n".to_string(),
+                    width: 0.0,
+                    style: style_props.to_vec(),
+                });
+                return;
+            }
+            if tag == "img" {
+                let src = attributes.iter().find(|(k,_)| k == "src").map(|(_, v)| v.clone()).unwrap_or_default();
+                let w: f32 = attributes.iter().find(|(k,_)| k == "width").and_then(|(_, v)| v.parse().ok()).unwrap_or(150.0);
+                let h: f32 = attributes.iter().find(|(k,_)| k == "height").and_then(|(_, v)| v.parse().ok()).unwrap_or(80.0);
+                items.push(InlineItem::Image { src, width: w, height: h });
+                return;
+            }
+
+            // Inherit style from this inline element.
+            let child_font_size = resolve_font_size(tag, attributes, font_size);
+            let mut child_props: Vec<(String, StyleValue)> = style_props.to_vec();
+
+            // Apply this element's computed styles.
+            if let Some(nova_style) = attributes.iter().find(|(k, _)| k == "data-nova-style") {
+                for decl in nova_style.1.split(';') {
+                    let parts: Vec<&str> = decl.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        let prop = parts[0].trim().to_string();
+                        let val = parts[1].trim();
+                        if prop == "font-size" {
+                            if let Some(px) = val.strip_suffix("px").and_then(|s| s.parse::<f32>().ok()) {
+                                if let Some(existing) = child_props.iter_mut().find(|(k, _)| k == "font-size") {
+                                    existing.1 = StyleValue::Px(px);
+                                }
+                            }
+                        } else if let Some(px) = val.strip_suffix("px").and_then(|s| s.parse::<f32>().ok()) {
+                            child_props.push((prop, StyleValue::Px(px)));
+                        } else if val.starts_with("rgb") || val.starts_with('#') {
+                            child_props.push((prop, StyleValue::Str(val.to_string())));
+                        } else {
+                            child_props.push((prop, StyleValue::Keyword(val.to_string())));
+                        }
+                    }
+                }
+            }
+
+            // Propagate href for links.
+            if tag == "a" {
+                if let Some(href) = attributes.iter().find(|(k, _)| k == "href") {
+                    child_props.push(("href".into(), StyleValue::Str(href.1.clone())));
+                }
+            }
+
+            // Recurse into children with this element's styles.
+            for child in children {
+                flatten_node_recursive(child, child_font_size, &child_props, items);
+            }
+        }
+        DomNode::Comment(_) | DomNode::Document { .. } => {}
+    }
+}
+
+/// Layout a run of inline items into line boxes.
+///
+/// Returns Taffy node IDs for each line box (flex-row containers).
+fn layout_inline_run(
+    taffy: &mut TaffyTree<NodeContext>,
+    inline_nodes: &[DomNode],
+    available_width: f32,
+    parent_font_size: f32,
+    parent_style_props: &[(String, StyleValue)],
+) -> Result<Vec<NodeId>, NovaError> {
+    // 1. Flatten all inline content into items.
+    let items = flatten_inline_content(inline_nodes, parent_font_size, parent_style_props);
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let line_height = parent_font_size * LINE_HEIGHT_FACTOR;
+
+    // 2. Break items into lines.
+    let mut lines: Vec<Vec<&InlineItem>> = Vec::new();
+    let mut current_line: Vec<&InlineItem> = Vec::new();
+    let mut current_width: f32 = 0.0;
+
+    for item in &items {
+        match item {
+            InlineItem::Word { text, width, .. } => {
+                if text == "\n" {
+                    // Forced line break (<br>).
+                    lines.push(std::mem::take(&mut current_line));
+                    current_width = 0.0;
+                    continue;
+                }
+                // Check if this word fits on the current line.
+                if current_width + *width > available_width && current_width > 0.0 {
+                    // Wrap to new line.
+                    // Remove trailing space from current line.
+                    if let Some(InlineItem::Space { .. }) = current_line.last() {
+                        current_line.pop();
+                    }
+                    lines.push(std::mem::take(&mut current_line));
+                    current_width = 0.0;
+                }
+                current_line.push(item);
+                current_width += *width;
+            }
+            InlineItem::Space { width, .. } => {
+                if !current_line.is_empty() {
+                    current_line.push(item);
+                    current_width += *width;
+                }
+            }
+            InlineItem::Image { width, .. } => {
+                if current_width + *width > available_width && current_width > 0.0 {
+                    lines.push(std::mem::take(&mut current_line));
+                    current_width = 0.0;
+                }
+                current_line.push(item);
+                current_width += *width;
+            }
+        }
+    }
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+
+    // 3. Create Taffy nodes for each line box.
+    let mut line_box_ids = Vec::new();
+    for line in &lines {
+        let mut item_ids = Vec::new();
+        let mut max_height = line_height;
+
+        for &item in line {
+            match item {
+                InlineItem::Word { text, width, style } => {
+                    let fs = style.iter()
+                        .find(|(k, _)| k == "font-size")
+                        .and_then(|(_, v)| if let StyleValue::Px(px) = v { Some(*px) } else { None })
+                        .unwrap_or(parent_font_size);
+                    let lh = fs * LINE_HEIGHT_FACTOR;
+                    max_height = max_height.max(lh);
+
+                    let ctx = NodeContext {
+                        content: LayoutContent::Text(text.clone()),
+                        style: StyleMap { properties: style.clone() },
+                    };
+                    let id = taffy
+                        .new_leaf_with_context(
+                            Style {
+                                display: Display::Flex,
+                                size: Size {
+                                    width: Dimension::Length(*width),
+                                    height: Dimension::Length(lh),
+                                },
+                                ..Style::DEFAULT
+                            },
+                            ctx,
+                        )
+                        .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
+                    item_ids.push(id);
+                }
+                InlineItem::Space { width, style } => {
+                    let ctx = NodeContext {
+                        content: LayoutContent::Text(" ".to_string()),
+                        style: StyleMap { properties: style.clone() },
+                    };
+                    let id = taffy
+                        .new_leaf_with_context(
+                            Style {
+                                display: Display::Flex,
+                                size: Size {
+                                    width: Dimension::Length(*width),
+                                    height: Dimension::Length(line_height),
+                                },
+                                ..Style::DEFAULT
+                            },
+                            ctx,
+                        )
+                        .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
+                    item_ids.push(id);
+                }
+                InlineItem::Image { src, width, height } => {
+                    max_height = max_height.max(*height);
+                    let ctx = NodeContext {
+                        content: LayoutContent::Image { src: src.clone() },
+                        style: StyleMap::default(),
+                    };
+                    let id = taffy
+                        .new_leaf_with_context(
+                            Style {
+                                display: Display::Flex,
+                                size: Size {
+                                    width: Dimension::Length(*width),
+                                    height: Dimension::Length(*height),
+                                },
+                                ..Style::DEFAULT
+                            },
+                            ctx,
+                        )
+                        .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
+                    item_ids.push(id);
+                }
+            }
+        }
+
+        // Create the line box container (flex-row, items aligned to baseline).
+        let line_ctx = NodeContext {
+            content: LayoutContent::Inline,
+            style: StyleMap::default(),
+        };
+        let line_id = taffy
+            .new_with_children(
+                Style {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    align_items: Some(AlignItems::Baseline),
+                    size: Size {
+                        width: Dimension::Percent(1.0),
+                        height: Dimension::Auto,
+                    },
+                    ..Style::DEFAULT
+                },
+                &item_ids,
+            )
+            .map(|id| {
+                taffy.set_node_context(id, Some(line_ctx)).ok();
+                id
+            })
+            .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
+
+        line_box_ids.push(line_id);
+    }
+
+    Ok(line_box_ids)
+}
+
+// ── Box model helpers ──────────────────────────────────────────────────
+
+/// Parse `box-sizing` from attributes, defaulting to `content-box`.
+fn resolve_box_sizing(attributes: &[(String, String)]) -> &'static str {
+    for attr_name in &["data-nova-style", "style"] {
+        if let Some(style_attr) = attributes.iter().find(|(k, _)| k == *attr_name) {
+            for decl in style_attr.1.split(';') {
+                let parts: Vec<&str> = decl.splitn(2, ':').collect();
+                if parts.len() == 2 && parts[0].trim() == "box-sizing" {
+                    let val = parts[1].trim();
+                    if val == "border-box" {
+                        return "border-box";
+                    }
+                }
+            }
+        }
+    }
+    "content-box"
+}
+
 // ── Reading Taffy results back into LayoutBox ──────────────────────────
 
 /// Recursively read computed layout from Taffy and build the `LayoutBox` tree.
@@ -816,7 +1220,13 @@ struct LayoutProps {
     padding_bottom: Option<LengthPercentage>,
     padding_left: Option<LengthPercentage>,
     width: Option<Dimension>,
+    min_width: Option<Dimension>,
     max_width: Option<Dimension>,
+    height: Option<Dimension>,
+    min_height: Option<Dimension>,
+    max_height: Option<Dimension>,
+    /// CSS `box-sizing`: "content-box" or "border-box".
+    box_sizing: Option<String>,
     /// CSS `position` property: "static" | "relative" | "absolute" | "fixed" | "sticky"
     position: Option<String>,
     /// CSS `top` inset.
@@ -1179,7 +1589,12 @@ fn parse_layout_props(attributes: &[(String, String)]) -> LayoutProps {
                 "padding-left" => props.padding_left = parse_length_percentage(val),
 
                 "width" => props.width = parse_dimension(val),
+                "min-width" => props.min_width = parse_dimension(val),
                 "max-width" => props.max_width = parse_dimension(val),
+                "height" => props.height = parse_dimension(val),
+                "min-height" => props.min_height = parse_dimension(val),
+                "max-height" => props.max_height = parse_dimension(val),
+                "box-sizing" => props.box_sizing = Some(val.to_string()),
 
                 "position" => props.position = Some(val.to_string()),
                 "top" => props.top = parse_length_percentage_auto(val),
@@ -1592,11 +2007,15 @@ fn build_taffy_style(
                 flex_shrink: float_flex_shrink,
                 size: Size {
                     width: default_width,
-                    height: Dimension::Auto,
+                    height: lp.height.unwrap_or(Dimension::Auto),
+                },
+                min_size: Size {
+                    width: lp.min_width.unwrap_or(Dimension::Auto),
+                    height: lp.min_height.unwrap_or(Dimension::Auto),
                 },
                 max_size: Size {
                     width: lp.max_width.unwrap_or(Dimension::Auto),
-                    height: Dimension::Auto,
+                    height: lp.max_height.unwrap_or(Dimension::Auto),
                 },
                 margin: float_margin,
                 padding,

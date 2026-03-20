@@ -232,6 +232,38 @@ fn add_node(
             children,
             attributes,
         } => {
+            // Special case: <center> centers its children horizontally.
+            if tag == "center" {
+                let child_ids = children
+                    .iter()
+                    .map(|c| add_node(taffy, c, available_width, parent_font_size, parent_style_props))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let style = Style {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Column,
+                    align_items: Some(AlignItems::Center),
+                    size: Size {
+                        width: Dimension::Percent(1.0),
+                        height: Dimension::Auto,
+                    },
+                    ..Style::DEFAULT
+                };
+
+                let ctx = NodeContext {
+                    content: LayoutContent::Block,
+                    style: StyleMap::default(),
+                };
+
+                return taffy
+                    .new_with_children(style, &child_ids)
+                    .map(|id| {
+                        taffy.set_node_context(id, Some(ctx)).ok();
+                        id
+                    })
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+            }
+
             // Special case: <br> forces a line break (full-width zero-height block).
             if tag == "br" {
                 let ctx = NodeContext {
@@ -435,8 +467,8 @@ fn add_node(
                             // Update instead of skip — CSS engine knows better.
                             if let Some(existing) = props.iter_mut().find(|(k, _)| *k == prop) {
                                 if prop == "font-size" {
-                                    if let Some(px) = val.strip_suffix("px").and_then(|s| s.parse::<f32>().ok()) {
-                                        existing.1 = StyleValue::Px(px);
+                                    if let Some(size) = parse_font_size_value(val) {
+                                        existing.1 = StyleValue::Px(size);
                                     }
                                 } else {
                                     existing.1 = StyleValue::Keyword(val.to_string());
@@ -447,6 +479,8 @@ fn add_node(
                         // Parse the value into a StyleValue.
                         if let Some(px) = val.strip_suffix("px").and_then(|s| s.parse::<f32>().ok()) {
                             props.push((prop, StyleValue::Px(px)));
+                        } else if let Some(pt) = val.strip_suffix("pt").and_then(|s| s.trim().parse::<f32>().ok()) {
+                            props.push((prop, StyleValue::Px(pt * 4.0 / 3.0)));
                         } else if val.starts_with("rgb") || val.starts_with('#') {
                             // Store as string — the painter will parse colors.
                             props.push((prop, StyleValue::Str(val.to_string())));
@@ -829,7 +863,7 @@ fn resolve_display(tag: &str, attributes: &[(String, String)]) -> String {
 }
 
 /// Resolve font-size from data-nova-style, tag defaults, or parent inheritance.
-fn resolve_font_size(tag: &str, attributes: &[(String, String)], parent_font_size: f32) -> f32 {
+fn resolve_font_size(tag: &str, attributes: &[(String, String)], _parent_font_size: f32) -> f32 {
     // Check data-nova-style first.
     for attr_name in &["data-nova-style", "style"] {
         if let Some(style_attr) = attributes.iter().find(|(k, _)| k == *attr_name) {
@@ -837,8 +871,8 @@ fn resolve_font_size(tag: &str, attributes: &[(String, String)], parent_font_siz
                 let parts: Vec<&str> = decl.splitn(2, ':').collect();
                 if parts.len() == 2 && parts[0].trim() == "font-size" {
                     let val = parts[1].trim();
-                    if let Some(px) = val.strip_suffix("px").and_then(|s| s.parse::<f32>().ok()) {
-                        return px;
+                    if let Some(size) = parse_font_size_value(val) {
+                        return size;
                     }
                 }
             }
@@ -846,6 +880,28 @@ fn resolve_font_size(tag: &str, attributes: &[(String, String)], parent_font_siz
     }
     // Tag-based defaults for headings.
     font_size_for_tag(tag)
+}
+
+/// Parse a CSS font-size value to pixels.
+/// Supports: `px`, `pt`, `em`, `rem`, `%`.
+fn parse_font_size_value(val: &str) -> Option<f32> {
+    let val = val.trim();
+    if let Some(px) = val.strip_suffix("px").and_then(|s| s.trim().parse::<f32>().ok()) {
+        Some(px)
+    } else if let Some(pt) = val.strip_suffix("pt").and_then(|s| s.trim().parse::<f32>().ok()) {
+        // 1pt = 4/3 px
+        Some(pt * 4.0 / 3.0)
+    } else if let Some(em) = val.strip_suffix("em").and_then(|s| s.trim().parse::<f32>().ok()) {
+        // em relative to parent — approximate with 16px base
+        Some(em * DEFAULT_FONT_SIZE)
+    } else if let Some(rem) = val.strip_suffix("rem").and_then(|s| s.trim().parse::<f32>().ok()) {
+        Some(rem * DEFAULT_FONT_SIZE)
+    } else if let Some(pct) = val.strip_suffix('%').and_then(|s| s.trim().parse::<f32>().ok()) {
+        Some(pct / 100.0 * DEFAULT_FONT_SIZE)
+    } else {
+        // Try plain number.
+        val.parse::<f32>().ok()
+    }
 }
 
 /// Build a `taffy::Style` from the resolved display mode, tag, and attributes.
@@ -1364,12 +1420,8 @@ fn add_table_node(
                     }
                 });
 
-            // Also check data-nova-style for width.
-            let css_width = if cell_width.is_none() {
-                parse_layout_props(attributes).width
-            } else {
-                None
-            };
+            // Also check data-nova-style for width (inline styles get cascaded here).
+            let css_width = parse_layout_props(attributes).width;
             let final_width = cell_width.or(css_width).unwrap_or(Dimension::Auto);
 
             // Cells size to content by default (flex-grow: 0).

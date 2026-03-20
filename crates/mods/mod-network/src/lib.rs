@@ -24,17 +24,13 @@ use nova_mod_api::{
     CoreApi, NovaMod,
 };
 
-pub mod cookie_jar;
 mod transport;
-
-use cookie_jar::CookieJar;
+pub mod cors;
 
 /// The network mod — fetches resources over HTTP and HTTPS.
 pub struct NetworkMod {
     manifest: ModManifest,
     core: Option<Arc<dyn CoreApi>>,
-    /// Thread-safe cookie storage shared across all requests.
-    cookie_jar: Arc<CookieJar>,
 }
 
 impl NetworkMod {
@@ -69,7 +65,6 @@ impl NetworkMod {
         Self {
             manifest,
             core: None,
-            cookie_jar: Arc::new(CookieJar::new()),
         }
     }
 
@@ -81,12 +76,42 @@ impl NetworkMod {
     /// Handles 301, 302, 303, 307, and 308 status codes:
     /// - 301/302/303: redirect, method changes to GET (for 303 this is required by spec)
     /// - 307/308: redirect, original method is preserved
-    async fn fetch_real(&self, url_str: &str, _headers: &[(String, String)]) -> Result<HttpResponse, NovaError> {
+    ///
+    /// Custom headers are forwarded to the underlying request.  The special
+    /// `x-nova-method` header overrides the HTTP method (used by the fetch API
+    /// bridge), and `x-nova-body` carries the request body.
+    async fn fetch_real(&self, url_str: &str, headers: &[(String, String)]) -> Result<HttpResponse, NovaError> {
         let mut current_url = url_str.to_string();
-        let mut method = "GET".to_string();
+
+        // Extract method override from pseudo-header if present.
+        let mut method = headers
+            .iter()
+            .find(|(k, _)| k == "x-nova-method")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| "GET".to_string());
+
+        // Extract body from pseudo-header if present.
+        let body = headers
+            .iter()
+            .find(|(k, _)| k == "x-nova-body")
+            .map(|(_, v)| v.clone());
+
+        // Filter out internal pseudo-headers before forwarding.
+        let custom_headers: Vec<(String, String)> = headers
+            .iter()
+            .filter(|(k, _)| !k.starts_with("x-nova-"))
+            .cloned()
+            .collect();
 
         for redirect_count in 0..=Self::MAX_REDIRECTS {
-            let response = self.fetch_single(&current_url, &method).await?;
+            let response = self
+                .fetch_single_with_headers(
+                    &current_url,
+                    &method,
+                    &custom_headers,
+                    body.as_deref(),
+                )
+                .await?;
 
             // Follow redirects for 301, 302, 303, 307, 308.
             if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
@@ -136,7 +161,23 @@ impl NetworkMod {
     }
 
     /// Perform a single HTTP request (no redirect following).
+    #[allow(dead_code)]
     async fn fetch_single(&self, url_str: &str, method: &str) -> Result<HttpResponse, NovaError> {
+        self.fetch_single_with_headers(url_str, method, &[], None)
+            .await
+    }
+
+    /// Perform a single HTTP request with custom headers and optional body.
+    ///
+    /// Custom headers are appended after the default headers. If a body is
+    /// provided, `Content-Length` is added automatically.
+    async fn fetch_single_with_headers(
+        &self,
+        url_str: &str,
+        method: &str,
+        custom_headers: &[(String, String)],
+        body: Option<&str>,
+    ) -> Result<HttpResponse, NovaError> {
         let parsed = url::Url::parse(url_str)
             .map_err(|e| NovaError::NetworkError(format!("invalid URL: {e}")))?;
 
@@ -155,45 +196,38 @@ impl NetworkMod {
 
         let use_tls = scheme == "https";
 
-        debug!(url = %url_str, host = %host, port, tls = use_tls, "connecting");
+        debug!(url = %url_str, host = %host, port, tls = use_tls, method, "connecting");
 
         let stream = transport::connect(&host, port, use_tls).await?;
 
-        // Look up cookies for this URL.
-        let cookie_header = {
-            let cookies = self.cookie_jar.cookies_for_url(&parsed);
-            if cookies.is_empty() {
-                String::new()
-            } else {
-                let header_value = CookieJar::to_cookie_header(&cookies);
-                debug!(url = %url_str, cookies = %header_value, "attaching cookies");
-                format!("Cookie: {header_value}\r\n")
-            }
-        };
-
-        // Build HTTP/1.1 request manually (simple, no heavy framework overhead).
-        let request = format!(
+        // Build the default headers.
+        let mut request = format!(
             "{method} {path} HTTP/1.1\r\n\
              Host: {host}\r\n\
              User-Agent: NOVA/0.1.0\r\n\
              Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n\
-             Accept-Encoding: gzip, identity\r\n\
-             {cookie_header}\
-             Connection: close\r\n\
-             \r\n"
+             Accept-Encoding: gzip, identity\r\n"
         );
+
+        // Append custom headers.
+        for (key, value) in custom_headers {
+            request.push_str(&format!("{key}: {value}\r\n"));
+        }
+
+        // Add Content-Length for body.
+        if let Some(body_content) = body {
+            request.push_str(&format!("Content-Length: {}\r\n", body_content.len()));
+        }
+
+        request.push_str("Connection: close\r\n\r\n");
+
+        // Append body after headers.
+        if let Some(body_content) = body {
+            request.push_str(body_content);
+        }
 
         let raw_response = transport::send_request(stream, &request).await?;
         let response = parse_http_response(&raw_response, url_str)?;
-
-        // Store any Set-Cookie headers from the response.
-        for (name, value) in &response.headers {
-            if name == "set-cookie" {
-                if let Some(cookie) = CookieJar::parse_set_cookie(value, &parsed) {
-                    self.cookie_jar.store(cookie);
-                }
-            }
-        }
 
         info!(
             url = %url_str,

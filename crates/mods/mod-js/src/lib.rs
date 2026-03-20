@@ -44,9 +44,13 @@ use nova_mod_api::{
 
 pub mod dom_api;
 pub mod dom_bridge;
+pub mod event_system;
+pub mod fetch_api;
 pub mod quickjs_runtime;
+pub mod storage;
+pub mod timers;
 
-use dom_api::{JsDomTree, eval_script, eval_script_with_env};
+use dom_api::{JsDomTree, eval_script_with_core, eval_script_with_env_and_core};
 use quickjs_runtime::QuickJsRuntime;
 
 // ── Context store ─────────────────────────────────────────────────────────────
@@ -166,7 +170,7 @@ impl NovaMod for JsMod {
                         Ok(rt) => js_ctx.quickjs = Some(rt),
                         Err(e) => {
                             warn!(error = %e, "failed to create QuickJS runtime, falling back");
-                            let result = eval_script(&source, tree);
+                            let result = eval_script_with_core(&source, tree, self.core.as_ref());
                             return Ok(TypedData::JsResult(result));
                         }
                     }
@@ -296,7 +300,7 @@ impl NovaMod for JsMod {
                 let mut last = JsValue::Undefined;
                 for (cb_source, captured_env) in callbacks {
                     debug!(len = cb_source.len(), "executing event callback");
-                    last = eval_script_with_env(&cb_source, Arc::clone(&tree), &captured_env);
+                    last = eval_script_with_env_and_core(&cb_source, Arc::clone(&tree), &captured_env, self.core.as_ref());
                 }
 
                 let mutated_dom = tree.lock().unwrap().to_dom();

@@ -38,8 +38,10 @@ use nova_mod_api::{
     CoreApi, NovaMod,
 };
 
+pub mod animation;
 pub mod cascade;
 pub mod defaults;
+pub mod media;
 pub mod parser;
 pub mod selector;
 pub mod values;

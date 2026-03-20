@@ -5,7 +5,6 @@
 //! inline styles, then writes the computed styles into `data-nova-style`
 //! attributes on each element.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use nova_mod_api::content::DomNode;
@@ -14,14 +13,6 @@ use crate::defaults::default_style_for_tag;
 use crate::parser::{self, CssRule};
 use crate::selector::{PseudoElement, SiblingContext, Specificity};
 use crate::values;
-
-/// Cache for computed styles keyed by (tag, class, id).
-/// Elements with identical tag + class + id attributes get the same cascade result,
-/// so we can skip re-evaluating all rules for them.
-type StyleCache = RefCell<HashMap<(String, String, String), String>>;
-
-/// Map from animation name to the "to" (100%) keyframe declarations (property, value).
-type KeyframesMap = HashMap<String, Vec<(String, String)>>;
 
 // ── Rule index for fast selector pre-filtering ────────────────────────
 
@@ -68,33 +59,33 @@ impl RuleIndex {
     }
 
     fn candidates_for(&self, tag: &str, attributes: &[(String, String)]) -> Vec<usize> {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = Vec::new();
         let mut result = Vec::new();
+        let push = |idx: usize, seen: &mut Vec<usize>, result: &mut Vec<usize>| {
+            if !seen.contains(&idx) {
+                seen.push(idx);
+                result.push(idx);
+            }
+        };
 
         if let Some(id) = attributes.iter().find(|(k, _)| k == "id").map(|(_, v)| v) {
             if let Some(indices) = self.by_id.get(id) {
-                for &idx in indices {
-                    if seen.insert(idx) { result.push(idx); }
-                }
+                for &idx in indices { push(idx, &mut seen, &mut result); }
             }
         }
         if let Some(class_attr) = attributes.iter().find(|(k, _)| k == "class").map(|(_, v)| v) {
             for cls in class_attr.split_whitespace() {
                 if let Some(indices) = self.by_class.get(cls) {
-                    for &idx in indices {
-                        if seen.insert(idx) { result.push(idx); }
-                    }
+                    for &idx in indices { push(idx, &mut seen, &mut result); }
                 }
             }
         }
         let tag_lower = tag.to_ascii_lowercase();
         if let Some(indices) = self.by_tag.get(&tag_lower) {
-            for &idx in indices {
-                if seen.insert(idx) { result.push(idx); }
-            }
+            for &idx in indices { push(idx, &mut seen, &mut result); }
         }
         for &idx in &self.universal {
-            if seen.insert(idx) { result.push(idx); }
+            push(idx, &mut seen, &mut result);
         }
         result
     }
@@ -172,54 +163,27 @@ pub fn compute_styles(dom: DomNode, extra_css: &[String], viewport_width: f32) -
     // 1. Extract embedded stylesheets.
     let embedded = extract_stylesheets(&dom);
 
-    // 2. Parse all stylesheets (full parse to also extract @keyframes).
+    // 2. Parse all stylesheets.
     let mut rules = Vec::new();
-    let mut keyframes_map: KeyframesMap = HashMap::new();
     for css in &embedded {
-        let sheet = parser::parse_stylesheet_full(css, viewport_width);
-        rules.extend(sheet.rules);
-        for kf in sheet.keyframes {
-            let final_decls: Vec<(String, String)> = kf.keyframes.iter()
-                .filter(|(pct, _)| *pct >= 0.99) // "to" = 1.0
-                .flat_map(|(_, decls)| decls.iter().map(|d| (d.property.clone(), d.value.clone())))
-                .collect();
-            if !final_decls.is_empty() {
-                keyframes_map.insert(kf.name.clone(), final_decls);
-            }
-        }
+        rules.extend(parser::parse_stylesheet(css, viewport_width));
     }
     for css in extra_css {
-        let sheet = parser::parse_stylesheet_full(css, viewport_width);
-        rules.extend(sheet.rules);
-        for kf in sheet.keyframes {
-            let final_decls: Vec<(String, String)> = kf.keyframes.iter()
-                .filter(|(pct, _)| *pct >= 0.99)
-                .flat_map(|(_, decls)| decls.iter().map(|d| (d.property.clone(), d.value.clone())))
-                .collect();
-            if !final_decls.is_empty() {
-                keyframes_map.insert(kf.name.clone(), final_decls);
-            }
-        }
+        rules.extend(parser::parse_stylesheet(css, viewport_width));
     }
 
     tracing::info!(
         embedded_count = embedded.len(),
         rule_count = rules.len(),
-        keyframes_count = keyframes_map.len(),
         "parsed CSS rules for style computation"
     );
 
     // 3. Build rule index for fast matching.
     let index = RuleIndex::build(&rules);
 
-    // 4. Style cache: (tag, class_attr, id_attr) → computed style string.
-    //    Elements with identical tag + class + id get the same cascade result
-    //    (ignoring ancestor context, which is an acceptable approximation for perf).
-    let cache: StyleCache = RefCell::new(HashMap::new());
-
-    // 5. Walk DOM and apply styles.
+    // 4. Walk DOM and apply styles.
     let ancestors: Vec<&DomNode> = Vec::new();
-    apply_styles_recursive(dom, &rules, &index, &ancestors, &cache, &keyframes_map)
+    apply_styles_recursive(dom, &rules, &index, &ancestors)
 }
 
 /// Recursively apply styles to a DOM node.
@@ -228,8 +192,6 @@ fn apply_styles_recursive(
     rules: &[CssRule],
     index: &RuleIndex,
     ancestors: &[&DomNode],
-    cache: &StyleCache,
-    keyframes: &KeyframesMap,
 ) -> DomNode {
     match node {
         DomNode::Element {
@@ -237,11 +199,6 @@ fn apply_styles_recursive(
             attributes,
             children,
         } => {
-            // Skip elements that are never visible — no need to compute styles.
-            if matches!(tag.as_str(), "script" | "style" | "template" | "noscript") {
-                return DomNode::Element { tag, attributes, children };
-            }
-
             // Build a temporary node for matching (without children for efficiency).
             let temp_node = DomNode::Element {
                 tag: tag.clone(),
@@ -250,7 +207,7 @@ fn apply_styles_recursive(
             };
 
             // Compute styles for this element.
-            let style_str = compute_element_style(&tag, &attributes, &temp_node, rules, index, ancestors, cache, keyframes);
+            let style_str = compute_element_style(&tag, &attributes, &temp_node, rules, index, ancestors);
 
             // Build new attributes with data-nova-style.
             let mut new_attributes = attributes;
@@ -275,7 +232,7 @@ fn apply_styles_recursive(
             let this_ref: &DomNode = &this_node;
             new_ancestors.push(this_ref);
 
-            let mut new_children = apply_styles_to_children(children, rules, index, &new_ancestors, cache, keyframes);
+            let mut new_children = apply_styles_to_children(children, rules, index, &new_ancestors);
 
             // Inject ::before and ::after pseudo-element text nodes when a CSS
             // rule targets this element with `::before` or `::after` and
@@ -308,7 +265,7 @@ fn apply_styles_recursive(
             }
         }
         DomNode::Document { children } => {
-            let new_children = apply_styles_to_children(children, rules, index, ancestors, cache, keyframes);
+            let new_children = apply_styles_to_children(children, rules, index, ancestors);
             DomNode::Document {
                 children: new_children,
             }
@@ -324,8 +281,6 @@ fn apply_styles_to_children(
     rules: &[CssRule],
     index: &RuleIndex,
     ancestors: &[&DomNode],
-    cache: &StyleCache,
-    keyframes: &KeyframesMap,
 ) -> Vec<DomNode> {
     let len = children.len();
     let mut result = Vec::with_capacity(len);
@@ -337,7 +292,7 @@ fn apply_styles_to_children(
             index: i,
         };
         let child = children_vec[i].clone();
-        result.push(apply_styles_recursive_with_siblings(child, rules, index, ancestors, Some(sib_ctx), cache, keyframes));
+        result.push(apply_styles_recursive_with_siblings(child, rules, index, ancestors, Some(sib_ctx)));
     }
 
     result
@@ -350,8 +305,6 @@ fn apply_styles_recursive_with_siblings(
     index: &RuleIndex,
     ancestors: &[&DomNode],
     siblings: Option<SiblingContext<'_>>,
-    cache: &StyleCache,
-    keyframes: &KeyframesMap,
 ) -> DomNode {
     match node {
         DomNode::Element {
@@ -359,39 +312,6 @@ fn apply_styles_recursive_with_siblings(
             attributes,
             children,
         } => {
-            // Skip elements that are never visible — no need to compute styles.
-            if matches!(tag.as_str(), "script" | "style" | "template" | "noscript") {
-                return DomNode::Element { tag, attributes, children };
-            }
-
-            // Fast path: elements with no class/id/style and only text children
-            // where the rule index has zero candidate rules can skip the full
-            // cascade and use only UA defaults. This avoids expensive selector
-            // matching for deeply nested leaf elements on large pages.
-            let has_class = attributes.iter().any(|(k, _)| k == "class");
-            let has_id = attributes.iter().any(|(k, _)| k == "id");
-            let has_style = attributes.iter().any(|(k, _)| k == "style");
-            let only_text_children = !children.is_empty()
-                && children.iter().all(|c| matches!(c, DomNode::Text(_) | DomNode::Comment(_)));
-            if !has_class && !has_id && !has_style && only_text_children {
-                let candidates = index.candidates_for(&tag, &attributes);
-                if candidates.is_empty() {
-                    let ua_style = crate::defaults::default_style_for_tag(&tag);
-                    let style_str = ua_style.properties.iter()
-                        .map(|(p, v)| format!("{}: {}", p, style_value_to_css(v)))
-                        .collect::<Vec<_>>()
-                        .join("; ");
-
-                    let mut new_attributes = attributes;
-                    new_attributes.retain(|(k, _)| k != "data-nova-style");
-                    if !style_str.is_empty() {
-                        new_attributes.push(("data-nova-style".into(), style_str));
-                    }
-
-                    return DomNode::Element { tag, attributes: new_attributes, children };
-                }
-            }
-
             let temp_node = DomNode::Element {
                 tag: tag.clone(),
                 attributes: attributes.clone(),
@@ -399,7 +319,7 @@ fn apply_styles_recursive_with_siblings(
             };
 
             let style_str = compute_element_style_with_siblings(
-                &tag, &attributes, &temp_node, rules, index, ancestors, siblings, cache, keyframes,
+                &tag, &attributes, &temp_node, rules, index, ancestors, siblings,
             );
 
             let mut new_attributes = attributes;
@@ -418,7 +338,7 @@ fn apply_styles_recursive_with_siblings(
             let this_ref: &DomNode = &this_node;
             new_ancestors.push(this_ref);
 
-            let mut new_children = apply_styles_to_children(children, rules, index, &new_ancestors, cache, keyframes);
+            let mut new_children = apply_styles_to_children(children, rules, index, &new_ancestors);
 
             if let Some(before_text) = pseudo_element_content(
                 &tag, &new_attributes, &this_node, rules, ancestors, PseudoElement::Before,
@@ -438,7 +358,7 @@ fn apply_styles_recursive_with_siblings(
             }
         }
         DomNode::Document { children } => {
-            let new_children = apply_styles_to_children(children, rules, index, ancestors, cache, keyframes);
+            let new_children = apply_styles_to_children(children, rules, index, ancestors);
             DomNode::Document { children: new_children }
         }
         other => other,
@@ -454,10 +374,8 @@ fn compute_element_style_with_siblings(
     index: &RuleIndex,
     ancestors: &[&DomNode],
     siblings: Option<SiblingContext<'_>>,
-    cache: &StyleCache,
-    keyframes: &KeyframesMap,
 ) -> String {
-    compute_element_style_impl(tag, attributes, node, rules, index, ancestors, siblings, cache, keyframes)
+    compute_element_style_impl(tag, attributes, node, rules, index, ancestors, siblings)
 }
 
 fn compute_element_style(
@@ -467,10 +385,8 @@ fn compute_element_style(
     rules: &[CssRule],
     index: &RuleIndex,
     ancestors: &[&DomNode],
-    cache: &StyleCache,
-    keyframes: &KeyframesMap,
 ) -> String {
-    compute_element_style_impl(tag, attributes, node, rules, index, ancestors, None, cache, keyframes)
+    compute_element_style_impl(tag, attributes, node, rules, index, ancestors, None)
 }
 
 /// Internal implementation that supports optional sibling context.
@@ -482,23 +398,7 @@ fn compute_element_style_impl(
     index: &RuleIndex,
     ancestors: &[&DomNode],
     siblings: Option<SiblingContext<'_>>,
-    cache: &StyleCache,
-    keyframes: &KeyframesMap,
 ) -> String {
-    // Check cache: elements with the same (tag, class, id) and no inline style
-    // will produce the same cascade result (modulo inheritance, which is an
-    // acceptable approximation for performance).
-    let class_attr = attributes.iter().find(|(k, _)| k == "class").map(|(_, v)| v.clone()).unwrap_or_default();
-    let id_attr = attributes.iter().find(|(k, _)| k == "id").map(|(_, v)| v.clone()).unwrap_or_default();
-    let has_inline_style = attributes.iter().any(|(k, _)| k == "style");
-
-    if !has_inline_style {
-        let cache_key = (tag.to_string(), class_attr.clone(), id_attr.clone());
-        if let Some(cached) = cache.borrow().get(&cache_key) {
-            return cached.clone();
-        }
-    }
-
     let mut declarations: Vec<CascadedDeclaration> = Vec::new();
 
     // 0. CSS inheritance: inherit inheritable properties from the nearest
@@ -528,9 +428,7 @@ fn compute_element_style_impl(
     // Track which inherited properties we've already found (from a closer
     // ancestor) so we only take the nearest value for each property.
     let mut inherited_props: Vec<String> = Vec::new();
-    // Only check the nearest 5 ancestors for inherited properties to limit
-    // O(depth) cost on deeply nested DOMs.
-    for ancestor in ancestors.iter().rev().take(5) {
+    for ancestor in ancestors.iter().rev() {
         if let DomNode::Element { attributes, .. } = ancestor {
             if let Some(style_str) = attributes.iter().find(|(k, _)| k == "data-nova-style") {
                 for decl in style_str.1.split(';') {
@@ -570,13 +468,8 @@ fn compute_element_style_impl(
     }
 
     // 2. Stylesheet rules — use the index to only check candidate rules.
-    //    Performance: limit candidate evaluation to avoid O(n) blowup on
-    //    elements that match many rules (e.g. `.mw-parser-output` on Wikipedia).
-    //    Elements with classes get a higher limit since they're more likely to
-    //    match important layout rules (e.g. Wikipedia's flex layout containers).
     let candidates = index.candidates_for(tag, attributes);
-    let max_rules = if attributes.iter().any(|(k, _)| k == "class") { 500 } else { 200 };
-    for &rule_idx in candidates.iter().take(max_rules) {
+    for &rule_idx in &candidates {
         let rule = &rules[rule_idx];
         if rule.selector.matches(node, ancestors, siblings) {
             let spec = rule.selector.specificity();
@@ -631,21 +524,6 @@ fn compute_element_style_impl(
             existing.1 = decl.value;
         } else {
             final_props.push((decl.property, decl.value));
-        }
-    }
-
-    // 6a. Apply animation end-state: if the element has animation-name, apply
-    // the "to" keyframe declarations as if the animation completed instantly.
-    if let Some(anim_name) = final_props.iter().find(|(p, _)| p == "animation-name").map(|(_, v)| v.clone()) {
-        let anim_name = anim_name.trim().trim_matches('"').trim_matches('\'').to_string();
-        if let Some(decls) = keyframes.get(&anim_name) {
-            for (prop, val) in decls {
-                if let Some(existing) = final_props.iter_mut().find(|(p, _)| p == prop) {
-                    existing.1 = val.clone();
-                } else {
-                    final_props.push((prop.clone(), val.clone()));
-                }
-            }
         }
     }
 
@@ -727,19 +605,11 @@ fn compute_element_style_impl(
     }
 
     // 8. Serialize as inline CSS string.
-    let result = final_props
+    final_props
         .iter()
         .map(|(p, v)| format!("{}: {}", p, v))
         .collect::<Vec<_>>()
-        .join("; ");
-
-    // Store in cache for future elements with the same tag+class+id.
-    if !has_inline_style {
-        let cache_key = (tag.to_string(), class_attr, id_attr);
-        cache.borrow_mut().insert(cache_key, result.clone());
-    }
-
-    result
+        .join("; ")
 }
 
 /// Expand CSS shorthand properties into their longhand equivalents.
@@ -999,68 +869,73 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
             // Pass through as-is; values like `underline`, `none`, `line-through` are used directly.
             out.push(decl);
         }
-        "transition" => {
-            // Parse: property duration timing-function delay
-            // Just extract transition-property and transition-duration for now.
-            let parts: Vec<&str> = decl.value.split(',').collect();
-            for part in &parts {
-                let tokens: Vec<&str> = part.trim().split_whitespace().collect();
-                if !tokens.is_empty() {
-                    out.push(CascadedDeclaration {
-                        property: "transition-property".into(),
-                        value: tokens[0].to_string(),
-                        specificity: decl.specificity,
-                        origin: decl.origin,
-                        important: decl.important,
-                    });
-                    if tokens.len() > 1 {
-                        out.push(CascadedDeclaration {
-                            property: "transition-duration".into(),
-                            value: tokens[1].to_string(),
-                            specificity: decl.specificity,
-                            origin: decl.origin,
-                            important: decl.important,
-                        });
-                    }
-                }
-            }
-            out.push(decl);
-        }
         "animation" => {
-            // Extract animation-name from the shorthand.
-            // animation: name duration timing-function delay iteration-count direction fill-mode
-            // The animation name is typically the first non-numeric, non-keyword token.
-            let parts: Vec<&str> = decl.value.split_whitespace().collect();
-            if !parts.is_empty() {
-                for part in &parts {
-                    if part.parse::<f64>().is_ok()
-                        || part.ends_with('s') || part.ends_with("ms")
-                    {
-                        continue;
+            // Parse the animation shorthand and expand into longhand properties.
+            let parsed = crate::animation::parse_animation_shorthand(&decl.value);
+            let longhands = [
+                ("animation-name", parsed.name),
+                ("animation-duration", format!("{}s", parsed.duration)),
+                ("animation-timing-function", match &parsed.timing_function {
+                    crate::animation::TimingFunction::Linear => "linear".to_string(),
+                    crate::animation::TimingFunction::Ease => "ease".to_string(),
+                    crate::animation::TimingFunction::EaseIn => "ease-in".to_string(),
+                    crate::animation::TimingFunction::EaseOut => "ease-out".to_string(),
+                    crate::animation::TimingFunction::EaseInOut => "ease-in-out".to_string(),
+                    crate::animation::TimingFunction::CubicBezier(x1, y1, x2, y2) => {
+                        format!("cubic-bezier({x1}, {y1}, {x2}, {y2})")
                     }
-                    if matches!(
-                        *part,
-                        "ease" | "linear" | "ease-in" | "ease-out" | "ease-in-out"
-                            | "normal" | "reverse" | "alternate" | "alternate-reverse"
-                            | "none" | "forwards" | "backwards" | "both" | "infinite"
-                            | "running" | "paused"
-                    ) {
-                        continue;
-                    }
-                    // This token is likely the animation name.
-                    out.push(CascadedDeclaration {
-                        property: "animation-name".into(),
-                        value: part.to_string(),
-                        specificity: decl.specificity,
-                        origin: decl.origin,
-                        important: decl.important,
-                    });
-                    break;
-                }
+                }),
+                ("animation-delay", format!("{}s", parsed.delay)),
+                ("animation-iteration-count", if parsed.iteration_count.is_infinite() {
+                    "infinite".to_string()
+                } else {
+                    format!("{}", parsed.iteration_count)
+                }),
+                ("animation-direction", match &parsed.direction {
+                    crate::animation::AnimationDirection::Normal => "normal".to_string(),
+                    crate::animation::AnimationDirection::Reverse => "reverse".to_string(),
+                    crate::animation::AnimationDirection::Alternate => "alternate".to_string(),
+                    crate::animation::AnimationDirection::AlternateReverse => "alternate-reverse".to_string(),
+                }),
+                ("animation-fill-mode", match &parsed.fill_mode {
+                    crate::animation::FillMode::None => "none".to_string(),
+                    crate::animation::FillMode::Forwards => "forwards".to_string(),
+                    crate::animation::FillMode::Backwards => "backwards".to_string(),
+                    crate::animation::FillMode::Both => "both".to_string(),
+                }),
+            ];
+            for (prop, val) in longhands {
+                out.push(CascadedDeclaration {
+                    property: prop.into(),
+                    value: val,
+                    specificity: decl.specificity,
+                    origin: decl.origin,
+                    important: decl.important,
+                });
             }
-            // The animation end-state is applied in compute_element_style_impl
-            // (step 6a) by looking up the "to" keyframe declarations.
-            out.push(decl);
+        }
+        "transition" => {
+            // Parse the transition shorthand: property duration [timing] [delay]
+            let parts: Vec<&str> = decl.value.split_whitespace().collect();
+            let property = parts.first().copied().unwrap_or("all");
+            let duration = parts.get(1).copied().unwrap_or("0s");
+            let timing = parts.get(2).copied().unwrap_or("ease");
+            let delay = parts.get(3).copied().unwrap_or("0s");
+
+            for (prop, val) in [
+                ("transition-property", property),
+                ("transition-duration", duration),
+                ("transition-timing-function", timing),
+                ("transition-delay", delay),
+            ] {
+                out.push(CascadedDeclaration {
+                    property: prop.into(),
+                    value: val.to_string(),
+                    specificity: decl.specificity,
+                    origin: decl.origin,
+                    important: decl.important,
+                });
+            }
         }
         _ => {
             // Not a shorthand; pass through.
@@ -1867,23 +1742,6 @@ mod tests {
         let m = expand("text-decoration", "none");
         assert_eq!(m.get("text-decoration").map(String::as_str), Some("none"));
     }
-
-    // ── animation shorthand ─────────────────────────────────────────────────
-
-    #[test]
-    fn animation_shorthand_extracts_name() {
-        let m = expand("animation", "fadeIn 1s ease-in-out");
-        assert_eq!(m.get("animation-name").map(String::as_str), Some("fadeIn"));
-        // The original shorthand should also be preserved.
-        assert!(m.contains_key("animation"));
-    }
-
-    #[test]
-    fn animation_shorthand_no_name_when_only_keywords() {
-        let m = expand("animation", "none 0.5s linear");
-        // "none" is a keyword, not a name — should not be extracted.
-        assert!(!m.contains_key("animation-name"));
-    }
 }
 
 #[cfg(test)]
@@ -2030,97 +1888,5 @@ mod pseudo_element_injection_tests {
         } else {
             panic!("expected Element for p");
         }
-    }
-
-    fn make_dom(html_body: Vec<DomNode>) -> DomNode {
-        DomNode::Document {
-            children: vec![DomNode::Element {
-                tag: "html".into(),
-                attributes: vec![],
-                children: vec![DomNode::Element {
-                    tag: "body".into(),
-                    attributes: vec![],
-                    children: html_body,
-                }],
-            }],
-        }
-    }
-
-    fn find_tag<'a>(node: &'a DomNode, target: &str) -> Option<&'a DomNode> {
-        match node {
-            DomNode::Element { tag, children, .. } => {
-                if tag == target { return Some(node); }
-                for child in children {
-                    if let Some(found) = find_tag(child, target) { return Some(found); }
-                }
-                None
-            }
-            DomNode::Document { children } => {
-                for child in children {
-                    if let Some(found) = find_tag(child, target) { return Some(found); }
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    #[test]
-    fn link_gets_blue_color_from_ua_defaults() {
-        // An <a> element should get color: #0000ee from UA defaults.
-        let dom = make_dom(vec![DomNode::Element {
-            tag: "p".into(),
-            attributes: vec![],
-            children: vec![
-                DomNode::Text("Hello ".into()),
-                DomNode::Element {
-                    tag: "a".into(),
-                    attributes: vec![("href".into(), "https://example.com".into())],
-                    children: vec![DomNode::Text("world".into())],
-                },
-            ],
-        }]);
-
-        let result = compute_styles(dom, &[], 1280.0);
-        let a = find_tag(&result, "a").expect("should find <a>");
-        let style = a.attr("data-nova-style").expect("a should have data-nova-style");
-        assert!(
-            style.contains("color: #0000ee"),
-            "link should have blue color in data-nova-style, got: {style}"
-        );
-        assert!(
-            style.contains("text-decoration: underline"),
-            "link should have underline in data-nova-style, got: {style}"
-        );
-    }
-
-    #[test]
-    fn link_color_not_overridden_by_parent_inheritance() {
-        // When a parent has color: black (from author CSS), the <a> element's
-        // UA default color: #0000ee should still win over inheritance.
-        let dom = make_dom(vec![
-            DomNode::Element {
-                tag: "style".into(),
-                attributes: vec![],
-                children: vec![DomNode::Text("body { color: black; }".into())],
-            },
-            DomNode::Element {
-                tag: "p".into(),
-                attributes: vec![],
-                children: vec![DomNode::Element {
-                    tag: "a".into(),
-                    attributes: vec![("href".into(), "https://example.com".into())],
-                    children: vec![DomNode::Text("link".into())],
-                }],
-            },
-        ]);
-
-        let result = compute_styles(dom, &[], 1280.0);
-        let a = find_tag(&result, "a").expect("should find <a>");
-        let style = a.attr("data-nova-style").expect("a should have data-nova-style");
-        assert!(
-            style.contains("color: #0000ee"),
-            "link should keep blue color despite parent having black, got: {style}"
-        );
     }
 }

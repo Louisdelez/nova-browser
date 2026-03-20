@@ -37,6 +37,9 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, warn};
 
 use nova_mod_api::content::{DomNode, JsValue};
+use nova_mod_api::CoreApi;
+
+use crate::fetch_api;
 
 // ── Handle allocation ────────────────────────────────────────────────────────
 
@@ -117,6 +120,8 @@ pub struct EventCallback {
     /// pre-seeded into the interpreter env so the callback body can reference
     /// the same variables (e.g. `btn`) without re-resolving them.
     pub captured_env: Vec<(String, ElementHandle)>,
+    /// Whether this listener was registered for the capture phase.
+    pub capture: bool,
 }
 
 // ── Main DOM tree ─────────────────────────────────────────────────────────────
@@ -628,18 +633,23 @@ impl JsDomTree {
     /// `captured_env` should be the current variable-to-handle bindings from
     /// the enclosing interpreter scope so the callback can reference those
     /// variables by name.
+    ///
+    /// If `capture` is `true`, the listener fires during the capture phase
+    /// rather than the bubble phase.
     pub fn add_event_listener(
         &mut self,
         handle: ElementHandle,
         event_type: &str,
         callback_source: &str,
         captured_env: Vec<(String, ElementHandle)>,
+        capture: bool,
     ) {
         let cb = EventCallback {
             source: callback_source.to_owned(),
             event_type: event_type.to_owned(),
             element_handle: handle,
             captured_env,
+            capture,
         };
         self.listeners
             .entry((handle, event_type.to_owned()))
@@ -680,373 +690,40 @@ impl JsDomTree {
         self.root
     }
 
-    /// `document.querySelectorAll(selector)` — returns all matching elements.
-    pub fn query_selector_all(&self, selector: &str) -> Vec<ElementHandle> {
-        let selector = selector.trim();
-        let mut results = Vec::new();
-        if selector.starts_with('#') {
-            self.collect_by_attr("id", &selector[1..], self.root, &mut results);
-        } else if selector.starts_with('.') {
-            self.collect_by_class(&selector[1..], self.root, &mut results);
-        } else {
-            self.collect_by_tag(selector, self.root, &mut results);
+    // ── Event system helpers ──────────────────────────────────────────────────
+
+    /// Build the path from the target element up to the document root.
+    ///
+    /// Returns `[target, parent, grandparent, …, root]`. If the target has no
+    /// parent (i.e., it is the root or disconnected), returns `[target]`.
+    pub fn build_ancestor_path(&self, target: ElementHandle) -> Vec<ElementHandle> {
+        let mut path = vec![target];
+        let mut current = target;
+        while let Some(parent) = self.find_parent(current) {
+            path.push(parent);
+            current = parent;
         }
-        results
+        path
     }
 
-    /// Recursive collect by attribute.
-    fn collect_by_attr(
-        &self,
-        attr: &str,
-        value: &str,
-        handle: ElementHandle,
-        out: &mut Vec<ElementHandle>,
-    ) {
-        let Some(elem) = self.nodes.get(&handle) else { return };
-        if elem.attributes.iter().any(|(k, v)| k == attr && v == value) {
-            out.push(handle);
-        }
-        for &child in &elem.children {
-            self.collect_by_attr(attr, value, child, out);
-        }
-    }
-
-    /// Recursive collect by class.
-    fn collect_by_class(
-        &self,
-        class: &str,
-        handle: ElementHandle,
-        out: &mut Vec<ElementHandle>,
-    ) {
-        let Some(elem) = self.nodes.get(&handle) else { return };
-        if elem.class_attr().split_whitespace().any(|c| c == class) {
-            out.push(handle);
-        }
-        for &child in &elem.children {
-            self.collect_by_class(class, child, out);
-        }
-    }
-
-    /// Recursive collect by tag name.
-    fn collect_by_tag(
-        &self,
-        tag: &str,
-        handle: ElementHandle,
-        out: &mut Vec<ElementHandle>,
-    ) {
-        let Some(elem) = self.nodes.get(&handle) else { return };
-        if elem.tag == tag.to_lowercase() && handle != self.root {
-            out.push(handle);
-        }
-        for &child in &elem.children {
-            self.collect_by_tag(tag, child, out);
-        }
-    }
-
-    /// Get the parent node of an element.
-    pub fn parent_node(&self, handle: ElementHandle) -> Option<ElementHandle> {
-        for (h, elem) in &self.nodes {
-            if elem.children.contains(&handle) {
+    /// Find the parent of a node by scanning all nodes for one that has
+    /// `handle` in its children list.
+    pub fn find_parent(&self, handle: ElementHandle) -> Option<ElementHandle> {
+        for (h, el) in &self.nodes {
+            if el.children.contains(&handle) {
                 return Some(*h);
             }
         }
         None
     }
 
-    /// Get the next sibling of an element.
-    pub fn next_sibling(&self, handle: ElementHandle) -> Option<ElementHandle> {
-        let parent = self.parent_node(handle)?;
-        let parent_elem = self.nodes.get(&parent)?;
-        let pos = parent_elem.children.iter().position(|&h| h == handle)?;
-        parent_elem.children.get(pos + 1).copied()
-    }
-
-    /// Get the previous sibling of an element.
-    pub fn previous_sibling(&self, handle: ElementHandle) -> Option<ElementHandle> {
-        let parent = self.parent_node(handle)?;
-        let parent_elem = self.nodes.get(&parent)?;
-        let pos = parent_elem.children.iter().position(|&h| h == handle)?;
-        if pos > 0 {
-            Some(parent_elem.children[pos - 1])
-        } else {
-            None
-        }
-    }
-
-    /// Get the first child of an element.
-    pub fn first_child(&self, handle: ElementHandle) -> Option<ElementHandle> {
-        self.nodes.get(&handle)?.children.first().copied()
-    }
-
-    /// Get the last child of an element.
-    pub fn last_child(&self, handle: ElementHandle) -> Option<ElementHandle> {
-        self.nodes.get(&handle)?.children.last().copied()
-    }
-
-    /// Clone a node (optionally deep).
-    pub fn clone_node(&mut self, handle: ElementHandle, deep: bool) -> ElementHandle {
-        let Some(elem) = self.nodes.get(&handle).cloned() else {
-            return self.alloc_handle();
-        };
-        let new_handle = self.alloc_handle();
-        let mut new_elem = JsElement {
-            handle: new_handle,
-            tag: elem.tag.clone(),
-            attributes: elem.attributes.clone(),
-            children: Vec::new(),
-            text: elem.text.clone(),
-            inline_styles: elem.inline_styles.clone(),
-        };
-        if deep {
-            for &child in &elem.children {
-                let cloned_child = self.clone_node(child, true);
-                new_elem.children.push(cloned_child);
-            }
-        }
-        self.nodes.insert(new_handle, new_elem);
-        new_handle
-    }
-
-    /// Insert a new child before a reference child.
-    pub fn insert_before(
-        &mut self,
-        parent: ElementHandle,
-        new_child: ElementHandle,
-        ref_child: Option<ElementHandle>,
-    ) -> bool {
-        if !self.nodes.contains_key(&parent) || !self.nodes.contains_key(&new_child) {
-            warn!(parent, new_child, "insertBefore: handle not found");
-            return false;
-        }
-        let Some(parent_elem) = self.nodes.get_mut(&parent) else {
-            return false;
-        };
-        match ref_child {
-            Some(ref_h) => {
-                if let Some(pos) = parent_elem.children.iter().position(|&h| h == ref_h) {
-                    parent_elem.children.insert(pos, new_child);
-                    true
-                } else {
-                    parent_elem.children.push(new_child);
-                    true
-                }
-            }
-            None => {
-                parent_elem.children.push(new_child);
-                true
-            }
-        }
-    }
-
-    /// Check if a parent element contains a child (descendant).
-    pub fn contains(&self, parent: ElementHandle, child: ElementHandle) -> bool {
-        if parent == child {
-            return true;
-        }
-        let Some(elem) = self.nodes.get(&parent) else {
-            return false;
-        };
-        for &c in &elem.children {
-            if self.contains(c, child) {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Remove an attribute from an element.
-    pub fn remove_attribute(&mut self, handle: ElementHandle, name: &str) {
-        let Some(elem) = self.nodes.get_mut(&handle) else {
-            warn!(handle, name, "removeAttribute: handle not found");
-            return;
-        };
-        elem.attributes.retain(|(k, _)| k != name);
-        debug!(handle, name, "removeAttribute");
-    }
-
-    /// Check if an element has a given attribute.
-    pub fn has_attribute(&self, handle: ElementHandle, name: &str) -> bool {
-        self.nodes
-            .get(&handle)
-            .map(|e| e.attributes.iter().any(|(k, _)| k == name))
-            .unwrap_or(false)
-    }
-
-    /// Get all element children (not text nodes) of a node.
-    pub fn children(&self, handle: ElementHandle) -> Vec<ElementHandle> {
-        let Some(elem) = self.nodes.get(&handle) else {
-            return Vec::new();
-        };
-        elem.children
-            .iter()
-            .copied()
-            .filter(|&h| {
-                self.nodes
-                    .get(&h)
-                    .map(|e| e.tag != "#text" && e.tag != "#comment")
-                    .unwrap_or(false)
-            })
-            .collect()
-    }
-
-    /// Check if an element matches a simple CSS selector.
-    pub fn matches(&self, handle: ElementHandle, selector: &str) -> bool {
-        let selector = selector.trim();
-        let Some(elem) = self.nodes.get(&handle) else {
-            return false;
-        };
-        if selector.starts_with('#') {
-            elem.attributes
-                .iter()
-                .any(|(k, v)| k == "id" && v == &selector[1..])
-        } else if selector.starts_with('.') {
-            elem.class_attr()
-                .split_whitespace()
-                .any(|c| c == &selector[1..])
-        } else {
-            elem.tag == selector.to_lowercase()
-        }
-    }
-
-    /// `document.createTextNode(text)` — creates an unattached text node.
-    pub fn create_text_node(&mut self, text: &str) -> ElementHandle {
-        let handle = self.alloc_handle();
-        let elem = JsElement::new_text(handle, text);
-        self.nodes.insert(handle, elem);
-        debug!(handle, text, "createTextNode");
-        handle
-    }
-
-    /// Remove a child from its parent.
-    pub fn remove_child(&mut self, parent: ElementHandle, child: ElementHandle) -> bool {
-        let Some(parent_elem) = self.nodes.get_mut(&parent) else {
-            warn!(parent, child, "removeChild: parent not found");
-            return false;
-        };
-        let len_before = parent_elem.children.len();
-        parent_elem.children.retain(|&h| h != child);
-        let removed = parent_elem.children.len() < len_before;
-        if removed {
-            debug!(parent, child, "removeChild");
-        }
-        removed
-    }
-
-    /// Get inline style property value.
-    pub fn style_get_property(&self, handle: ElementHandle, name: &str) -> Option<String> {
-        self.nodes
-            .get(&handle)?
-            .inline_styles
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.clone())
-    }
-
-    /// Check if a classList contains a class.
-    pub fn class_list_contains(&self, handle: ElementHandle, cls: &str) -> bool {
-        self.nodes
-            .get(&handle)
-            .map(|e| e.class_attr().split_whitespace().any(|c| c == cls))
-            .unwrap_or(false)
-    }
-
-    /// Toggle a class in classList. Returns true if class is now present.
-    pub fn class_list_toggle(&mut self, handle: ElementHandle, cls: &str) -> bool {
-        if self.class_list_contains(handle, cls) {
-            self.class_list_remove(handle, cls);
-            false
-        } else {
-            self.class_list_add(handle, cls);
-            true
-        }
-    }
-
-    /// Get the `className` (class attribute value) for an element.
-    pub fn class_name(&self, handle: ElementHandle) -> String {
-        self.nodes
-            .get(&handle)
-            .map(|e| e.class_attr())
+    /// Get all listeners for a given element handle and event type.
+    pub fn get_listeners(&self, handle: ElementHandle, event_type: &str) -> Vec<&EventCallback> {
+        let key = (handle, event_type.to_owned());
+        self.listeners
+            .get(&key)
+            .map(|v| v.iter().collect())
             .unwrap_or_default()
-    }
-
-    /// Set the `className` attribute for an element.
-    pub fn set_class_name(&mut self, handle: ElementHandle, value: &str) {
-        if let Some(elem) = self.nodes.get_mut(&handle) {
-            elem.set_class_attr(value.to_owned());
-        }
-    }
-
-    /// Get the `id` attribute for an element.
-    pub fn get_id(&self, handle: ElementHandle) -> String {
-        self.get_attribute(handle, "id").unwrap_or_default()
-    }
-
-    /// Set the `id` attribute for an element.
-    pub fn set_id(&mut self, handle: ElementHandle, value: &str) {
-        self.set_attribute(handle, "id", value);
-    }
-
-    /// Get all child handles (including text nodes).
-    pub fn child_nodes(&self, handle: ElementHandle) -> Vec<ElementHandle> {
-        self.nodes
-            .get(&handle)
-            .map(|e| e.children.clone())
-            .unwrap_or_default()
-    }
-
-    /// Find the body element handle.
-    pub fn body(&self) -> Option<ElementHandle> {
-        self.find_by_tag("body", self.root)
-    }
-
-    /// Get or set the document title.
-    pub fn get_title(&self) -> String {
-        if let Some(title_handle) = self.find_by_tag("title", self.root) {
-            self.get_text_content(title_handle)
-        } else {
-            String::new()
-        }
-    }
-
-    /// Set the document title.
-    pub fn set_title(&mut self, title: &str) {
-        if let Some(title_handle) = self.find_by_tag("title", self.root) {
-            self.set_text_content(title_handle, title);
-        }
-    }
-
-    /// Query selector scoped to a specific element.
-    pub fn query_selector_within(
-        &self,
-        handle: ElementHandle,
-        selector: &str,
-    ) -> Option<ElementHandle> {
-        let selector = selector.trim();
-        if selector.starts_with('#') {
-            self.find_by_attr("id", &selector[1..], handle)
-        } else if selector.starts_with('.') {
-            self.find_by_class(&selector[1..], handle)
-        } else {
-            self.find_by_tag(selector, handle)
-        }
-    }
-
-    /// Query selector all scoped to a specific element.
-    pub fn query_selector_all_within(
-        &self,
-        handle: ElementHandle,
-        selector: &str,
-    ) -> Vec<ElementHandle> {
-        let selector = selector.trim();
-        let mut results = Vec::new();
-        if selector.starts_with('#') {
-            self.collect_by_attr("id", &selector[1..], handle, &mut results);
-        } else if selector.starts_with('.') {
-            self.collect_by_class(&selector[1..], handle, &mut results);
-        } else {
-            self.collect_by_tag(selector, handle, &mut results);
-        }
-        results
     }
 }
 
@@ -1121,12 +798,25 @@ fn parse_attributes(input: &str, out: &mut Vec<(String, String)>) {
 /// el.style.setProperty("color", "red");
 /// el.appendChild(child);
 /// el.addEventListener("click", function() { … });
+/// fetch("url", { method: "POST", headers: {...}, body: "..." });
 /// console.log("…");
 /// ```
 ///
 /// Returns a [`JsValue`] (the result of the last expression, or `Undefined`).
 pub fn eval_script(source: &str, tree: Arc<Mutex<JsDomTree>>) -> JsValue {
     eval_script_with_env(source, tree, &[])
+}
+
+/// Like [`eval_script`] but with an optional [`CoreApi`] for network access.
+///
+/// When `core` is provided, `fetch()` calls are routed through the core's
+/// capability system to the network mod.
+pub fn eval_script_with_core(
+    source: &str,
+    tree: Arc<Mutex<JsDomTree>>,
+    core: Option<&Arc<dyn CoreApi>>,
+) -> JsValue {
+    eval_script_with_env_and_core(source, tree, &[], core)
 }
 
 /// Like [`eval_script`] but pre-seeds the interpreter's variable environment
@@ -1138,6 +828,18 @@ pub fn eval_script_with_env(
     source: &str,
     tree: Arc<Mutex<JsDomTree>>,
     initial_env: &[(String, ElementHandle)],
+) -> JsValue {
+    eval_script_with_env_and_core(source, tree, initial_env, None)
+}
+
+/// Full-featured script evaluation with environment seeding and optional CoreApi.
+///
+/// Combines the features of [`eval_script_with_env`] and [`eval_script_with_core`].
+pub fn eval_script_with_env_and_core(
+    source: &str,
+    tree: Arc<Mutex<JsDomTree>>,
+    initial_env: &[(String, ElementHandle)],
+    core: Option<&Arc<dyn CoreApi>>,
 ) -> JsValue {
     let mut env: HashMap<String, ElementHandle> = initial_env
         .iter()
@@ -1157,7 +859,7 @@ pub fn eval_script_with_env(
         }
 
         // Evaluate and update last value.
-        last_value = eval_statement(line, &mut env, Arc::clone(&tree));
+        last_value = eval_statement(line, &mut env, Arc::clone(&tree), core);
     }
 
     last_value
@@ -1195,6 +897,7 @@ fn eval_statement(
     line: &str,
     env: &mut HashMap<String, ElementHandle>,
     tree: Arc<Mutex<JsDomTree>>,
+    core: Option<&Arc<dyn CoreApi>>,
 ) -> JsValue {
     let line = line.trim_end_matches(';').trim();
 
@@ -1210,6 +913,13 @@ fn eval_statement(
                 return JsValue::Number(handle as f64);
             }
         }
+    }
+
+    // ── fetch() ───────────────────────────────────────────────────────────────
+
+    if line.starts_with("fetch(") {
+        let args = extract_call_args(line, "fetch");
+        return eval_fetch(args, core);
     }
 
     // ── console.log ───────────────────────────────────────────────────────────
@@ -1325,7 +1035,7 @@ fn eval_statement(
                     .collect();
                 tree.lock()
                     .unwrap()
-                    .add_event_listener(handle, &event_type, &cb_body, captured);
+                    .add_event_listener(handle, &event_type, &cb_body, captured, false);
             }
         }
         return JsValue::Undefined;
@@ -1371,6 +1081,47 @@ fn eval_dom_expr(
     }
 
     None
+}
+
+/// Evaluate a `fetch()` call and return the response as a JsValue.
+///
+/// If no CoreApi is available, returns an error object.  Otherwise, performs
+/// a synchronous HTTP request through the core's capability routing.
+fn eval_fetch(args: &str, core: Option<&Arc<dyn CoreApi>>) -> JsValue {
+    let Some(core) = core else {
+        warn!("fetch() called but no CoreApi available");
+        return JsValue::Object(vec![
+            ("error".to_string(), JsValue::String("fetch: no network available".to_string())),
+        ]);
+    };
+
+    let (url, method, headers, body) = fetch_api::parse_fetch_call(args);
+    debug!(url = %url, method = %method, "fetch() called from JS");
+
+    match fetch_api::execute_fetch(core, &url, &method, headers, body.as_deref()) {
+        Ok(resp) => {
+            // Return a Response-like object.
+            let headers_obj: Vec<(String, JsValue)> = resp
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), JsValue::String(v.clone())))
+                .collect();
+
+            JsValue::Object(vec![
+                ("status".to_string(), JsValue::Number(resp.status as f64)),
+                ("ok".to_string(), JsValue::Boolean(resp.status >= 200 && resp.status < 300)),
+                ("url".to_string(), JsValue::String(resp.url)),
+                ("headers".to_string(), JsValue::Object(headers_obj)),
+                ("body".to_string(), JsValue::String(resp.body)),
+            ])
+        }
+        Err(e) => {
+            warn!(error = %e, "fetch() failed");
+            JsValue::Object(vec![
+                ("error".to_string(), JsValue::String(e)),
+            ])
+        }
+    }
 }
 
 // ── Parsing helpers ───────────────────────────────────────────────────────────
@@ -1665,7 +1416,7 @@ mod tests {
         };
         {
             let mut tree = tree_arc.lock().unwrap();
-            tree.add_event_listener(handle, "click", "console.log('clicked');", vec![]);
+            tree.add_event_listener(handle, "click", "console.log('clicked');", vec![], false);
         }
         let callbacks = tree_arc.lock().unwrap().dispatch_event(handle, "click");
         assert_eq!(callbacks.len(), 1);

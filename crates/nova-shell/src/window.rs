@@ -592,7 +592,7 @@ impl BrowserWindow {
         }
 
         self.framebuffer
-            .draw_text(text_x, text_y, &self.url_bar_text, URL_BAR_FONT_SIZE, text_color, None, None, None);
+            .draw_text(text_x, text_y, &self.url_bar_text, URL_BAR_FONT_SIZE, text_color, None, None, None, None);
 
         // -- Cursor (vertical line at the cursor position) --
         if self.url_bar_focused && !self.url_bar_select_all {

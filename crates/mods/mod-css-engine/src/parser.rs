@@ -71,6 +71,8 @@ struct MediaQuery {
     max_width: Option<f32>,
     /// If `true`, the query always evaluates to `false` (e.g. `print`).
     never: bool,
+    /// Expected color scheme: Some("dark"), Some("light"), or None (no preference).
+    prefers_color_scheme: Option<String>,
 }
 
 impl MediaQuery {
@@ -86,6 +88,13 @@ impl MediaQuery {
         }
         if let Some(max) = self.max_width {
             if viewport_width > max {
+                return false;
+            }
+        }
+        if let Some(ref scheme) = self.prefers_color_scheme {
+            // Default to "light" mode. In the future, this should come from OS settings.
+            let os_scheme = "light";
+            if scheme != os_scheme {
                 return false;
             }
         }
@@ -107,6 +116,7 @@ fn parse_media_query(query: &str) -> MediaQuery {
             min_width: None,
             max_width: None,
             never: true,
+            prefers_color_scheme: None,
         };
     }
 
@@ -116,6 +126,7 @@ fn parse_media_query(query: &str) -> MediaQuery {
             min_width: None,
             max_width: None,
             never: false,
+            prefers_color_scheme: None,
         };
     }
 
@@ -123,6 +134,7 @@ fn parse_media_query(query: &str) -> MediaQuery {
         min_width: None,
         max_width: None,
         never: false,
+        prefers_color_scheme: None,
     };
 
     // Split by `and` and parse each condition.
@@ -145,6 +157,11 @@ fn parse_media_query(query: &str) -> MediaQuery {
         } else if let Some(val_str) = inner.strip_prefix("max-width:").or(inner.strip_prefix("max-width :")) {
             if let Some(px) = parse_px_value(val_str.trim()) {
                 mq.max_width = Some(px);
+            }
+        } else if let Some(val_str) = inner.strip_prefix("prefers-color-scheme:").or(inner.strip_prefix("prefers-color-scheme :")) {
+            let scheme = val_str.trim().to_lowercase();
+            if scheme == "dark" || scheme == "light" {
+                mq.prefers_color_scheme = Some(scheme);
             }
         }
     }
@@ -849,6 +866,34 @@ mod tests {
         "#;
         let rules = parse_stylesheet(css, TEST_VP);
         assert_eq!(rules.len(), 2, "h1 and p rules should both be present");
+    }
+
+    // ── prefers-color-scheme tests ─────────────────────────────────────
+
+    #[test]
+    fn media_prefers_color_scheme_light() {
+        let css = r#"
+            body { color: black; }
+            @media (prefers-color-scheme: light) {
+                body { background: white; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, TEST_VP);
+        // Light scheme matches our default, so both rules should be present.
+        assert_eq!(rules.len(), 2);
+    }
+
+    #[test]
+    fn media_prefers_color_scheme_dark() {
+        let css = r#"
+            body { color: black; }
+            @media (prefers-color-scheme: dark) {
+                body { background: #333; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, TEST_VP);
+        // Dark scheme doesn't match (we default to light), so only 1 rule.
+        assert_eq!(rules.len(), 1);
     }
 
     #[test]

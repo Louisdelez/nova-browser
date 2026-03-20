@@ -445,6 +445,9 @@ pub fn parse_color(raw: &str) -> Option<CssColor> {
     if raw.starts_with("rgb") {
         return parse_rgb_color(raw);
     }
+    if raw.starts_with("hsl") {
+        return parse_hsl_color(raw);
+    }
     parse_named_color(raw)
 }
 
@@ -540,6 +543,107 @@ fn parse_color_component(s: &str) -> Option<u8> {
         let val: f32 = s.parse().ok()?;
         Some(val.round().clamp(0.0, 255.0) as u8)
     }
+}
+
+/// Parse `hsl(h, s%, l%)` or `hsla(h, s%, l%, a)`.
+///
+/// Also supports the modern space-separated syntax: `hsl(h s% l% / a)`.
+fn parse_hsl_color(raw: &str) -> Option<CssColor> {
+    let inner = raw
+        .strip_prefix("hsla(")
+        .or_else(|| raw.strip_prefix("hsl("))?
+        .strip_suffix(')')?
+        .trim();
+
+    // Split by comma or slash (modern syntax uses spaces + slash for alpha).
+    let parts: Vec<&str> = if inner.contains(',') {
+        inner.split(',').map(str::trim).collect()
+    } else {
+        let slash_parts: Vec<&str> = inner.splitn(2, '/').collect();
+        let mut hsl: Vec<&str> = slash_parts[0].split_whitespace().collect();
+        if slash_parts.len() > 1 {
+            hsl.push(slash_parts[1].trim());
+        }
+        hsl
+    };
+
+    if parts.len() < 3 {
+        return None;
+    }
+
+    // Parse hue (degrees, optionally with deg/rad/turn suffix).
+    let h = parse_hue(parts[0])?;
+    // Parse saturation (0-100, with optional %).
+    let s = parse_percent_value(parts[1])?;
+    // Parse lightness (0-100, with optional %).
+    let l = parse_percent_value(parts[2])?;
+    let a = if parts.len() >= 4 {
+        let a_str = parts[3].trim();
+        if let Some(pct) = a_str.strip_suffix('%') {
+            pct.trim().parse::<f32>().unwrap_or(100.0) / 100.0
+        } else {
+            a_str.parse::<f32>().unwrap_or(1.0)
+        }
+    } else {
+        1.0
+    };
+
+    let (r, g, b) = hsl_to_rgb(h, s / 100.0, l / 100.0);
+    Some(CssColor {
+        r: (r * 255.0).round().clamp(0.0, 255.0) as u8,
+        g: (g * 255.0).round().clamp(0.0, 255.0) as u8,
+        b: (b * 255.0).round().clamp(0.0, 255.0) as u8,
+        a,
+    })
+}
+
+/// Parse a hue value (degrees). Supports bare numbers, `deg`, `rad`, `turn`.
+fn parse_hue(s: &str) -> Option<f32> {
+    let s = s.trim();
+    if let Some(v) = s.strip_suffix("deg") {
+        v.trim().parse::<f32>().ok()
+    } else if let Some(v) = s.strip_suffix("rad") {
+        v.trim().parse::<f32>().ok().map(|r| r.to_degrees())
+    } else if let Some(v) = s.strip_suffix("turn") {
+        v.trim().parse::<f32>().ok().map(|t| t * 360.0)
+    } else {
+        s.parse::<f32>().ok()
+    }
+    .map(|h| ((h % 360.0) + 360.0) % 360.0) // Normalize to 0-360
+}
+
+/// Parse a percentage value, stripping the optional `%` suffix.
+fn parse_percent_value(s: &str) -> Option<f32> {
+    let s = s.trim();
+    if let Some(pct) = s.strip_suffix('%') {
+        pct.trim().parse::<f32>().ok()
+    } else {
+        s.parse::<f32>().ok()
+    }
+}
+
+/// Convert HSL to RGB. h is in degrees (0-360), s and l are 0.0-1.0.
+/// Returns (r, g, b) each in 0.0-1.0.
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    if s == 0.0 {
+        return (l, l, l); // achromatic
+    }
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+    let h_norm = h / 360.0;
+    let r = hue_to_rgb(p, q, h_norm + 1.0 / 3.0);
+    let g = hue_to_rgb(p, q, h_norm);
+    let b = hue_to_rgb(p, q, h_norm - 1.0 / 3.0);
+    (r, g, b)
+}
+
+fn hue_to_rgb(p: f32, q: f32, mut t: f32) -> f32 {
+    if t < 0.0 { t += 1.0; }
+    if t > 1.0 { t -= 1.0; }
+    if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
+    if t < 1.0 / 2.0 { return q; }
+    if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+    p
 }
 
 /// Parse a named CSS color.
@@ -867,6 +971,56 @@ mod tests {
         // calc((10px + 20px) * 3) → 90
         let result = eval_calc("(10px + 20px) * 3", 0.0);
         assert_eq!(result, Some(90.0));
+    }
+
+    // ── HSL color tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn hsl_pure_red() {
+        let c = parse_color("hsl(0, 100%, 50%)").unwrap();
+        assert_eq!(c.r, 255);
+        assert_eq!(c.g, 0);
+        assert_eq!(c.b, 0);
+        assert_eq!(c.a, 1.0);
+    }
+
+    #[test]
+    fn hsl_pure_green() {
+        let c = parse_color("hsl(120, 100%, 50%)").unwrap();
+        assert_eq!(c.r, 0);
+        assert_eq!(c.g, 255);  // might be 128 depending on rounding
+        assert!(c.g >= 127); // green channel should be high
+        assert_eq!(c.b, 0);
+    }
+
+    #[test]
+    fn hsl_pure_blue() {
+        let c = parse_color("hsl(240, 100%, 50%)").unwrap();
+        assert_eq!(c.r, 0);
+        assert_eq!(c.g, 0);
+        assert_eq!(c.b, 255);
+    }
+
+    #[test]
+    fn hsla_with_alpha() {
+        let c = parse_color("hsla(0, 100%, 50%, 0.5)").unwrap();
+        assert_eq!(c.r, 255);
+        assert!((c.a - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn hsl_modern_syntax() {
+        let c = parse_color("hsl(120 100% 50%)").unwrap();
+        assert!(c.g >= 127);
+    }
+
+    #[test]
+    fn hsl_achromatic() {
+        let c = parse_color("hsl(0, 0%, 50%)").unwrap();
+        // Should be gray: r ≈ g ≈ b ≈ 128
+        assert!((c.r as i32 - 128).abs() <= 1);
+        assert!((c.g as i32 - 128).abs() <= 1);
+        assert!((c.b as i32 - 128).abs() <= 1);
     }
 
     #[test]

@@ -525,6 +525,7 @@ impl Framebuffer {
         font_weight: Option<u16>,
         font_style: Option<&str>,
         font_family: Option<&str>,
+        letter_spacing: Option<f32>,
     ) {
         if self.font_renderer.is_none() {
             self.draw_text_bitmap(x, y, text, font_size, color);
@@ -601,6 +602,9 @@ impl Framebuffer {
             }
 
             cx += metrics.advance_width as i32;
+            if let Some(ls) = letter_spacing {
+                cx += ls.round() as i32;
+            }
         }
 
         // Put the renderer back.
@@ -705,10 +709,10 @@ impl Framebuffer {
                 RenderOp::FillRect { x, y, width, height, color } => {
                     self.fill_rect(*x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, *color);
                 }
-                RenderOp::DrawText { x, y, text, font_size, color, font_weight, font_style, font_family } => {
+                RenderOp::DrawText { x, y, text, font_size, color, font_weight, font_style, font_family, letter_spacing } => {
                     self.draw_text(
                         *x - sx, *y + y_offset - scroll_y + sy_extra, text, *font_size, *color,
-                        *font_weight, font_style.as_deref(), font_family.as_deref(),
+                        *font_weight, font_style.as_deref(), font_family.as_deref(), *letter_spacing,
                     );
                 }
                 RenderOp::StrokeRect { x, y, width, height, color, width_px } => {
@@ -763,6 +767,20 @@ impl Framebuffer {
                 }
                 RenderOp::StickyEnd => {
                     self.translate_y_offset = 0.0;
+                }
+                // Scrollable container: clip child rendering to the container bounds.
+                // Internal scroll state is tracked by the window; for now this
+                // behaves like PushClip/PopClip.
+                RenderOp::ScrollContainerStart { x, y, width, height, .. } => {
+                    self.clip_stack.push(ClipRect {
+                        x: (*x - sx).round() as i32,
+                        y: (*y + y_offset - scroll_y + sy_extra).round() as i32,
+                        width: width.round() as i32,
+                        height: height.round() as i32,
+                    });
+                }
+                RenderOp::ScrollContainerEnd => {
+                    self.clip_stack.pop();
                 }
                 // Link ops are metadata-only; they don't draw anything.
                 RenderOp::Link { .. } => {}

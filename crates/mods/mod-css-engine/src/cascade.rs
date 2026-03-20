@@ -199,6 +199,11 @@ fn apply_styles_recursive(
             attributes,
             children,
         } => {
+            // Skip elements that are never visible — no need to compute styles.
+            if matches!(tag.as_str(), "script" | "style" | "template" | "noscript" | "svg" | "math") {
+                return DomNode::Element { tag, attributes, children };
+            }
+
             // Build a temporary node for matching (without children for efficiency).
             let temp_node = DomNode::Element {
                 tag: tag.clone(),
@@ -312,6 +317,11 @@ fn apply_styles_recursive_with_siblings(
             attributes,
             children,
         } => {
+            // Skip elements that are never visible — no need to compute styles.
+            if matches!(tag.as_str(), "script" | "style" | "template" | "noscript" | "svg" | "math") {
+                return DomNode::Element { tag, attributes, children };
+            }
+
             let temp_node = DomNode::Element {
                 tag: tag.clone(),
                 attributes: attributes.clone(),
@@ -428,7 +438,9 @@ fn compute_element_style_impl(
     // Track which inherited properties we've already found (from a closer
     // ancestor) so we only take the nearest value for each property.
     let mut inherited_props: Vec<String> = Vec::new();
-    for ancestor in ancestors.iter().rev() {
+    // Only check the nearest 5 ancestors for inherited properties to limit
+    // O(depth) cost on deeply nested DOMs.
+    for ancestor in ancestors.iter().rev().take(5) {
         if let DomNode::Element { attributes, .. } = ancestor {
             if let Some(style_str) = attributes.iter().find(|(k, _)| k == "data-nova-style") {
                 for decl in style_str.1.split(';') {

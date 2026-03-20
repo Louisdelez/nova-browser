@@ -89,6 +89,12 @@ impl NovaMod for PainterMod {
                 let mut ops = Vec::new();
                 paint_box(&root, &mut ops, &images_map);
 
+                // Post-process: coalesce adjacent DrawText ops on the same line
+                // into single ops. This ensures consistent word spacing because
+                // the renderer draws the combined string in one pass instead of
+                // positioning each word independently.
+                let ops = coalesce_text_ops(ops);
+
                 debug!(op_count = ops.len(), "painting complete");
                 Ok(TypedData::RenderCommands(RenderCommands { ops, fonts: vec![] }))
             }
@@ -102,6 +108,107 @@ impl NovaMod for PainterMod {
         info!(mod_id = %self.manifest.id, "painter mod shutting down");
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Text op coalescing
+// ---------------------------------------------------------------------------
+
+/// Merge consecutive `DrawText` ops that share the same Y coordinate, font size,
+/// color, weight, style, and family into a single `DrawText` op.
+///
+/// Individual words are laid out by the layout engine as separate boxes, each
+/// producing its own `DrawText` op. When the renderer draws them independently,
+/// slight differences between layout measurement and rendering measurement
+/// cause words to visually overlap or have inconsistent spacing.
+///
+/// By joining adjacent words into one string (with a space between them when
+/// there's a gap), the renderer draws the whole line in one pass and its own
+/// advance-width calculations keep the spacing consistent.
+fn coalesce_text_ops(ops: Vec<RenderOp>) -> Vec<RenderOp> {
+    let mut result: Vec<RenderOp> = Vec::with_capacity(ops.len());
+
+    for op in ops {
+        if let RenderOp::DrawText {
+            x, y, ref text, font_size, color, ref font_weight, ref font_style, ref font_family, ref letter_spacing,
+        } = op
+        {
+            // Try to merge with the previous DrawText if on the same line.
+            let merged = match result.last() {
+                Some(RenderOp::DrawText {
+                    x: prev_x,
+                    y: prev_y,
+                    text: prev_text,
+                    font_size: prev_fs,
+                    color: prev_color,
+                    font_weight: prev_fw,
+                    font_style: prev_fst,
+                    font_family: prev_ff,
+                    letter_spacing: prev_ls,
+                }) => {
+                    // Same baseline Y (within 0.5px), same font properties, and same color.
+                    (y - prev_y).abs() < 0.5
+                        && (font_size - prev_fs).abs() < 0.1
+                        && color_eq(&color, prev_color)
+                        && font_weight == prev_fw
+                        && font_style == prev_fst
+                        && font_family == prev_ff
+                        && letter_spacing == prev_ls
+                        && x > *prev_x
+                        && (x - *prev_x) < prev_text.len() as f32 * font_size + font_size * 3.0
+                }
+                _ => false,
+            };
+
+            if merged {
+                // Pop the previous and merge.
+                if let Some(RenderOp::DrawText {
+                    x: prev_x,
+                    y: prev_y,
+                    text: prev_text,
+                    font_size: prev_fs,
+                    color: prev_color,
+                    font_weight: prev_fw,
+                    font_style: prev_fst,
+                    font_family: prev_ff,
+                    letter_spacing: prev_ls,
+                }) = result.pop()
+                {
+                    let combined = if text.starts_with(' ') || prev_text.ends_with(' ') {
+                        format!("{}{}", prev_text, text)
+                    } else {
+                        format!("{} {}", prev_text, text)
+                    };
+                    result.push(RenderOp::DrawText {
+                        x: prev_x,
+                        y: prev_y,
+                        text: combined,
+                        font_size: prev_fs,
+                        color: prev_color,
+                        font_weight: prev_fw,
+                        font_style: prev_fst,
+                        font_family: prev_ff,
+                        letter_spacing: prev_ls,
+                    });
+                }
+            } else {
+                result.push(op);
+            }
+        } else {
+            result.push(op);
+        }
+    }
+
+    result
+}
+
+/// Compare two colors for approximate equality.
+#[inline]
+fn color_eq(a: &Color, b: &Color) -> bool {
+    (a.r - b.r).abs() < 0.01
+        && (a.g - b.g).abs() < 0.01
+        && (a.b - b.b).abs() < 0.01
+        && (a.a - b.a).abs() < 0.01
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +313,65 @@ fn extract_transform(style: &nova_mod_api::content::StyleMap) -> Option<CssTrans
     None
 }
 
+/// Check if this element creates a new stacking context.
+///
+/// A stacking context is created by elements with:
+/// - `z-index` set AND `position` is not `static`
+/// - `opacity` < 1.0
+/// - CSS `transform` is set (non-none)
+/// - `position: fixed` or `position: sticky`
+fn creates_stacking_context(style: &nova_mod_api::content::StyleMap) -> bool {
+    let mut has_z_index = false;
+    let mut has_position = false;
+    let mut has_opacity_lt_1 = false;
+    let mut has_transform = false;
+    let mut is_fixed_or_sticky = false;
+
+    for (key, value) in &style.properties {
+        match key.as_str() {
+            "z-index" => {
+                match value {
+                    StyleValue::Number(n) if *n != 0.0 => has_z_index = true,
+                    StyleValue::Keyword(s) | StyleValue::Str(s) => {
+                        if s.trim() != "auto" {
+                            has_z_index = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "position" => {
+                if let StyleValue::Keyword(k) | StyleValue::Str(k) = value {
+                    let pos = k.trim();
+                    if pos != "static" { has_position = true; }
+                    if pos == "fixed" || pos == "sticky" { is_fixed_or_sticky = true; }
+                }
+            }
+            "opacity" => {
+                match value {
+                    StyleValue::Number(n) if *n < 1.0 => has_opacity_lt_1 = true,
+                    StyleValue::Str(s) | StyleValue::Keyword(s) => {
+                        if let Ok(v) = s.parse::<f32>() {
+                            if v < 1.0 { has_opacity_lt_1 = true; }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "transform" => {
+                if let StyleValue::Str(s) | StyleValue::Keyword(s) = value {
+                    if s.trim() != "none" && !s.trim().is_empty() {
+                        has_transform = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (has_z_index && has_position) || has_opacity_lt_1 || has_transform || is_fixed_or_sticky
+}
+
 /// Recursively paint a layout box into render operations.
 fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<String, Vec<u8>>) {
     // Skip zero-sized boxes (display: none, comments, etc.).
@@ -277,18 +443,78 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     // Paint background-image (url() or linear-gradient).
     if let Some(bg_image) = extract_background_image_value(&layout_box.style) {
         if bg_image.starts_with("url(") {
-            // Background image from URL.
             if let Some(url) = extract_css_url(&bg_image) {
                 if let Some(decoded) = images.get(&url) {
                     if decoded.len() >= 8 {
                         let iw = u32::from_le_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]);
                         let ih = u32::from_le_bytes([decoded[4], decoded[5], decoded[6], decoded[7]]);
                         let px = decoded[8..].to_vec();
-                        ops.push(RenderOp::DrawImage {
-                            x: layout_box.x, y: layout_box.y,
-                            width: layout_box.width, height: layout_box.height,
-                            img_width: iw, img_height: ih, pixels: px,
-                        });
+                        let img_w = iw as f32;
+                        let img_h = ih as f32;
+
+                        let bg_repeat = extract_background_repeat(&layout_box.style);
+                        let (pos_x, pos_y) = extract_background_position(&layout_box.style);
+                        let (size_w, size_h) = extract_background_size(
+                            &layout_box.style, layout_box.width, layout_box.height, img_w, img_h,
+                        );
+
+                        // Calculate the positioned origin of the background image.
+                        let origin_x = layout_box.x + (layout_box.width - size_w) * pos_x;
+                        let origin_y = layout_box.y + (layout_box.height - size_h) * pos_y;
+
+                        match bg_repeat {
+                            "no-repeat" => {
+                                ops.push(RenderOp::DrawImage {
+                                    x: origin_x, y: origin_y,
+                                    width: size_w, height: size_h,
+                                    img_width: iw, img_height: ih, pixels: px,
+                                });
+                            }
+                            "repeat-x" => {
+                                if size_w > 0.0 {
+                                    let mut cx = layout_box.x;
+                                    while cx < layout_box.x + layout_box.width {
+                                        ops.push(RenderOp::DrawImage {
+                                            x: cx, y: origin_y,
+                                            width: size_w, height: size_h,
+                                            img_width: iw, img_height: ih, pixels: px.clone(),
+                                        });
+                                        cx += size_w;
+                                    }
+                                }
+                            }
+                            "repeat-y" => {
+                                if size_h > 0.0 {
+                                    let mut cy = layout_box.y;
+                                    while cy < layout_box.y + layout_box.height {
+                                        ops.push(RenderOp::DrawImage {
+                                            x: origin_x, y: cy,
+                                            width: size_w, height: size_h,
+                                            img_width: iw, img_height: ih, pixels: px.clone(),
+                                        });
+                                        cy += size_h;
+                                    }
+                                }
+                            }
+                            _ => {
+                                // "repeat" — tile in both directions
+                                if size_w > 0.0 && size_h > 0.0 {
+                                    let mut cy = layout_box.y;
+                                    while cy < layout_box.y + layout_box.height {
+                                        let mut cx = layout_box.x;
+                                        while cx < layout_box.x + layout_box.width {
+                                            ops.push(RenderOp::DrawImage {
+                                                x: cx, y: cy,
+                                                width: size_w, height: size_h,
+                                                img_width: iw, img_height: ih, pixels: px.clone(),
+                                            });
+                                            cx += size_w;
+                                        }
+                                        cy += size_h;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -301,15 +527,20 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         }
     }
 
-    // Paint text content.
+    // Paint text content (including space-only nodes for inter-element spacing).
     if let LayoutContent::Text(ref text) = layout_box.content {
-        if !text.trim().is_empty() {
+        if !text.is_empty() {
             let font_size = extract_font_size(&layout_box.style);
             let text_color = multiply_alpha(extract_text_color(&layout_box.style), opacity);
             let font_weight = extract_font_weight(&layout_box.style);
             let font_style = extract_font_style(&layout_box.style);
             let font_family = extract_font_family(&layout_box.style);
-            let transformed_text = apply_text_transform(text, &layout_box.style);
+            let letter_spacing = extract_letter_spacing(&layout_box.style);
+            let mut transformed_text = apply_text_transform(text, &layout_box.style);
+            // Apply text-overflow: ellipsis if needed.
+            if has_text_overflow_ellipsis(&layout_box.style) && layout_box.width > 0.0 {
+                transformed_text = truncate_with_ellipsis(&transformed_text, font_size, layout_box.width);
+            }
             ops.push(RenderOp::DrawText {
                 x: layout_box.x,
                 y: layout_box.y + font_size, // baseline offset
@@ -319,6 +550,7 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                 font_weight,
                 font_style,
                 font_family,
+                letter_spacing,
             });
 
             // Draw underline if text-decoration: underline is set.
@@ -363,12 +595,33 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                 font_weight: None,
                 font_style: None,
                 font_family: None,
+                letter_spacing: None,
             });
         }
     }
 
     // Emit FormField op for interactive form elements.
     if let Some((field_type, value)) = extract_form_field(&layout_box.style) {
+        // If this is a text input with an empty value, show placeholder text in gray.
+        let placeholder = extract_placeholder(&layout_box.style);
+        if value.is_empty() && !placeholder.is_empty()
+            && matches!(field_type.as_str(), "text" | "email" | "search" | "url" | "tel" | "password" | "textarea")
+        {
+            let font_size = extract_font_size(&layout_box.style);
+            let placeholder_color = multiply_alpha(Color::rgb(0.6, 0.6, 0.6), opacity);
+            ops.push(RenderOp::DrawText {
+                x: layout_box.x + 4.0,
+                y: layout_box.y + font_size,
+                text: placeholder.clone(),
+                font_size,
+                color: placeholder_color,
+                font_weight: None,
+                font_style: Some("italic".to_string()),
+                font_family: None,
+                letter_spacing: None,
+            });
+        }
+
         ops.push(RenderOp::FormField {
             x: layout_box.x,
             y: layout_box.y,
@@ -421,7 +674,21 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
 
     // Check whether this box clips its overflow.
     let clips_overflow = has_overflow_clip(&layout_box.style);
-    if clips_overflow {
+
+    // Check if this is a scrollable container (overflow: auto/scroll with overflowing content).
+    let is_scroll_container = is_overflow_scroll(&layout_box.style);
+    let content_height = layout_box.children.iter()
+        .map(|c| c.y + c.height - layout_box.y)
+        .fold(0.0_f32, f32::max);
+    if is_scroll_container && content_height > layout_box.height {
+        ops.push(RenderOp::ScrollContainerStart {
+            x: layout_box.x,
+            y: layout_box.y,
+            width: layout_box.width,
+            height: layout_box.height,
+            content_height,
+        });
+    } else if clips_overflow {
         ops.push(RenderOp::PushClip {
             x: layout_box.x,
             y: layout_box.y,
@@ -430,15 +697,26 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         });
     }
 
-    // Recurse into children, sorted by z_index (stable sort preserves DOM order
-    // for equal z-index values, which matches CSS stacking context semantics).
+    // Recurse into children. Children that create stacking contexts are
+    // painted in z-index order; other children paint in DOM order.
     let mut child_indices: Vec<usize> = (0..layout_box.children.len()).collect();
     child_indices.sort_by_key(|&i| layout_box.children[i].z_index);
     for i in child_indices {
-        paint_box(&layout_box.children[i], ops, images);
+        let child = &layout_box.children[i];
+        let is_stacking_ctx = creates_stacking_context(&child.style);
+        if is_stacking_ctx {
+            // Isolate this child's painting in a save/restore block.
+            ops.push(RenderOp::Save);
+        }
+        paint_box(child, ops, images);
+        if is_stacking_ctx {
+            ops.push(RenderOp::Restore);
+        }
     }
 
-    if clips_overflow {
+    if is_scroll_container && content_height > layout_box.height {
+        ops.push(RenderOp::ScrollContainerEnd);
+    } else if clips_overflow {
         ops.push(RenderOp::PopClip);
     }
 
@@ -449,6 +727,75 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     if needs_translate {
         ops.push(RenderOp::Restore);
     }
+}
+
+/// Check if the style requests text-overflow: ellipsis.
+fn has_text_overflow_ellipsis(style: &nova_mod_api::content::StyleMap) -> bool {
+    let mut has_ellipsis = false;
+    let mut has_overflow_hidden = false;
+
+    for (key, value) in &style.properties {
+        match key.as_str() {
+            "text-overflow" => {
+                if let StyleValue::Keyword(k) | StyleValue::Str(k) = value {
+                    if k.trim() == "ellipsis" {
+                        has_ellipsis = true;
+                    }
+                }
+            }
+            "overflow" | "overflow-x" => {
+                if let StyleValue::Keyword(k) | StyleValue::Str(k) = value {
+                    if matches!(k.trim(), "hidden" | "clip") {
+                        has_overflow_hidden = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    has_ellipsis && has_overflow_hidden
+}
+
+/// Truncate text and append "..." if it exceeds the given width.
+///
+/// Uses character width estimation. Not exact but good enough for visible
+/// truncation.
+fn truncate_with_ellipsis(text: &str, font_size: f32, max_width: f32) -> String {
+    let ellipsis = "...";
+    let ellipsis_width = estimate_text_width(ellipsis, font_size);
+
+    if max_width <= ellipsis_width {
+        return ellipsis.to_string();
+    }
+
+    let available = max_width - ellipsis_width;
+    let mut current_width = 0.0;
+    let mut truncated = String::new();
+
+    for ch in text.chars() {
+        let char_width = estimate_char_width(ch, font_size);
+        if current_width + char_width > available {
+            truncated.push_str(ellipsis);
+            return truncated;
+        }
+        current_width += char_width;
+        truncated.push(ch);
+    }
+
+    // Text fits — no truncation needed.
+    text.to_string()
+}
+
+/// Estimate the width of a single character at a given font size.
+fn estimate_char_width(_ch: char, font_size: f32) -> f32 {
+    // Rough approximation: average character width ≈ 0.6 * font_size.
+    font_size * 0.6
+}
+
+/// Estimate the width of a string at a given font size.
+fn estimate_text_width(text: &str, font_size: f32) -> f32 {
+    text.chars().count() as f32 * font_size * 0.6
 }
 
 /// Return `true` if the style map requests overflow clipping
@@ -462,6 +809,22 @@ fn has_overflow_clip(style: &nova_mod_api::content::StyleMap) -> bool {
                 _ => continue,
             };
             if matches!(clip_val, "hidden" | "scroll" | "auto") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Return `true` if the style requests scrollable overflow (`overflow: auto` or `overflow: scroll`).
+fn is_overflow_scroll(style: &nova_mod_api::content::StyleMap) -> bool {
+    for (key, value) in &style.properties {
+        if key == "overflow" || key == "overflow-y" {
+            let val = match value {
+                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
+                _ => continue,
+            };
+            if matches!(val, "scroll" | "auto") {
                 return true;
             }
         }
@@ -726,6 +1089,8 @@ fn parse_color_string(s: &str) -> Option<Color> {
         parse_hex_color(s)
     } else if s.starts_with("rgb") {
         parse_rgb_color(s)
+    } else if s.starts_with("hsl") {
+        parse_hsl_color(s)
     } else {
         // Try named colour first, then fall back to bare hex (no '#' prefix).
         parse_named_color(s).or_else(|| {
@@ -796,6 +1161,75 @@ fn parse_rgb_color(s: &str) -> Option<Color> {
     }
 }
 
+/// Parse an HSL/HSLA color string into a Color.
+fn parse_hsl_color(s: &str) -> Option<Color> {
+    let inner = s
+        .trim_start_matches("hsla(")
+        .trim_start_matches("hsl(")
+        .trim_end_matches(')');
+
+    let parts: Vec<&str> = if inner.contains(',') {
+        inner.split(',').map(str::trim).collect()
+    } else {
+        let slash_parts: Vec<&str> = inner.splitn(2, '/').collect();
+        let mut hsl: Vec<&str> = slash_parts[0].split_whitespace().collect();
+        if slash_parts.len() > 1 {
+            hsl.push(slash_parts[1].trim());
+        }
+        hsl
+    };
+
+    if parts.len() < 3 {
+        return None;
+    }
+
+    let h = {
+        let s = parts[0].trim();
+        let val = if let Some(v) = s.strip_suffix("deg") {
+            v.trim().parse::<f32>().ok()?
+        } else if let Some(v) = s.strip_suffix("rad") {
+            v.trim().parse::<f32>().ok()?.to_degrees()
+        } else if let Some(v) = s.strip_suffix("turn") {
+            v.trim().parse::<f32>().ok()? * 360.0
+        } else {
+            s.parse::<f32>().ok()?
+        };
+        ((val % 360.0) + 360.0) % 360.0
+    };
+    let s_val = parts[1].trim().trim_end_matches('%').trim().parse::<f32>().ok()? / 100.0;
+    let l = parts[2].trim().trim_end_matches('%').trim().parse::<f32>().ok()? / 100.0;
+    let a = if parts.len() >= 4 {
+        let a_str = parts[3].trim();
+        if let Some(pct) = a_str.strip_suffix('%') {
+            pct.trim().parse::<f32>().unwrap_or(100.0) / 100.0
+        } else {
+            a_str.parse::<f32>().unwrap_or(1.0)
+        }
+    } else {
+        1.0
+    };
+
+    // HSL to RGB conversion
+    let (r, g, b) = if s_val == 0.0 {
+        (l, l, l)
+    } else {
+        let q = if l < 0.5 { l * (1.0 + s_val) } else { l + s_val - l * s_val };
+        let p = 2.0 * l - q;
+        let h_norm = h / 360.0;
+        let hue2rgb = |p: f32, q: f32, mut t: f32| -> f32 {
+            if t < 0.0 { t += 1.0; }
+            if t > 1.0 { t -= 1.0; }
+            if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
+            if t < 1.0 / 2.0 { return q; }
+            if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+            p
+        };
+        (hue2rgb(p, q, h_norm + 1.0/3.0), hue2rgb(p, q, h_norm), hue2rgb(p, q, h_norm - 1.0/3.0))
+    };
+
+    Some(Color::rgba(r, g, b, a))
+}
+
 fn parse_named_color(s: &str) -> Option<Color> {
     match s.to_lowercase().as_str() {
         "black" => Some(Color::BLACK),
@@ -860,6 +1294,30 @@ fn extract_font_weight(style: &nova_mod_api::content::StyleMap) -> Option<u16> {
                     };
                 }
                 StyleValue::Number(n) => return Some(*n as u16),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Extract the CSS `letter-spacing` from a style map.
+///
+/// Returns `Some(px)` if a pixel value is set, `None` for `normal` or absent.
+fn extract_letter_spacing(style: &nova_mod_api::content::StyleMap) -> Option<f32> {
+    for (key, value) in &style.properties {
+        if key == "letter-spacing" {
+            match value {
+                StyleValue::Px(px) => return Some(*px),
+                StyleValue::Keyword(k) | StyleValue::Str(k) => {
+                    if k.trim() == "normal" {
+                        return None;
+                    }
+                    if let Some(px) = k.strip_suffix("px").and_then(|s| s.trim().parse::<f32>().ok()) {
+                        return Some(px);
+                    }
+                }
+                StyleValue::Number(n) => return Some(*n),
                 _ => {}
             }
         }
@@ -1013,6 +1471,18 @@ fn extract_form_field(style: &nova_mod_api::content::StyleMap) -> Option<(String
     field_type.map(|ft| (ft, value))
 }
 
+/// Extract the placeholder text from a style map (set by mod-layout for form inputs).
+fn extract_placeholder(style: &nova_mod_api::content::StyleMap) -> String {
+    for (key, value) in &style.properties {
+        if key == "nova-placeholder" {
+            if let StyleValue::Str(s) | StyleValue::Keyword(s) = value {
+                return s.clone();
+            }
+        }
+    }
+    String::new()
+}
+
 /// Check if the element has `position: sticky`.
 fn is_position_sticky(style: &nova_mod_api::content::StyleMap) -> bool {
     for (key, value) in &style.properties {
@@ -1053,6 +1523,131 @@ fn extract_font_size(style: &nova_mod_api::content::StyleMap) -> f32 {
         }
     }
     16.0
+}
+
+/// Extract the `background-repeat` CSS value. Defaults to "repeat".
+fn extract_background_repeat(style: &nova_mod_api::content::StyleMap) -> &'static str {
+    for (key, value) in &style.properties {
+        if key == "background-repeat" {
+            let val = match value {
+                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
+                _ => continue,
+            };
+            return match val.trim() {
+                "no-repeat" => "no-repeat",
+                "repeat-x" => "repeat-x",
+                "repeat-y" => "repeat-y",
+                "repeat" => "repeat",
+                _ => "repeat",
+            };
+        }
+    }
+    "repeat"
+}
+
+/// Extract the `background-position` CSS value as (x_fraction, y_fraction) in 0.0-1.0.
+/// Defaults to (0.0, 0.0) (top-left).
+fn extract_background_position(style: &nova_mod_api::content::StyleMap) -> (f32, f32) {
+    for (key, value) in &style.properties {
+        if key == "background-position" {
+            let val = match value {
+                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
+                _ => continue,
+            };
+            let val = val.trim();
+            let parts: Vec<&str> = val.split_whitespace().collect();
+
+            let parse_pos = |s: &str| -> f32 {
+                match s {
+                    "left" | "top" => 0.0,
+                    "center" => 0.5,
+                    "right" | "bottom" => 1.0,
+                    _ => {
+                        if let Some(pct) = s.strip_suffix('%') {
+                            pct.trim().parse::<f32>().unwrap_or(0.0) / 100.0
+                        } else {
+                            0.0
+                        }
+                    }
+                }
+            };
+
+            return match parts.len() {
+                1 => {
+                    let v = parse_pos(parts[0]);
+                    (v, v)
+                }
+                _ => {
+                    (parse_pos(parts[0]), parse_pos(parts[1]))
+                }
+            };
+        }
+    }
+    (0.0, 0.0)
+}
+
+/// Extract the `background-size` CSS value.
+/// Returns the computed (width, height) in pixels for the background image.
+/// Special values `cover` and `contain` are resolved against the box and image dimensions.
+fn extract_background_size(
+    style: &nova_mod_api::content::StyleMap,
+    box_w: f32,
+    box_h: f32,
+    img_w: f32,
+    img_h: f32,
+) -> (f32, f32) {
+    for (key, value) in &style.properties {
+        if key == "background-size" {
+            let val = match value {
+                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
+                _ => continue,
+            };
+            let val = val.trim();
+            match val {
+                "cover" => {
+                    if img_w <= 0.0 || img_h <= 0.0 { return (box_w, box_h); }
+                    let ratio_w = box_w / img_w;
+                    let ratio_h = box_h / img_h;
+                    let scale = ratio_w.max(ratio_h);
+                    return (img_w * scale, img_h * scale);
+                }
+                "contain" => {
+                    if img_w <= 0.0 || img_h <= 0.0 { return (box_w, box_h); }
+                    let ratio_w = box_w / img_w;
+                    let ratio_h = box_h / img_h;
+                    let scale = ratio_w.min(ratio_h);
+                    return (img_w * scale, img_h * scale);
+                }
+                "auto" => {
+                    return (img_w, img_h);
+                }
+                _ => {
+                    let parts: Vec<&str> = val.split_whitespace().collect();
+                    let parse_size = |s: &str, reference: f32, img_dim: f32| -> f32 {
+                        if s == "auto" { return img_dim; }
+                        if let Some(pct) = s.strip_suffix('%') {
+                            return pct.trim().parse::<f32>().unwrap_or(100.0) / 100.0 * reference;
+                        }
+                        parse_length_px(s).unwrap_or(img_dim)
+                    };
+                    match parts.len() {
+                        1 => {
+                            let w = parse_size(parts[0], box_w, img_w);
+                            let h = if img_w > 0.0 { w * img_h / img_w } else { img_h };
+                            return (w, h);
+                        }
+                        _ => {
+                            return (
+                                parse_size(parts[0], box_w, img_w),
+                                parse_size(parts[1], box_h, img_h),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (img_w, img_h)
 }
 
 /// Extract `background-image` CSS value from a style map.
@@ -1555,6 +2150,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_hsl_color_in_painter() {
+        let c = parse_color_string("hsl(0, 100%, 50%)").unwrap();
+        assert!((c.r - 1.0).abs() < 0.01); // red
+        assert!(c.g < 0.01);
+        assert!(c.b < 0.01);
+    }
+
+    #[test]
     fn font_family_passed_in_draw_text_op() {
         let mut style = StyleMap::default();
         style.properties.push((
@@ -1578,5 +2181,79 @@ mod tests {
             }
         });
         assert!(has_family, "DrawText should carry font_family = Some(\"CustomFont\")");
+    }
+
+    #[test]
+    fn background_repeat_no_repeat() {
+        let mut style = StyleMap::default();
+        style.properties.push(("background-repeat".into(), StyleValue::Keyword("no-repeat".into())));
+        assert_eq!(extract_background_repeat(&style), "no-repeat");
+    }
+
+    #[test]
+    fn background_position_center() {
+        let mut style = StyleMap::default();
+        style.properties.push(("background-position".into(), StyleValue::Keyword("center".into())));
+        let (x, y) = extract_background_position(&style);
+        assert!((x - 0.5).abs() < 0.01);
+        assert!((y - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn background_size_contain() {
+        let mut style = StyleMap::default();
+        style.properties.push(("background-size".into(), StyleValue::Keyword("contain".into())));
+        let (w, h) = extract_background_size(&style, 200.0, 100.0, 400.0, 200.0);
+        // contain: min(200/400, 100/200) = 0.5, so 200x100
+        assert!((w - 200.0).abs() < 0.01);
+        assert!((h - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn background_size_cover() {
+        let mut style = StyleMap::default();
+        style.properties.push(("background-size".into(), StyleValue::Keyword("cover".into())));
+        let (w, h) = extract_background_size(&style, 200.0, 100.0, 100.0, 100.0);
+        // cover: max(200/100, 100/100) = 2.0, so 200x200
+        assert!((w - 200.0).abs() < 0.01);
+        assert!((h - 200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn text_overflow_ellipsis_truncates() {
+        let result = truncate_with_ellipsis("Hello, World! This is a very long text", 16.0, 100.0);
+        assert!(result.ends_with("..."), "should end with ellipsis: {result}");
+        assert!(result.len() < "Hello, World! This is a very long text".len());
+    }
+
+    #[test]
+    fn text_overflow_short_text_unchanged() {
+        let result = truncate_with_ellipsis("Hi", 16.0, 200.0);
+        assert_eq!(result, "Hi");
+    }
+
+    // --- Stacking context tests ---
+
+    #[test]
+    fn stacking_context_detected_for_opacity() {
+        let mut style = StyleMap::default();
+        style.properties.push(("opacity".into(), StyleValue::Number(0.5)));
+        assert!(creates_stacking_context(&style));
+    }
+
+    #[test]
+    fn stacking_context_not_created_for_static_z_index() {
+        let mut style = StyleMap::default();
+        style.properties.push(("z-index".into(), StyleValue::Number(5.0)));
+        // No position set (default is static) — should NOT create stacking context.
+        assert!(!creates_stacking_context(&style));
+    }
+
+    #[test]
+    fn stacking_context_for_positioned_z_index() {
+        let mut style = StyleMap::default();
+        style.properties.push(("z-index".into(), StyleValue::Number(5.0)));
+        style.properties.push(("position".into(), StyleValue::Keyword("relative".into())));
+        assert!(creates_stacking_context(&style));
     }
 }

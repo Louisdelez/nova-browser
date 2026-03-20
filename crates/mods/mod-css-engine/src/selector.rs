@@ -97,6 +97,18 @@ pub enum PseudoClass {
     FirstChild,
     /// `:last-child` — matches the last child element.
     LastChild,
+    /// `:not(selector-list)` — matches if none of the selectors match.
+    Not(Box<SelectorList>),
+    /// `:is(selector-list)` — matches if any of the selectors match.
+    Is(Box<SelectorList>),
+    /// `:where(selector-list)` — matches like `:is()` but with zero specificity.
+    Where(Box<SelectorList>),
+    /// `:hover` — matches when the element is being hovered by the pointer.
+    Hover,
+    /// `:focus` — matches when the element has keyboard focus.
+    Focus,
+    /// `:active` — matches when the element is being activated (e.g. mouse down).
+    Active,
 }
 
 /// CSS pseudo-element (e.g. `::before`, `::after`).
@@ -190,10 +202,13 @@ impl Specificity {
 
 impl SelectorList {
     /// Parse a selector list from a CSS selector string.
+    ///
+    /// Splits on commas that are not inside parentheses, so that
+    /// `:is(h1, h2)` is not incorrectly split.
     pub fn parse(input: &str) -> Option<Self> {
-        let parts: Vec<&str> = input.split(',').collect();
+        let parts = split_on_top_level_commas(input);
         let mut selectors = Vec::new();
-        for part in parts {
+        for part in &parts {
             let part = part.trim();
             if part.is_empty() {
                 continue;
@@ -280,17 +295,17 @@ impl Selector {
         };
 
         // Tokenize into compound-selector strings and combinator characters.
-        // We split by whitespace, then detect `>`, `+`, `~` as combinator
-        // tokens.  We also handle cases where combinators are glued to
-        // selectors (e.g. `div>p`).
-        let tokens: Vec<&str> = selector_str.split_whitespace().collect();
+        // We split by whitespace (respecting parentheses), then detect `>`,
+        // `+`, `~` as combinator tokens.  We also handle cases where
+        // combinators are glued to selectors (e.g. `div>p`).
+        let tokens = split_whitespace_respecting_parens(selector_str);
         let mut parts: Vec<CompoundSelector> = Vec::new();
         let mut combinators: Vec<Combinator> = Vec::new();
         // pending_combinator: the combinator to use before the next compound selector.
         let mut pending_combinator: Option<Combinator> = None;
 
         for token in &tokens {
-            match *token {
+            match token.as_str() {
                 ">" => {
                     pending_combinator = Some(Combinator::Child);
                     continue;
@@ -524,8 +539,25 @@ impl Selector {
                 a += 1;
             }
             b += part.classes.len() as u32;
-            // Pseudo-classes count as class-level specificity.
-            b += part.pseudos.len() as u32;
+            // Pseudo-classes count as class-level specificity, except
+            // :where() (zero) and :not()/:is() (take their argument's specificity).
+            for pseudo in &part.pseudos {
+                match pseudo {
+                    PseudoClass::Where(_) => {
+                        // :where() has zero specificity.
+                    }
+                    PseudoClass::Not(inner) | PseudoClass::Is(inner) => {
+                        // :not() and :is() take the specificity of their most specific argument.
+                        let inner_spec = inner.specificity();
+                        a += inner_spec.0;
+                        b += inner_spec.1;
+                        c += inner_spec.2;
+                    }
+                    _ => {
+                        b += 1;
+                    }
+                }
+            }
             // Attribute selectors count as class-level specificity.
             b += part.attributes.len() as u32;
             if part.tag.is_some() {
@@ -655,8 +687,53 @@ impl CompoundSelector {
                         "last-child" => {
                             sel.pseudos.push(PseudoClass::LastChild);
                         }
+                        "not" | "is" | "where" => {
+                            // Expect '(' selector-list ')'.
+                            if chars.peek() == Some(&'(') {
+                                chars.next(); // consume '('
+                                let mut arg = String::new();
+                                let mut depth = 1u32;
+                                while let Some(&c) = chars.peek() {
+                                    chars.next();
+                                    if c == '(' {
+                                        depth += 1;
+                                        arg.push(c);
+                                    } else if c == ')' {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            break;
+                                        }
+                                        arg.push(c);
+                                    } else {
+                                        arg.push(c);
+                                    }
+                                }
+                                if let Some(inner_list) = SelectorList::parse(&arg) {
+                                    let pseudo = match pseudo_lower.as_str() {
+                                        "not" => PseudoClass::Not(Box::new(inner_list)),
+                                        "is" => PseudoClass::Is(Box::new(inner_list)),
+                                        "where" => PseudoClass::Where(Box::new(inner_list)),
+                                        _ => unreachable!(),
+                                    };
+                                    sel.pseudos.push(pseudo);
+                                }
+                            }
+                        }
+                        "hover" => {
+                            sel.pseudos.push(PseudoClass::Hover);
+                        }
+                        "focus" => {
+                            sel.pseudos.push(PseudoClass::Focus);
+                        }
+                        "active" => {
+                            sel.pseudos.push(PseudoClass::Active);
+                        }
+                        "link" | "visited" => {
+                            // Treat :link and :visited as always matching for <a> elements.
+                            // This is a simplification — we don't track visited links.
+                        }
                         _ => {
-                            // Unknown pseudo-class — silently ignore (e.g. :hover, :link).
+                            // Unknown pseudo-class — silently ignore.
                         }
                     }
                 }
@@ -754,20 +831,23 @@ impl CompoundSelector {
 
     /// Check all pseudo-classes on this selector against the node and sibling context.
     fn check_pseudos(&self, node: &DomNode, siblings: Option<SiblingContext<'_>>) -> bool {
-        let ctx = match siblings {
-            Some(ctx) => ctx,
-            None => return false, // No sibling context — positional pseudos can't match.
-        };
-
         for pseudo in &self.pseudos {
             match pseudo {
                 PseudoClass::NthChild(formula) => {
+                    let ctx = match siblings {
+                        Some(ctx) => ctx,
+                        None => return false,
+                    };
                     let pos = element_position_among_all(ctx.siblings, ctx.index);
                     if !formula.matches(pos) {
                         return false;
                     }
                 }
                 PseudoClass::NthOfType(formula) => {
+                    let ctx = match siblings {
+                        Some(ctx) => ctx,
+                        None => return false,
+                    };
                     let tag = node.tag().unwrap_or("");
                     let pos = element_position_among_type(ctx.siblings, ctx.index, tag);
                     if !formula.matches(pos) {
@@ -775,13 +855,42 @@ impl CompoundSelector {
                     }
                 }
                 PseudoClass::FirstChild => {
+                    let ctx = match siblings {
+                        Some(ctx) => ctx,
+                        None => return false,
+                    };
                     let pos = element_position_among_all(ctx.siblings, ctx.index);
                     if pos != 1 {
                         return false;
                     }
                 }
                 PseudoClass::LastChild => {
+                    let ctx = match siblings {
+                        Some(ctx) => ctx,
+                        None => return false,
+                    };
                     if !is_last_element(ctx.siblings, ctx.index) {
+                        return false;
+                    }
+                }
+                PseudoClass::Hover | PseudoClass::Focus | PseudoClass::Active => {
+                    // Interactive pseudo-classes require interaction state.
+                    // Without state, they don't match (safe default).
+                    return false;
+                }
+                PseudoClass::Not(inner_list) => {
+                    // :not() matches if NONE of the inner selectors match.
+                    if inner_list.selectors.iter().any(|sel| {
+                        sel.parts.len() == 1 && sel.parts[0].matches(node, siblings)
+                    }) {
+                        return false;
+                    }
+                }
+                PseudoClass::Is(inner_list) | PseudoClass::Where(inner_list) => {
+                    // :is()/:where() matches if ANY of the inner selectors match.
+                    if !inner_list.selectors.iter().any(|sel| {
+                        sel.parts.len() == 1 && sel.parts[0].matches(node, siblings)
+                    }) {
                         return false;
                     }
                 }
@@ -944,6 +1053,68 @@ impl AttributeSelector {
             }
         }
     }
+}
+
+/// Split a string on commas that are not inside parentheses.
+///
+/// This ensures that `:is(h1, h2), div` splits into [`:is(h1, h2)`, `div`]
+/// rather than naively splitting on every comma.
+/// Split a string on whitespace, but not inside parentheses or brackets.
+///
+/// This ensures that `:is(h1, h2)` is treated as a single token even though
+/// it contains spaces after the commas.
+fn split_whitespace_respecting_parens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0u32;
+    let mut bracket_depth = 0u32;
+    for ch in input.chars() {
+        match ch {
+            '(' => { depth += 1; current.push(ch); }
+            ')' => { depth = depth.saturating_sub(1); current.push(ch); }
+            '[' => { bracket_depth += 1; current.push(ch); }
+            ']' => { bracket_depth = bracket_depth.saturating_sub(1); current.push(ch); }
+            c if c.is_whitespace() && depth == 0 && bracket_depth == 0 => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    tokens.push(trimmed);
+                    current.clear();
+                }
+            }
+            _ => { current.push(ch); }
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        tokens.push(trimmed);
+    }
+    tokens
+}
+
+fn split_on_top_level_commas(input: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0u32;
+    for ch in input.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                parts.push(std::mem::take(&mut current));
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+    parts.push(current);
+    parts
 }
 
 /// Strip surrounding quotes (single or double) from a value string.
@@ -1382,11 +1553,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_pseudo_class_ignored() {
-        // :hover is unknown, should be silently ignored and still match the tag.
+    fn hover_pseudo_class_parsed() {
+        // :hover is now recognized and parsed. Without interaction state it won't match.
         let sel = SelectorList::parse("a:hover").unwrap();
         let node = elem("a", &[]);
-        assert!(sel.matches(&node, &[], None));
+        // Without hover state, :hover doesn't match.
+        assert!(!sel.matches(&node, &[], None));
+    }
+
+    #[test]
+    fn hover_pseudo_parsed_correctly() {
+        let sel = SelectorList::parse("button:hover").unwrap();
+        let compound = &sel.selectors[0].parts[0];
+        assert_eq!(compound.tag, Some("button".into()));
+        assert_eq!(compound.pseudos.len(), 1);
+        assert!(matches!(compound.pseudos[0], PseudoClass::Hover));
     }
 
     // ── Child combinator tests ──
@@ -1649,5 +1830,64 @@ mod tests {
             PseudoClass::NthChild(f) => assert_eq!(*f, NthFormula { a: 2, b: 1 }),
             _ => panic!("Expected NthChild"),
         }
+    }
+
+    // ── :not(), :is(), :where() pseudo-class tests ──
+
+    #[test]
+    fn not_pseudo_class_excludes() {
+        let sel = SelectorList::parse("div:not(.hidden)").unwrap();
+        let visible = elem("div", &[("class", "visible")]);
+        assert!(sel.matches(&visible, &[], None));
+
+        let hidden = elem("div", &[("class", "hidden")]);
+        assert!(!sel.matches(&hidden, &[], None));
+    }
+
+    #[test]
+    fn not_pseudo_class_with_tag() {
+        let sel = SelectorList::parse(":not(span)").unwrap();
+        let div = elem("div", &[]);
+        assert!(sel.matches(&div, &[], None));
+
+        let span = elem("span", &[]);
+        assert!(!sel.matches(&span, &[], None));
+    }
+
+    #[test]
+    fn is_pseudo_class_matches_any() {
+        let sel = SelectorList::parse(":is(h1, h2, h3)").unwrap();
+        assert!(sel.matches(&elem("h1", &[]), &[], None));
+        assert!(sel.matches(&elem("h2", &[]), &[], None));
+        assert!(sel.matches(&elem("h3", &[]), &[], None));
+        assert!(!sel.matches(&elem("h4", &[]), &[], None));
+    }
+
+    #[test]
+    fn where_pseudo_class_matches_any() {
+        let sel = SelectorList::parse(":where(h1, h2)").unwrap();
+        assert!(sel.matches(&elem("h1", &[]), &[], None));
+        assert!(!sel.matches(&elem("h4", &[]), &[], None));
+    }
+
+    #[test]
+    fn where_pseudo_zero_specificity() {
+        // :where() should have zero specificity.
+        let sel = SelectorList::parse(":where(.foo)").unwrap();
+        assert_eq!(sel.specificity(), Specificity(0, 0, 0));
+    }
+
+    #[test]
+    fn not_pseudo_specificity() {
+        // :not(.foo) should have the specificity of .foo = (0,1,0).
+        let sel = SelectorList::parse(":not(.foo)").unwrap();
+        assert_eq!(sel.specificity(), Specificity(0, 1, 0));
+    }
+
+    #[test]
+    fn is_pseudo_specificity() {
+        // :is(#id, .class) should take the highest = (1,0,0).
+        let sel = SelectorList::parse(":is(#id, .class)").unwrap();
+        assert_eq!(sel.specificity(), Specificity(1, 0, 0));
     }
 }

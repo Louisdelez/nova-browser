@@ -16,6 +16,7 @@ use nova_mod_api::{
     CapabilityType, ContentRequest, NovaError, TypedData, Viewport,
     content::{DomNode, HttpResponse},
 };
+use mod_css_engine::FontFaceUrl;
 use nova_registry::CapabilityRegistry;
 
 /// Sub-resources extracted from a parsed DOM tree.
@@ -93,8 +94,23 @@ impl PipelineEngine {
             stylesheets = all;
         }
 
+        // Step 4c: Extract @font-face URLs from stylesheets
+        let font_face_urls = self.extract_font_face_urls(&stylesheets, &base_url);
+        if !font_face_urls.is_empty() {
+            info!(
+                "Pipeline: discovered {} @font-face URL(s):",
+                font_face_urls.len()
+            );
+            for ff in &font_face_urls {
+                info!(
+                    "  font-family: \"{}\", url: {}",
+                    ff.family, ff.url
+                );
+            }
+        }
+
         // Step 5: Compute styles (with external stylesheets)
-        let styles = self.compute_styles_with(&dom, stylesheets).await?;
+        let styles = self.compute_styles_with(&dom, stylesheets, &viewport).await?;
 
         // Step 6: Layout
         let layout_tree = self.layout(&styles, viewport).await?;
@@ -118,6 +134,23 @@ impl PipelineEngine {
 
         info!("Pipeline: navigation complete");
         Ok(render_commands)
+    }
+
+    /// Re-render a DOM tree without re-fetching.
+    ///
+    /// Runs style → layout → paint on the provided DOM, suitable for
+    /// updating the display after JavaScript DOM mutations.
+    pub async fn re_render(
+        &self,
+        dom: TypedData,
+        viewport: Viewport,
+    ) -> Result<TypedData, NovaError> {
+        info!("Pipeline: re-rendering after DOM mutation");
+        let styles = self.compute_styles_with(&dom, vec![], &viewport).await?;
+        let layout = self.layout(&styles, viewport).await?;
+        let render = self.paint_with_images(&layout, vec![]).await?;
+        info!("Pipeline: re-render complete");
+        Ok(render)
     }
 
     /// Fetch a URL and parse it, returning the DOM tree without running
@@ -177,11 +210,13 @@ impl PipelineEngine {
         &self,
         dom: &TypedData,
         stylesheets: Vec<TypedData>,
+        viewport: &Viewport,
     ) -> Result<TypedData, NovaError> {
         let cap = CapabilityType::ComputeStyles;
         let request = ContentRequest::ComputeStyles {
             dom: Box::new(dom.clone()),
             stylesheets,
+            viewport_width: viewport.width,
         };
 
         self.registry.route(&cap, request).await
@@ -269,6 +304,29 @@ impl PipelineEngine {
         }
 
         self.fetch_stylesheets_parallel(&import_urls).await
+    }
+
+    /// Extract `@font-face` URLs from fetched stylesheets.
+    ///
+    /// Scans each stylesheet for `@font-face` rules using the CSS engine's
+    /// parser and resolves relative URLs against the page's base URL.
+    /// Returns a list of `FontFaceUrl` entries (family + resolved URL).
+    fn extract_font_face_urls(
+        &self,
+        stylesheets: &[TypedData],
+        base_url: &Option<Url>,
+    ) -> Vec<FontFaceUrl> {
+        let mut result = Vec::new();
+        for sheet in stylesheets {
+            if let TypedData::Text(css) = sheet {
+                let entries = mod_css_engine::extract_font_face_urls(css, 1280.0);
+                for mut entry in entries {
+                    entry.url = resolve_url(&entry.url, base_url);
+                    result.push(entry);
+                }
+            }
+        }
+        result
     }
 
     /// Fetch and decode images in parallel.

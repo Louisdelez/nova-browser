@@ -6,11 +6,10 @@
 //! attributes on each element.
 
 use nova_mod_api::content::DomNode;
-use tracing::debug;
 
 use crate::defaults::default_style_for_tag;
 use crate::parser::{self, CssRule};
-use crate::selector::Specificity;
+use crate::selector::{PseudoElement, SiblingContext, Specificity};
 use crate::values;
 
 /// A declaration with its origin and specificity, used for cascade sorting.
@@ -20,6 +19,8 @@ struct CascadedDeclaration {
     value: String,
     specificity: Specificity,
     origin: CascadeOrigin,
+    /// `true` when the declaration was marked `!important`.
+    important: bool,
 }
 
 /// Origin of a CSS declaration in the cascade.
@@ -79,17 +80,17 @@ fn extract_stylesheets_recursive(node: &DomNode, sheets: &mut Vec<String>) {
 /// 4. Serializes the style as an inline CSS string on `data-nova-style`.
 ///
 /// Additionally accepts pre-parsed external stylesheets from the `stylesheets` parameter.
-pub fn compute_styles(dom: DomNode, extra_css: &[String]) -> DomNode {
+pub fn compute_styles(dom: DomNode, extra_css: &[String], viewport_width: f32) -> DomNode {
     // 1. Extract embedded stylesheets.
     let embedded = extract_stylesheets(&dom);
 
     // 2. Parse all stylesheets.
     let mut rules = Vec::new();
     for css in &embedded {
-        rules.extend(parser::parse_stylesheet(css));
+        rules.extend(parser::parse_stylesheet(css, viewport_width));
     }
     for css in extra_css {
-        rules.extend(parser::parse_stylesheet(css));
+        rules.extend(parser::parse_stylesheet(css, viewport_width));
     }
 
     tracing::info!(
@@ -148,10 +149,31 @@ fn apply_styles_recursive(
             let this_ref: &DomNode = &this_node;
             new_ancestors.push(this_ref);
 
-            let new_children: Vec<DomNode> = children
-                .into_iter()
-                .map(|child| apply_styles_recursive(child, rules, &new_ancestors))
-                .collect();
+            let mut new_children = apply_styles_to_children(children, rules, &new_ancestors);
+
+            // Inject ::before and ::after pseudo-element text nodes when a CSS
+            // rule targets this element with `::before` or `::after` and
+            // declares a `content` property with a quoted string.
+            if let Some(before_text) = pseudo_element_content(
+                &tag,
+                &new_attributes,
+                &this_node,
+                rules,
+                ancestors,
+                PseudoElement::Before,
+            ) {
+                new_children.insert(0, DomNode::Text(before_text));
+            }
+            if let Some(after_text) = pseudo_element_content(
+                &tag,
+                &new_attributes,
+                &this_node,
+                rules,
+                ancestors,
+                PseudoElement::After,
+            ) {
+                new_children.push(DomNode::Text(after_text));
+            }
 
             DomNode::Element {
                 tag,
@@ -160,16 +182,115 @@ fn apply_styles_recursive(
             }
         }
         DomNode::Document { children } => {
-            let new_children: Vec<DomNode> = children
-                .into_iter()
-                .map(|child| apply_styles_recursive(child, rules, ancestors))
-                .collect();
+            let new_children = apply_styles_to_children(children, rules, ancestors);
             DomNode::Document {
                 children: new_children,
             }
         }
         other => other,
     }
+}
+
+/// Process a list of children, providing each child with sibling context
+/// for `:nth-child` / `:nth-of-type` pseudo-class matching.
+fn apply_styles_to_children(
+    children: Vec<DomNode>,
+    rules: &[CssRule],
+    ancestors: &[&DomNode],
+) -> Vec<DomNode> {
+    let len = children.len();
+    let mut result = Vec::with_capacity(len);
+    let children_vec: Vec<DomNode> = children;
+
+    for i in 0..len {
+        let sib_ctx = SiblingContext {
+            siblings: &children_vec,
+            index: i,
+        };
+        let child = children_vec[i].clone();
+        result.push(apply_styles_recursive_with_siblings(child, rules, ancestors, Some(sib_ctx)));
+    }
+
+    result
+}
+
+/// Like `apply_styles_recursive` but with sibling context for the current node.
+fn apply_styles_recursive_with_siblings(
+    node: DomNode,
+    rules: &[CssRule],
+    ancestors: &[&DomNode],
+    siblings: Option<SiblingContext<'_>>,
+) -> DomNode {
+    match node {
+        DomNode::Element {
+            tag,
+            attributes,
+            children,
+        } => {
+            let temp_node = DomNode::Element {
+                tag: tag.clone(),
+                attributes: attributes.clone(),
+                children: vec![],
+            };
+
+            let style_str = compute_element_style_with_siblings(
+                &tag, &attributes, &temp_node, rules, ancestors, siblings,
+            );
+
+            let mut new_attributes = attributes;
+            new_attributes.retain(|(k, _)| k != "data-nova-style");
+            if !style_str.is_empty() {
+                new_attributes.push(("data-nova-style".into(), style_str));
+            }
+
+            let this_node = DomNode::Element {
+                tag: tag.clone(),
+                attributes: new_attributes.clone(),
+                children: vec![],
+            };
+
+            let mut new_ancestors: Vec<&DomNode> = ancestors.to_vec();
+            let this_ref: &DomNode = &this_node;
+            new_ancestors.push(this_ref);
+
+            let mut new_children = apply_styles_to_children(children, rules, &new_ancestors);
+
+            if let Some(before_text) = pseudo_element_content(
+                &tag, &new_attributes, &this_node, rules, ancestors, PseudoElement::Before,
+            ) {
+                new_children.insert(0, DomNode::Text(before_text));
+            }
+            if let Some(after_text) = pseudo_element_content(
+                &tag, &new_attributes, &this_node, rules, ancestors, PseudoElement::After,
+            ) {
+                new_children.push(DomNode::Text(after_text));
+            }
+
+            DomNode::Element {
+                tag,
+                attributes: new_attributes,
+                children: new_children,
+            }
+        }
+        DomNode::Document { children } => {
+            let new_children = apply_styles_to_children(children, rules, ancestors);
+            DomNode::Document { children: new_children }
+        }
+        other => other,
+    }
+}
+
+/// Compute element style with sibling context for nth-child matching.
+fn compute_element_style_with_siblings(
+    tag: &str,
+    attributes: &[(String, String)],
+    node: &DomNode,
+    rules: &[CssRule],
+    ancestors: &[&DomNode],
+    siblings: Option<SiblingContext<'_>>,
+) -> String {
+    // Delegate to the main compute function, but pass siblings for matching.
+    compute_element_style_impl(tag, attributes, node, rules, ancestors, siblings)
 }
 
 /// Compute the style string for a single element.
@@ -183,13 +304,67 @@ fn compute_element_style(
     rules: &[CssRule],
     ancestors: &[&DomNode],
 ) -> String {
+    compute_element_style_impl(tag, attributes, node, rules, ancestors, None)
+}
+
+/// Internal implementation that supports optional sibling context.
+fn compute_element_style_impl(
+    tag: &str,
+    attributes: &[(String, String)],
+    node: &DomNode,
+    rules: &[CssRule],
+    ancestors: &[&DomNode],
+    siblings: Option<SiblingContext<'_>>,
+) -> String {
     let mut declarations: Vec<CascadedDeclaration> = Vec::new();
 
-    // 0. CSS inheritance FIRST (lowest priority — everything else overrides).
-    // Inheritable properties propagate down the tree unless explicitly overridden.
-    inherit_from_ancestors(ancestors, &mut declarations);
+    // 0. CSS inheritance: inherit inheritable properties from the nearest
+    //    ancestor that has a computed `data-nova-style`. These are added at
+    //    the lowest priority so any explicit declaration will override them.
+    static INHERITED_PROPERTIES: &[&str] = &[
+        "color",
+        "font-size",
+        "font-weight",
+        "font-style",
+        "font-family",
+        "text-align",
+        "text-decoration",
+        "line-height",
+        "white-space",
+        "visibility",
+        "list-style-type",
+    ];
 
-    // 1. User-agent defaults (override inherited values for this specific tag).
+    // Track which inherited properties we've already found (from a closer
+    // ancestor) so we only take the nearest value for each property.
+    let mut inherited_props: Vec<String> = Vec::new();
+    for ancestor in ancestors.iter().rev() {
+        if let DomNode::Element { attributes, .. } = ancestor {
+            if let Some(style_str) = attributes.iter().find(|(k, _)| k == "data-nova-style") {
+                for decl in style_str.1.split(';') {
+                    let parts: Vec<&str> = decl.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        let prop = parts[0].trim();
+                        let val = parts[1].trim();
+                        if INHERITED_PROPERTIES.contains(&prop)
+                            && !inherited_props.contains(&prop.to_string())
+                        {
+                            inherited_props.push(prop.to_string());
+                            declarations.push(CascadedDeclaration {
+                                property: prop.to_string(),
+                                value: val.to_string(),
+                                specificity: Specificity(0, 0, 0),
+                                origin: CascadeOrigin::UserAgent,
+                                important: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 1. User-agent defaults.
     let ua_style = default_style_for_tag(tag);
     for (prop, val) in &ua_style.properties {
         let value_str = style_value_to_css(val);
@@ -198,22 +373,21 @@ fn compute_element_style(
             value: value_str,
             specificity: Specificity(0, 0, 0),
             origin: CascadeOrigin::UserAgent,
+            important: false,
         });
     }
 
-    // 1b. Deprecated HTML presentational attributes.
-    convert_presentational_attributes(attributes, &mut declarations);
-
     // 2. Stylesheet rules (sorted by specificity).
     for rule in rules {
-        if rule.selector.matches(node, ancestors) {
+        if rule.selector.matches(node, ancestors, siblings) {
             let spec = rule.selector.specificity();
-            for (prop, val) in &rule.declarations {
+            for decl in &rule.declarations {
                 declarations.push(CascadedDeclaration {
-                    property: prop.clone(),
-                    value: val.clone(),
+                    property: decl.property.clone(),
+                    value: decl.value.clone(),
                     specificity: spec,
                     origin: CascadeOrigin::AuthorStylesheet,
+                    important: decl.important,
                 });
             }
         }
@@ -222,12 +396,13 @@ fn compute_element_style(
     // 3. Inline styles (highest priority).
     if let Some(style_attr) = attributes.iter().find(|(k, _)| k == "style") {
         let inline_decls = parser::parse_inline_style(&style_attr.1);
-        for (prop, val) in inline_decls {
+        for decl in inline_decls {
             declarations.push(CascadedDeclaration {
-                property: prop,
-                value: val,
+                property: decl.property,
+                value: decl.value,
                 specificity: Specificity::inline(),
                 origin: CascadeOrigin::Inline,
+                important: decl.important,
             });
         }
     }
@@ -238,11 +413,15 @@ fn compute_element_style(
         expand_shorthand(decl, &mut expanded);
     }
 
-    // 5. Sort by cascade: origin first, then specificity.
+    // 5. Sort by cascade: !important first, then origin, then specificity.
+    // `!important` declarations always beat normal declarations, regardless of
+    // origin or specificity.  Within the same importance level the existing
+    // (origin, specificity) ordering applies.
     // Stable sort preserves source order for equal specificity.
     expanded.sort_by(|a, b| {
-        a.origin
-            .cmp(&b.origin)
+        a.important
+            .cmp(&b.important)
+            .then(a.origin.cmp(&b.origin))
             .then(a.specificity.cmp(&b.specificity))
     });
 
@@ -256,7 +435,43 @@ fn compute_element_style(
         }
     }
 
-    // 7. Serialize as inline CSS string.
+    // 7. Resolve CSS custom properties (var()).
+    // Collect custom properties (--*) from ancestors and this element.
+    let mut custom_props: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    // Inherit custom properties from ancestors (outermost to innermost).
+    for ancestor in ancestors.iter() {
+        if let DomNode::Element { attributes, .. } = ancestor {
+            if let Some(style_str) = attributes.iter().find(|(k, _)| k == "data-nova-style") {
+                for decl in style_str.1.split(';') {
+                    let parts: Vec<&str> = decl.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        let prop = parts[0].trim();
+                        let val = parts[1].trim();
+                        if prop.starts_with("--") {
+                            custom_props.insert(prop.to_string(), val.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Add this element's own custom properties (override ancestors).
+    for (prop, val) in &final_props {
+        if prop.starts_with("--") {
+            custom_props.insert(prop.clone(), val.clone());
+        }
+    }
+
+    // Resolve var() in non-custom property values.
+    for (prop, val) in &mut final_props {
+        if !prop.starts_with("--") && val.contains("var(") {
+            *val = resolve_var(val, &custom_props);
+        }
+    }
+
+    // 8. Serialize as inline CSS string.
     final_props
         .iter()
         .map(|(p, v)| format!("{}: {}", p, v))
@@ -281,6 +496,7 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
                     value: val.to_string(),
                     specificity: decl.specificity,
                     origin: decl.origin,
+                    important: decl.important,
                 });
             }
         }
@@ -298,6 +514,7 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
                     value: val.to_string(),
                     specificity: decl.specificity,
                     origin: decl.origin,
+                    important: decl.important,
                 });
             }
         }
@@ -313,6 +530,7 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
                     value: val.to_string(),
                     specificity: decl.specificity,
                     origin: decl.origin,
+                    important: decl.important,
                 });
             } else {
                 // Pass through as-is.
@@ -320,46 +538,266 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
             }
         }
         "border" => {
-            // border: <width> <style> <color>
+            expand_border_shorthand("border", &decl, out);
+        }
+        "border-top" => {
+            expand_border_shorthand("border-top", &decl, out);
+        }
+        "border-bottom" => {
+            expand_border_shorthand("border-bottom", &decl, out);
+        }
+        "border-left" => {
+            expand_border_shorthand("border-left", &decl, out);
+        }
+        "border-right" => {
+            expand_border_shorthand("border-right", &decl, out);
+        }
+        "flex" => {
+            let val = decl.value.trim();
+            let (grow, shrink, basis) = match val {
+                "none" => ("0", "0", "auto"),
+                "auto" => ("1", "1", "auto"),
+                _ => {
+                    let parts: Vec<&str> = val.split_whitespace().collect();
+                    match parts.len() {
+                        1 => {
+                            // Single number → flex-grow: N; flex-shrink: 1; flex-basis: 0%
+                            // But if it's not parseable as a number, treat as keyword basis.
+                            if parts[0].parse::<f64>().is_ok() {
+                                // Store the grow value; shrink=1, basis=0%
+                                // We handle this specially below.
+                                let grow_val = parts[0];
+                                out.push(CascadedDeclaration {
+                                    property: "flex-grow".into(),
+                                    value: grow_val.to_string(),
+                                    specificity: decl.specificity,
+                                    origin: decl.origin,
+                                    important: decl.important,
+                                });
+                                out.push(CascadedDeclaration {
+                                    property: "flex-shrink".into(),
+                                    value: "1".to_string(),
+                                    specificity: decl.specificity,
+                                    origin: decl.origin,
+                                    important: decl.important,
+                                });
+                                out.push(CascadedDeclaration {
+                                    property: "flex-basis".into(),
+                                    value: "0%".to_string(),
+                                    specificity: decl.specificity,
+                                    origin: decl.origin,
+                                    important: decl.important,
+                                });
+                                return;
+                            } else {
+                                ("1", "1", parts[0])
+                            }
+                        }
+                        2 => {
+                            // flex-grow flex-shrink  or  flex-grow flex-basis
+                            // If second token is a number, treat as flex-shrink; otherwise flex-basis.
+                            if parts[1].parse::<f64>().is_ok() {
+                                // grow + shrink, basis = 0%
+                                out.push(CascadedDeclaration {
+                                    property: "flex-grow".into(),
+                                    value: parts[0].to_string(),
+                                    specificity: decl.specificity,
+                                    origin: decl.origin,
+                                    important: decl.important,
+                                });
+                                out.push(CascadedDeclaration {
+                                    property: "flex-shrink".into(),
+                                    value: parts[1].to_string(),
+                                    specificity: decl.specificity,
+                                    origin: decl.origin,
+                                    important: decl.important,
+                                });
+                                out.push(CascadedDeclaration {
+                                    property: "flex-basis".into(),
+                                    value: "0%".to_string(),
+                                    specificity: decl.specificity,
+                                    origin: decl.origin,
+                                    important: decl.important,
+                                });
+                            } else {
+                                // grow + basis
+                                out.push(CascadedDeclaration {
+                                    property: "flex-grow".into(),
+                                    value: parts[0].to_string(),
+                                    specificity: decl.specificity,
+                                    origin: decl.origin,
+                                    important: decl.important,
+                                });
+                                out.push(CascadedDeclaration {
+                                    property: "flex-shrink".into(),
+                                    value: "1".to_string(),
+                                    specificity: decl.specificity,
+                                    origin: decl.origin,
+                                    important: decl.important,
+                                });
+                                out.push(CascadedDeclaration {
+                                    property: "flex-basis".into(),
+                                    value: parts[1].to_string(),
+                                    specificity: decl.specificity,
+                                    origin: decl.origin,
+                                    important: decl.important,
+                                });
+                            }
+                            return;
+                        }
+                        _ => {
+                            // 3+ tokens: flex-grow flex-shrink flex-basis
+                            (parts[0], parts[1], parts.get(2).copied().unwrap_or("0%"))
+                        }
+                    }
+                }
+            };
+            for (prop, val) in [("flex-grow", grow), ("flex-shrink", shrink), ("flex-basis", basis)] {
+                out.push(CascadedDeclaration {
+                    property: prop.into(),
+                    value: val.to_string(),
+                    specificity: decl.specificity,
+                    origin: decl.origin,
+                    important: decl.important,
+                });
+            }
+        }
+        "overflow" => {
             let parts: Vec<&str> = decl.value.split_whitespace().collect();
-            for part in &parts {
-                if part.ends_with("px") || part.ends_with("em") || *part == "thin" || *part == "medium" || *part == "thick" {
-                    let width_val = match *part {
-                        "thin" => "1px".to_string(),
-                        "medium" => "3px".to_string(),
-                        "thick" => "5px".to_string(),
-                        v => v.to_string(),
-                    };
+            let (ox, oy) = match parts.len() {
+                1 => (parts[0], parts[0]),
+                _ => (parts[0], parts.get(1).copied().unwrap_or(parts[0])),
+            };
+            for (prop, val) in [("overflow-x", ox), ("overflow-y", oy)] {
+                out.push(CascadedDeclaration {
+                    property: prop.into(),
+                    value: val.to_string(),
+                    specificity: decl.specificity,
+                    origin: decl.origin,
+                    important: decl.important,
+                });
+            }
+        }
+        "list-style" => {
+            // Possible tokens: type keywords, position keywords (inside/outside), url(...)
+            static LIST_STYLE_TYPES: &[&str] = &[
+                "disc", "circle", "square", "decimal", "lower-roman", "upper-roman",
+                "lower-alpha", "upper-alpha", "lower-latin", "upper-latin", "none",
+            ];
+            static LIST_STYLE_POSITIONS: &[&str] = &["inside", "outside"];
+
+            let val = decl.value.trim();
+            if val == "none" {
+                for (prop, v) in [
+                    ("list-style-type", "none"),
+                    ("list-style-position", "outside"),
+                    ("list-style-image", "none"),
+                ] {
                     out.push(CascadedDeclaration {
-                        property: "border-width".into(),
-                        value: width_val,
+                        property: prop.into(),
+                        value: v.to_string(),
                         specificity: decl.specificity,
                         origin: decl.origin,
+                        important: decl.important,
                     });
-                } else if values::parse_color(part).is_some()
-                    || part.starts_with('#')
-                    || part.starts_with("rgb")
-                {
+                }
+            } else {
+                let parts: Vec<&str> = val.split_whitespace().collect();
+                let mut style_type = "disc";
+                let mut style_position = "outside";
+                let mut style_image = "none";
+
+                for part in &parts {
+                    if LIST_STYLE_POSITIONS.contains(part) {
+                        style_position = part;
+                    } else if part.starts_with("url(") {
+                        style_image = part;
+                    } else if LIST_STYLE_TYPES.contains(part) {
+                        style_type = part;
+                    }
+                }
+
+                for (prop, v) in [
+                    ("list-style-type", style_type),
+                    ("list-style-position", style_position),
+                    ("list-style-image", style_image),
+                ] {
                     out.push(CascadedDeclaration {
-                        property: "border-color".into(),
-                        value: part.to_string(),
+                        property: prop.into(),
+                        value: v.to_string(),
                         specificity: decl.specificity,
                         origin: decl.origin,
-                    });
-                } else {
-                    // Likely border-style (solid, dashed, etc.).
-                    out.push(CascadedDeclaration {
-                        property: "border-style".into(),
-                        value: part.to_string(),
-                        specificity: decl.specificity,
-                        origin: decl.origin,
+                        important: decl.important,
                     });
                 }
             }
         }
+        "text-decoration" => {
+            // Pass through as-is; values like `underline`, `none`, `line-through` are used directly.
+            out.push(decl);
+        }
         _ => {
             // Not a shorthand; pass through.
             out.push(decl);
+        }
+    }
+}
+
+/// Parse and expand a directional border shorthand (`border`, `border-top`, etc.).
+///
+/// For `border` the longhands are `border-width`, `border-style`, `border-color`.
+/// For `border-{side}` the longhands are `border-{side}-width`, `border-{side}-style`, `border-{side}-color`.
+fn expand_border_shorthand(prefix: &str, decl: &CascadedDeclaration, out: &mut Vec<CascadedDeclaration>) {
+    let (width_prop, style_prop, color_prop) = if prefix == "border" {
+        (
+            "border-width".to_string(),
+            "border-style".to_string(),
+            "border-color".to_string(),
+        )
+    } else {
+        (
+            format!("{prefix}-width"),
+            format!("{prefix}-style"),
+            format!("{prefix}-color"),
+        )
+    };
+
+    let parts: Vec<&str> = decl.value.split_whitespace().collect();
+    for part in &parts {
+        if part.ends_with("px") || part.ends_with("em") || *part == "thin" || *part == "medium" || *part == "thick" {
+            let width_val = match *part {
+                "thin" => "1px".to_string(),
+                "medium" => "3px".to_string(),
+                "thick" => "5px".to_string(),
+                v => v.to_string(),
+            };
+            out.push(CascadedDeclaration {
+                property: width_prop.clone(),
+                value: width_val,
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        } else if values::parse_color(part).is_some()
+            || part.starts_with('#')
+            || part.starts_with("rgb")
+        {
+            out.push(CascadedDeclaration {
+                property: color_prop.clone(),
+                value: part.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        } else {
+            // Likely border-style keyword (solid, dashed, etc.).
+            out.push(CascadedDeclaration {
+                property: style_prop.clone(),
+                value: part.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
         }
     }
 }
@@ -380,6 +818,130 @@ fn expand_trbl<'a>(parts: &[&'a str]) -> (&'a str, &'a str, &'a str, &'a str) {
     }
 }
 
+/// Resolve `var(--name)` and `var(--name, fallback)` references in a CSS value.
+///
+/// Performs up to 8 passes to handle nested var() in fallback values.
+fn resolve_var(value: &str, custom_props: &std::collections::HashMap<String, String>) -> String {
+    let mut result = value.to_string();
+    for _ in 0..8 {
+        if !result.contains("var(") {
+            break;
+        }
+        result = resolve_var_once(&result, custom_props);
+    }
+    result
+}
+
+/// Perform a single pass of var() substitution.
+fn resolve_var_once(value: &str, custom_props: &std::collections::HashMap<String, String>) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == 'v' {
+            // Check for "var("
+            let mut buf = String::from('v');
+            let prefix = "ar(";
+            let mut matched = true;
+            for expected in prefix.chars() {
+                if let Some(&next) = chars.peek() {
+                    if next == expected {
+                        buf.push(next);
+                        chars.next();
+                    } else {
+                        matched = false;
+                        break;
+                    }
+                } else {
+                    matched = false;
+                    break;
+                }
+            }
+
+            if matched {
+                // Read content inside var(...), tracking parenthesis depth.
+                let mut inner = String::new();
+                let mut depth = 1;
+                while let Some(c) = chars.next() {
+                    if c == '(' {
+                        depth += 1;
+                        inner.push(c);
+                    } else if c == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        inner.push(c);
+                    } else {
+                        inner.push(c);
+                    }
+                }
+
+                // Parse: --name or --name, fallback
+                let inner = inner.trim();
+                let (var_name, fallback) = if let Some(comma_pos) = inner.find(',') {
+                    let name = inner[..comma_pos].trim();
+                    let fb = inner[comma_pos + 1..].trim();
+                    (name, Some(fb))
+                } else {
+                    (inner, None)
+                };
+
+                if let Some(val) = custom_props.get(var_name) {
+                    result.push_str(val);
+                } else if let Some(fb) = fallback {
+                    result.push_str(fb);
+                }
+                // If no value and no fallback, output nothing.
+            } else {
+                result.push_str(&buf);
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
+/// Check if any CSS rule targets `node` with `pe` (::before or ::after) and
+/// declares a quoted `content` string.  Returns the unquoted content text if
+/// found, or `None` otherwise.
+fn pseudo_element_content(
+    _tag: &str,
+    _attributes: &[(String, String)],
+    node: &DomNode,
+    rules: &[CssRule],
+    ancestors: &[&DomNode],
+    pe: PseudoElement,
+) -> Option<String> {
+    for rule in rules {
+        if rule.selector.matches_with_pseudo_element(node, ancestors, pe) {
+            // Look for `content` property with a quoted string value.
+            for decl in &rule.declarations {
+                if decl.property == "content" {
+                    let val = decl.value.trim();
+                    // Accept both double- and single-quoted strings.
+                    let unquoted = if (val.starts_with('"') && val.ends_with('"'))
+                        || (val.starts_with('\'') && val.ends_with('\''))
+                    {
+                        val[1..val.len() - 1].to_string()
+                    } else if val == "none" || val == "normal" || val.is_empty() {
+                        continue;
+                    } else {
+                        // Unquoted keyword — treat as raw text.
+                        val.to_string()
+                    };
+                    if !unquoted.is_empty() {
+                        return Some(unquoted);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Convert a `StyleValue` to a CSS string representation.
 fn style_value_to_css(val: &nova_mod_api::content::StyleValue) -> String {
     use nova_mod_api::content::StyleValue;
@@ -396,155 +958,6 @@ fn style_value_to_css(val: &nova_mod_api::content::StyleValue) -> String {
         }
         StyleValue::Str(s) => s.clone(),
         StyleValue::Number(n) => format!("{n}"),
-    }
-}
-
-/// CSS properties that are inherited by default (per CSS spec).
-const INHERITED_PROPERTIES: &[&str] = &[
-    "color",
-    "font-family",
-    "font-size",
-    "font-weight",
-    "font-style",
-    "line-height",
-    "text-align",
-    "text-decoration",
-    "text-transform",
-    "letter-spacing",
-    "word-spacing",
-    "white-space",
-    "visibility",
-    "cursor",
-    "direction",
-    "list-style",
-    "list-style-type",
-];
-
-/// Inherit CSS properties from ancestor elements.
-///
-/// Walks the ancestor chain (nearest first) and collects inherited properties
-/// from their `data-nova-style` attributes. These are added at UA priority
-/// so any explicit declaration on the current element will override them.
-fn inherit_from_ancestors(
-    ancestors: &[&DomNode],
-    declarations: &mut Vec<CascadedDeclaration>,
-) {
-    // Walk ancestors from nearest to farthest.
-    for ancestor in ancestors.iter().rev() {
-        if let DomNode::Element { attributes, .. } = ancestor {
-            if let Some(style_attr) = attributes.iter().find(|(k, _)| k == "data-nova-style") {
-                for decl in style_attr.1.split(';') {
-                    let parts: Vec<&str> = decl.splitn(2, ':').collect();
-                    if parts.len() == 2 {
-                        let prop = parts[0].trim();
-                        let val = parts[1].trim();
-                        // Only inherit if this property is inheritable.
-                        if INHERITED_PROPERTIES.contains(&prop) {
-                            // Only add if not already declared (don't override
-                            // UA defaults that are more specific to this element).
-                            let already_set = declarations
-                                .iter()
-                                .any(|d| d.property == prop && d.origin >= CascadeOrigin::UserAgent);
-                            // For inherited properties, we want to ADD them even if
-                            // there's a UA default, because the ancestor's value
-                            // should win over the generic UA default.
-                            // We use a special "inherited" specificity that beats UA
-                            // defaults but loses to author stylesheets and inline.
-                            if !already_set {
-                                declarations.push(CascadedDeclaration {
-                                    property: prop.to_string(),
-                                    value: val.to_string(),
-                                    specificity: Specificity(0, 0, 0),
-                                    origin: CascadeOrigin::UserAgent,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Convert deprecated HTML presentational attributes to CSS declarations.
-///
-/// Maps attributes like `bgcolor`, `color`, `align`, `width`, `height`,
-/// `border` to their CSS equivalents. These are given UserAgent origin
-/// so any real CSS rule will override them.
-fn convert_presentational_attributes(
-    attributes: &[(String, String)],
-    declarations: &mut Vec<CascadedDeclaration>,
-) {
-    for (attr, value) in attributes {
-        let (prop, css_val) = match attr.as_str() {
-            "bgcolor" => ("background-color", format_color_attr(value)),
-            "color" => ("color", format_color_attr(value)),
-            "align" => match value.to_lowercase().as_str() {
-                "center" => ("text-align", "center".into()),
-                "right" => ("text-align", "right".into()),
-                "left" => ("text-align", "left".into()),
-                _ => continue,
-            },
-            "valign" => match value.to_lowercase().as_str() {
-                "middle" => ("vertical-align", "middle".into()),
-                "bottom" => ("vertical-align", "bottom".into()),
-                "top" => ("vertical-align", "top".into()),
-                _ => continue,
-            },
-            "width" => {
-                if value.ends_with('%') {
-                    ("width", value.clone())
-                } else if let Ok(_) = value.parse::<f32>() {
-                    ("width", format!("{value}px"))
-                } else {
-                    continue;
-                }
-            }
-            "height" => {
-                if value.ends_with('%') {
-                    ("height", value.clone())
-                } else if let Ok(_) = value.parse::<f32>() {
-                    ("height", format!("{value}px"))
-                } else {
-                    continue;
-                }
-            }
-            "border" => {
-                if let Ok(n) = value.parse::<f32>() {
-                    if n > 0.0 {
-                        ("border-width", format!("{n}px"))
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            }
-            _ => continue,
-        };
-
-        declarations.push(CascadedDeclaration {
-            property: prop.into(),
-            value: css_val,
-            specificity: Specificity(0, 0, 0),
-            origin: CascadeOrigin::UserAgent,
-        });
-    }
-}
-
-/// Format a color attribute value: ensure `#` prefix for hex values.
-fn format_color_attr(value: &str) -> String {
-    let trimmed = value.trim();
-    // If it looks like a hex color without #, add it.
-    if trimmed.len() == 6
-        && trimmed.chars().all(|c| c.is_ascii_hexdigit())
-    {
-        format!("#{trimmed}")
-    } else if trimmed.starts_with('#') || trimmed.starts_with("rgb") {
-        trimmed.to_string()
-    } else {
-        // Could be a named color.
-        trimmed.to_string()
     }
 }
 
@@ -586,7 +999,7 @@ mod tests {
             children: vec![DomNode::Text("Hello".into())],
         }]);
 
-        let result = compute_styles(dom, &[]);
+        let result = compute_styles(dom, &[], 1280.0);
         // The h1 should have a data-nova-style attribute.
         fn find_h1(node: &DomNode) -> Option<&DomNode> {
             match node {
@@ -635,7 +1048,7 @@ mod tests {
             },
         ]);
 
-        let result = compute_styles(dom, &[]);
+        let result = compute_styles(dom, &[], 1280.0);
         fn find_h1(node: &DomNode) -> Option<&DomNode> {
             match node {
                 DomNode::Element { tag, children, .. } => {
@@ -682,7 +1095,7 @@ mod tests {
             },
         ]);
 
-        let result = compute_styles(dom, &[]);
+        let result = compute_styles(dom, &[], 1280.0);
         fn find_p(node: &DomNode) -> Option<&DomNode> {
             match node {
                 DomNode::Element { tag, children, .. } => {
@@ -730,7 +1143,7 @@ mod tests {
             },
         ]);
 
-        let result = compute_styles(dom, &[]);
+        let result = compute_styles(dom, &[], 1280.0);
         fn find_div(node: &DomNode) -> Option<&DomNode> {
             match node {
                 DomNode::Element { tag, children, .. } => {
@@ -784,7 +1197,7 @@ mod tests {
             },
         ]);
 
-        let result = compute_styles(dom, &[]);
+        let result = compute_styles(dom, &[], 1280.0);
         fn find_div(node: &DomNode) -> Option<&DomNode> {
             match node {
                 DomNode::Element { tag, children, .. } => {
@@ -831,7 +1244,7 @@ mod tests {
             },
         ]);
 
-        let result = compute_styles(dom, &[]);
+        let result = compute_styles(dom, &[], 1280.0);
         fn find_div(node: &DomNode) -> Option<&DomNode> {
             match node {
                 DomNode::Element { tag, children, .. } => {
@@ -863,5 +1276,396 @@ mod tests {
         assert!(style.contains("margin-right: 20px"), "style = {style}");
         assert!(style.contains("margin-bottom: 10px"), "style = {style}");
         assert!(style.contains("margin-left: 20px"), "style = {style}");
+    }
+
+    // ── !important override test ──────────────────────────────────────────────
+
+    /// `!important` on a lower-specificity rule must beat a normal declaration
+    /// from a higher-specificity selector.
+    #[test]
+    fn important_beats_higher_specificity() {
+        // `#high-specificity { color: blue; }` has specificity (1,0,0).
+        // `.low { color: red !important; }` has specificity (0,1,0) but is !important.
+        // The !important red should win.
+        let dom = make_dom(vec![
+            DomNode::Element {
+                tag: "style".into(),
+                attributes: vec![],
+                children: vec![DomNode::Text(
+                    "#high { color: blue; } .low { color: red !important; }".into(),
+                )],
+            },
+            DomNode::Element {
+                tag: "p".into(),
+                attributes: vec![
+                    ("id".into(), "high".into()),
+                    ("class".into(), "low".into()),
+                ],
+                children: vec![],
+            },
+        ]);
+
+        let result = compute_styles(dom, &[], 1280.0);
+        fn find_p(node: &DomNode) -> Option<&DomNode> {
+            match node {
+                DomNode::Element { tag, children, .. } => {
+                    if tag == "p" {
+                        return Some(node);
+                    }
+                    for child in children {
+                        if let Some(found) = find_p(child) {
+                            return Some(found);
+                        }
+                    }
+                    None
+                }
+                DomNode::Document { children } => {
+                    for child in children {
+                        if let Some(found) = find_p(child) {
+                            return Some(found);
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        }
+
+        let p = find_p(&result).expect("should find p");
+        let style = p.attr("data-nova-style").expect("p should have data-nova-style");
+        // !important red should win over the higher-specificity blue.
+        assert!(style.contains("color: red"), "!important should win: style = {style}");
+        assert!(!style.contains("color: blue"), "blue should be overridden: style = {style}");
+    }
+
+    /// `!important` inline style beats a normal inline style from a stylesheet rule.
+    #[test]
+    fn important_stylesheet_beats_normal_inline() {
+        // Stylesheet: `p { color: green !important; }` — !important author.
+        // Inline style on element: `color: purple` — normal inline (no !important).
+        // According to CSS spec, !important author beats normal inline.
+        let dom = make_dom(vec![
+            DomNode::Element {
+                tag: "style".into(),
+                attributes: vec![],
+                children: vec![DomNode::Text("p { color: green !important; }".into())],
+            },
+            DomNode::Element {
+                tag: "p".into(),
+                attributes: vec![("style".into(), "color: purple".into())],
+                children: vec![],
+            },
+        ]);
+
+        let result = compute_styles(dom, &[], 1280.0);
+        fn find_p(node: &DomNode) -> Option<&DomNode> {
+            match node {
+                DomNode::Element { tag, children, .. } => {
+                    if tag == "p" {
+                        return Some(node);
+                    }
+                    for child in children {
+                        if let Some(found) = find_p(child) {
+                            return Some(found);
+                        }
+                    }
+                    None
+                }
+                DomNode::Document { children } => {
+                    for child in children {
+                        if let Some(found) = find_p(child) {
+                            return Some(found);
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        }
+
+        let p = find_p(&result).expect("should find p");
+        let style = p.attr("data-nova-style").expect("p should have data-nova-style");
+        assert!(style.contains("color: green"), "!important stylesheet should win: style = {style}");
+        assert!(!style.contains("color: purple"), "normal inline should lose: style = {style}");
+    }
+
+    // ── Helper: call expand_shorthand and return a map of property→value ──────
+
+    fn expand(property: &str, value: &str) -> std::collections::HashMap<String, String> {
+        let decl = CascadedDeclaration {
+            property: property.to_string(),
+            value: value.to_string(),
+            specificity: crate::selector::Specificity(0, 0, 0),
+            origin: CascadeOrigin::AuthorStylesheet,
+            important: false,
+        };
+        let mut out = Vec::new();
+        expand_shorthand(decl, &mut out);
+        out.into_iter().map(|d| (d.property, d.value)).collect()
+    }
+
+    // ── flex shorthand ────────────────────────────────────────────────────────
+
+    #[test]
+    fn flex_single_number() {
+        let m = expand("flex", "1");
+        assert_eq!(m.get("flex-grow").map(String::as_str), Some("1"));
+        assert_eq!(m.get("flex-shrink").map(String::as_str), Some("1"));
+        assert_eq!(m.get("flex-basis").map(String::as_str), Some("0%"));
+    }
+
+    #[test]
+    fn flex_three_values() {
+        let m = expand("flex", "0 1 auto");
+        assert_eq!(m.get("flex-grow").map(String::as_str), Some("0"));
+        assert_eq!(m.get("flex-shrink").map(String::as_str), Some("1"));
+        assert_eq!(m.get("flex-basis").map(String::as_str), Some("auto"));
+    }
+
+    #[test]
+    fn flex_none_keyword() {
+        let m = expand("flex", "none");
+        assert_eq!(m.get("flex-grow").map(String::as_str), Some("0"));
+        assert_eq!(m.get("flex-shrink").map(String::as_str), Some("0"));
+        assert_eq!(m.get("flex-basis").map(String::as_str), Some("auto"));
+    }
+
+    #[test]
+    fn flex_auto_keyword() {
+        let m = expand("flex", "auto");
+        assert_eq!(m.get("flex-grow").map(String::as_str), Some("1"));
+        assert_eq!(m.get("flex-shrink").map(String::as_str), Some("1"));
+        assert_eq!(m.get("flex-basis").map(String::as_str), Some("auto"));
+    }
+
+    // ── overflow shorthand ────────────────────────────────────────────────────
+
+    #[test]
+    fn overflow_single_value() {
+        let m = expand("overflow", "hidden");
+        assert_eq!(m.get("overflow-x").map(String::as_str), Some("hidden"));
+        assert_eq!(m.get("overflow-y").map(String::as_str), Some("hidden"));
+    }
+
+    #[test]
+    fn overflow_two_values() {
+        let m = expand("overflow", "auto scroll");
+        assert_eq!(m.get("overflow-x").map(String::as_str), Some("auto"));
+        assert_eq!(m.get("overflow-y").map(String::as_str), Some("scroll"));
+    }
+
+    // ── list-style shorthand ──────────────────────────────────────────────────
+
+    #[test]
+    fn list_style_none() {
+        let m = expand("list-style", "none");
+        assert_eq!(m.get("list-style-type").map(String::as_str), Some("none"));
+        assert_eq!(m.get("list-style-position").map(String::as_str), Some("outside"));
+        assert_eq!(m.get("list-style-image").map(String::as_str), Some("none"));
+    }
+
+    #[test]
+    fn list_style_disc_inside() {
+        let m = expand("list-style", "disc inside");
+        assert_eq!(m.get("list-style-type").map(String::as_str), Some("disc"));
+        assert_eq!(m.get("list-style-position").map(String::as_str), Some("inside"));
+        assert_eq!(m.get("list-style-image").map(String::as_str), Some("none"));
+    }
+
+    // ── directional border shorthands ─────────────────────────────────────────
+
+    #[test]
+    fn border_top_shorthand() {
+        let m = expand("border-top", "2px solid red");
+        assert_eq!(m.get("border-top-width").map(String::as_str), Some("2px"));
+        assert_eq!(m.get("border-top-style").map(String::as_str), Some("solid"));
+        assert_eq!(m.get("border-top-color").map(String::as_str), Some("red"));
+    }
+
+    #[test]
+    fn border_bottom_shorthand() {
+        let m = expand("border-bottom", "1px dashed blue");
+        assert_eq!(m.get("border-bottom-width").map(String::as_str), Some("1px"));
+        assert_eq!(m.get("border-bottom-style").map(String::as_str), Some("dashed"));
+        assert_eq!(m.get("border-bottom-color").map(String::as_str), Some("blue"));
+    }
+
+    #[test]
+    fn border_left_shorthand() {
+        let m = expand("border-left", "3px solid green");
+        assert_eq!(m.get("border-left-width").map(String::as_str), Some("3px"));
+        assert_eq!(m.get("border-left-style").map(String::as_str), Some("solid"));
+        assert_eq!(m.get("border-left-color").map(String::as_str), Some("green"));
+    }
+
+    #[test]
+    fn border_right_shorthand() {
+        let m = expand("border-right", "4px dotted black");
+        assert_eq!(m.get("border-right-width").map(String::as_str), Some("4px"));
+        assert_eq!(m.get("border-right-style").map(String::as_str), Some("dotted"));
+        assert_eq!(m.get("border-right-color").map(String::as_str), Some("black"));
+    }
+
+    // ── text-decoration pass-through ──────────────────────────────────────────
+
+    #[test]
+    fn text_decoration_passes_through() {
+        let m = expand("text-decoration", "underline");
+        assert_eq!(m.get("text-decoration").map(String::as_str), Some("underline"));
+        // Should not be split into sub-properties.
+        assert!(m.len() == 1);
+    }
+
+    #[test]
+    fn text_decoration_none_passes_through() {
+        let m = expand("text-decoration", "none");
+        assert_eq!(m.get("text-decoration").map(String::as_str), Some("none"));
+    }
+}
+
+#[cfg(test)]
+mod pseudo_element_injection_tests {
+    use super::*;
+    use nova_mod_api::content::DomNode;
+
+    fn find_element<'a>(node: &'a DomNode, tag_name: &str) -> Option<&'a DomNode> {
+        match node {
+            DomNode::Element { tag, children, .. } => {
+                if tag == tag_name {
+                    return Some(node);
+                }
+                for child in children {
+                    if let Some(f) = find_element(child, tag_name) {
+                        return Some(f);
+                    }
+                }
+                None
+            }
+            DomNode::Document { children } => {
+                for child in children {
+                    if let Some(f) = find_element(child, tag_name) {
+                        return Some(f);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn before_pseudo_injects_text_child() {
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "body".into(),
+                attributes: vec![],
+                children: vec![
+                    DomNode::Element {
+                        tag: "style".into(),
+                        attributes: vec![],
+                        children: vec![DomNode::Text(
+                            r#"p::before { content: ">>"; }"#.into(),
+                        )],
+                    },
+                    DomNode::Element {
+                        tag: "p".into(),
+                        attributes: vec![],
+                        children: vec![DomNode::Text("Hello".into())],
+                    },
+                ],
+            }],
+        };
+
+        let result = compute_styles(dom, &[], 800.0);
+        let p = find_element(&result, "p").expect("should find p");
+        if let DomNode::Element { children, .. } = p {
+            // First child should be the injected ::before text.
+            assert!(
+                !children.is_empty(),
+                "p should have children after ::before injection"
+            );
+            // The first child should be the injected text ">>"
+            assert!(
+                matches!(&children[0], DomNode::Text(t) if t == ">>"),
+                "first child should be '>>'. Got: {:?}",
+                &children[0]
+            );
+        } else {
+            panic!("expected Element for p");
+        }
+    }
+
+    #[test]
+    fn after_pseudo_injects_text_child() {
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "body".into(),
+                attributes: vec![],
+                children: vec![
+                    DomNode::Element {
+                        tag: "style".into(),
+                        attributes: vec![],
+                        children: vec![DomNode::Text(
+                            r#"span::after { content: " [end]"; }"#.into(),
+                        )],
+                    },
+                    DomNode::Element {
+                        tag: "span".into(),
+                        attributes: vec![],
+                        children: vec![DomNode::Text("text".into())],
+                    },
+                ],
+            }],
+        };
+
+        let result = compute_styles(dom, &[], 800.0);
+        let span = find_element(&result, "span").expect("should find span");
+        if let DomNode::Element { children, .. } = span {
+            let last = children.last().expect("span should have children");
+            assert!(
+                matches!(last, DomNode::Text(t) if t == " [end]"),
+                "last child should be ' [end]'. Got: {:?}",
+                last
+            );
+        } else {
+            panic!("expected Element for span");
+        }
+    }
+
+    #[test]
+    fn content_none_does_not_inject() {
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "body".into(),
+                attributes: vec![],
+                children: vec![
+                    DomNode::Element {
+                        tag: "style".into(),
+                        attributes: vec![],
+                        children: vec![DomNode::Text(
+                            r#"p::before { content: none; }"#.into(),
+                        )],
+                    },
+                    DomNode::Element {
+                        tag: "p".into(),
+                        attributes: vec![],
+                        children: vec![DomNode::Text("Hello".into())],
+                    },
+                ],
+            }],
+        };
+
+        let result = compute_styles(dom, &[], 800.0);
+        let p = find_element(&result, "p").expect("should find p");
+        if let DomNode::Element { children, .. } = p {
+            // With content: none, no text should be injected.
+            assert_eq!(
+                children.len(),
+                1,
+                "p should have exactly 1 child (no ::before injection with content:none)"
+            );
+        } else {
+            panic!("expected Element for p");
+        }
     }
 }

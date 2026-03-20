@@ -12,3 +12,4 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 semver = { workspace = true }
 taffy = { workspace = true }
+fontdue = "0.9"

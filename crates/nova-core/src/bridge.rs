@@ -97,6 +97,8 @@ fn capability_for_request(req: &ContentRequest) -> nova_mod_api::CapabilityType 
         }
         ContentRequest::ParseCss { .. } => CapabilityType::ParseStylesheet,
         ContentRequest::ExecScript { .. } => CapabilityType::ExecJavaScript,
+        ContentRequest::ExecScriptWithDom { .. } => CapabilityType::ExecJavaScript,
+        ContentRequest::DispatchEvent { .. } => CapabilityType::ExecJavaScript,
         ContentRequest::DecodeImage { format_hint, .. } => {
             CapabilityType::DecodeImage(format_hint.clone().unwrap_or_default())
         }

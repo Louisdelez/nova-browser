@@ -16,3 +16,4 @@ bytes = { workspace = true }
 url = { workspace = true }
 async-trait = { workspace = true }
 futures = "0.3"
+mod-css-engine = { workspace = true }

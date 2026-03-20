@@ -12,24 +12,321 @@ use tracing::debug;
 
 use crate::selector::SelectorList;
 
+/// A single declaration (property: value [!important]).
+#[derive(Debug, Clone)]
+pub struct Declaration {
+    pub property: String,
+    pub value: String,
+    /// `true` when the declaration was marked `!important`.
+    pub important: bool,
+}
+
 /// A parsed CSS rule: selector + declarations.
 #[derive(Debug, Clone)]
 pub struct CssRule {
     /// The parsed selector list.
     pub selector: SelectorList,
-    /// Property declarations: (property-name, value-string).
-    pub declarations: Vec<(String, String)>,
+    /// Property declarations.
+    pub declarations: Vec<Declaration>,
 }
 
-/// A single declaration (property: value).
+/// A parsed `@font-face` rule.
+///
+/// Only `font-family` and `src` are extracted. Font fetching is not performed
+/// yet — this is a foundation for future custom-font support.
 #[derive(Debug, Clone)]
-pub struct Declaration {
-    pub property: String,
-    pub value: String,
+pub struct FontFaceRule {
+    /// The value of the `font-family` descriptor (without quotes).
+    pub family: String,
+    /// The value of the `src` descriptor (typically a `url(...)` expression).
+    pub src: String,
+}
+
+/// Combined output from `parse_stylesheet_full`.
+#[derive(Debug, Clone)]
+pub struct ParsedStylesheet {
+    /// Qualified CSS rules (selector + declarations).
+    pub rules: Vec<CssRule>,
+    /// Parsed `@font-face` rules encountered in the stylesheet.
+    pub font_faces: Vec<FontFaceRule>,
+}
+
+/// A parsed `@media` query with optional width constraints.
+#[derive(Debug, Clone)]
+struct MediaQuery {
+    /// Minimum viewport width (inclusive) in px.
+    min_width: Option<f32>,
+    /// Maximum viewport width (inclusive) in px.
+    max_width: Option<f32>,
+    /// If `true`, the query always evaluates to `false` (e.g. `print`).
+    never: bool,
+}
+
+impl MediaQuery {
+    /// Evaluate this query against a viewport width.
+    fn evaluate(&self, viewport_width: f32) -> bool {
+        if self.never {
+            return false;
+        }
+        if let Some(min) = self.min_width {
+            if viewport_width < min {
+                return false;
+            }
+        }
+        if let Some(max) = self.max_width {
+            if viewport_width > max {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Parse a simple media query string into a `MediaQuery`.
+///
+/// Supports: `screen`, `all`, `print`, `not print`,
+/// `(min-width: Npx)`, `(max-width: Npx)`,
+/// `screen and (max-width: Npx)`, and combinations with `and`.
+fn parse_media_query(query: &str) -> MediaQuery {
+    let query = query.trim();
+
+    // `print` medium — never matches in a screen browser.
+    if query.eq_ignore_ascii_case("print") {
+        return MediaQuery {
+            min_width: None,
+            max_width: None,
+            never: true,
+        };
+    }
+
+    // `not print` — always matches.
+    if query.eq_ignore_ascii_case("not print") {
+        return MediaQuery {
+            min_width: None,
+            max_width: None,
+            never: false,
+        };
+    }
+
+    let mut mq = MediaQuery {
+        min_width: None,
+        max_width: None,
+        never: false,
+    };
+
+    // Split by `and` and parse each condition.
+    for part in query.split("and") {
+        let part = part.trim();
+        // Skip media-type keywords.
+        if part.eq_ignore_ascii_case("screen")
+            || part.eq_ignore_ascii_case("all")
+            || part.is_empty()
+        {
+            continue;
+        }
+
+        // Try to parse `(min-width: Npx)` or `(max-width: Npx)`.
+        let inner = part.trim_start_matches('(').trim_end_matches(')').trim();
+        if let Some(val_str) = inner.strip_prefix("min-width:").or(inner.strip_prefix("min-width :")) {
+            if let Some(px) = parse_px_value(val_str.trim()) {
+                mq.min_width = Some(px);
+            }
+        } else if let Some(val_str) = inner.strip_prefix("max-width:").or(inner.strip_prefix("max-width :")) {
+            if let Some(px) = parse_px_value(val_str.trim()) {
+                mq.max_width = Some(px);
+            }
+        }
+    }
+
+    mq
+}
+
+/// Parse a CSS pixel value like `700px`, `1024px`, or bare number.
+fn parse_px_value(s: &str) -> Option<f32> {
+    let s = s.trim();
+    let num_str = s
+        .strip_suffix("px")
+        .or_else(|| s.strip_suffix("em")) // treat em as ~16px * value
+        .unwrap_or(s);
+    let val: f32 = num_str.trim().parse().ok()?;
+    if s.ends_with("em") {
+        Some(val * 16.0) // rough approximation
+    } else {
+        Some(val)
+    }
+}
+
+/// Pre-process CSS text to evaluate `@media` queries and flatten matching blocks.
+///
+/// Non-matching `@media` blocks are stripped. `@font-face` blocks are extracted
+/// into the returned `Vec<FontFaceRule>` list so callers can use them for future
+/// font loading. `@keyframes`, `@charset`, and `@import` are stripped.
+///
+/// Returns `(preprocessed_css, font_face_rules)`.
+fn preprocess_media_queries(
+    css: &str,
+    viewport_width: f32,
+) -> (String, Vec<FontFaceRule>) {
+    let mut result = String::with_capacity(css.len());
+    let mut font_faces: Vec<FontFaceRule> = Vec::new();
+    let bytes = css.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] == b'@' {
+            // Read the at-rule name.
+            let start = i;
+            i += 1; // skip '@'
+            // Read identifier.
+            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-') {
+                i += 1;
+            }
+            let name = &css[start + 1..i];
+
+            if name.eq_ignore_ascii_case("media") {
+                // Read until '{'.
+                let query_start = i;
+                while i < len && bytes[i] != b'{' {
+                    i += 1;
+                }
+                let query_text = &css[query_start..i];
+
+                // Read the brace-balanced block.
+                let block_content = read_brace_block(css, &mut i);
+                let query = parse_media_query(query_text);
+                if query.evaluate(viewport_width) {
+                    // Include the inner rules.
+                    result.push_str(&block_content);
+                    result.push('\n');
+                }
+                // else: skip the block entirely.
+            } else if name.eq_ignore_ascii_case("font-face") {
+                // Parse the @font-face block and extract font-family + src.
+                // Skip whitespace up to '{'.
+                while i < len && bytes[i] != b'{' {
+                    i += 1;
+                }
+                let block_content = read_brace_block(css, &mut i);
+                // Extract font-family and src from the declarations.
+                let mut family = String::new();
+                let mut src = String::new();
+                for decl in block_content.split(';') {
+                    let decl = decl.trim();
+                    if let Some(rest) = decl.strip_prefix("font-family") {
+                        let val = rest.trim_start_matches(':').trim().trim_matches('"').trim_matches('\'');
+                        family = val.to_string();
+                    } else if let Some(rest) = decl.strip_prefix("src") {
+                        let val = rest.trim_start_matches(':').trim();
+                        src = val.to_string();
+                    }
+                }
+                if !family.is_empty() || !src.is_empty() {
+                    font_faces.push(FontFaceRule { family, src });
+                }
+                // @font-face is not passed to cssparser — it would be rejected anyway.
+            } else if name.eq_ignore_ascii_case("keyframes")
+                || name.eq_ignore_ascii_case("charset")
+                || name.eq_ignore_ascii_case("import")
+            {
+                // Skip to end of block or semicolon.
+                if name.eq_ignore_ascii_case("charset") || name.eq_ignore_ascii_case("import") {
+                    // These end with `;`.
+                    while i < len && bytes[i] != b';' {
+                        i += 1;
+                    }
+                    if i < len {
+                        i += 1; // skip ';'
+                    }
+                } else {
+                    // Skip brace block.
+                    while i < len && bytes[i] != b'{' {
+                        i += 1;
+                    }
+                    let _ = read_brace_block(css, &mut i);
+                }
+            } else {
+                // Unknown at-rule — pass through (will be handled/skipped by cssparser).
+                result.push_str(&css[start..i]);
+            }
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+
+    (result, font_faces)
+}
+
+/// Read a brace-balanced block from `css` starting at position `i` (which should
+/// point to the opening `{`). Returns the content between the braces (exclusive).
+/// Advances `i` past the closing `}`.
+fn read_brace_block(css: &str, i: &mut usize) -> String {
+    let bytes = css.as_bytes();
+    let len = bytes.len();
+
+    if *i >= len || bytes[*i] != b'{' {
+        return String::new();
+    }
+
+    *i += 1; // skip opening '{'
+    let content_start = *i;
+    let mut depth = 1u32;
+
+    while *i < len && depth > 0 {
+        match bytes[*i] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            b'\'' | b'"' => {
+                // Skip string literals to avoid counting braces inside them.
+                let quote = bytes[*i];
+                *i += 1;
+                while *i < len && bytes[*i] != quote {
+                    if bytes[*i] == b'\\' {
+                        *i += 1; // skip escaped char
+                    }
+                    *i += 1;
+                }
+                // *i now points to the closing quote (or end); the loop will advance.
+            }
+            _ => {}
+        }
+        if depth > 0 {
+            *i += 1;
+        }
+    }
+
+    let content_end = *i;
+    if *i < len {
+        *i += 1; // skip closing '}'
+    }
+
+    css[content_start..content_end].to_string()
 }
 
 /// Parse a CSS stylesheet string into a list of rules.
-pub fn parse_stylesheet(css: &str) -> Vec<CssRule> {
+///
+/// `viewport_width` is used to evaluate `@media` queries. Rules inside matching
+/// `@media` blocks are flattened into the top-level rule list; non-matching
+/// blocks are discarded. `@font-face` rules are extracted but not returned here;
+/// use [`parse_stylesheet_full`] if font-face data is needed.
+pub fn parse_stylesheet(css: &str, viewport_width: f32) -> Vec<CssRule> {
+    let (preprocessed, _font_faces) = preprocess_media_queries(css, viewport_width);
+    parse_stylesheet_inner(&preprocessed)
+}
+
+/// Parse a CSS stylesheet and return both qualified rules and `@font-face` rules.
+///
+/// This is the full parse that preserves font-face information for future use.
+/// `viewport_width` is used to evaluate `@media` queries.
+pub fn parse_stylesheet_full(css: &str, viewport_width: f32) -> ParsedStylesheet {
+    let (preprocessed, font_faces) = preprocess_media_queries(css, viewport_width);
+    let rules = parse_stylesheet_inner(&preprocessed);
+    ParsedStylesheet { rules, font_faces }
+}
+
+/// Parse a CSS stylesheet string into a list of rules (internal, no media query handling).
+fn parse_stylesheet_inner(css: &str) -> Vec<CssRule> {
     let mut input = ParserInput::new(css);
     let mut parser = Parser::new(&mut input);
     let mut rule_parser = NovaRuleParser;
@@ -50,7 +347,7 @@ pub fn parse_stylesheet(css: &str) -> Vec<CssRule> {
 }
 
 /// Parse an inline style string (e.g., `color: red; font-size: 16px`) into declarations.
-pub fn parse_inline_style(style: &str) -> Vec<(String, String)> {
+pub fn parse_inline_style(style: &str) -> Vec<Declaration> {
     let mut input = ParserInput::new(style);
     let mut parser = Parser::new(&mut input);
     let mut decl_parser = NovaDeclarationParser;
@@ -60,7 +357,7 @@ pub fn parse_inline_style(style: &str) -> Vec<(String, String)> {
 
     for result in iter {
         match result {
-            Ok(decl) => decls.push((decl.property, decl.value)),
+            Ok(decl) => decls.push(decl),
             Err((err, _slice)) => {
                 debug!("CSS inline style parse error: {:?}", err);
             }
@@ -124,14 +421,14 @@ impl<'i> QualifiedRuleParser<'i> for NovaRuleParser {
 }
 
 /// Parse declarations inside a `{ ... }` block.
-fn parse_declaration_block<'i>(input: &mut Parser<'i, '_>) -> Vec<(String, String)> {
+fn parse_declaration_block<'i>(input: &mut Parser<'i, '_>) -> Vec<Declaration> {
     let mut decl_parser = NovaDeclarationParser;
     let iter = RuleBodyParser::new(input, &mut decl_parser);
     let mut decls = Vec::new();
 
     for result in iter {
         match result {
-            Ok(decl) => decls.push((decl.property, decl.value)),
+            Ok(decl) => decls.push(decl),
             Err(_) => {} // Skip invalid declarations.
         }
     }
@@ -151,18 +448,29 @@ impl<'i> DeclarationParser<'i> for NovaDeclarationParser {
         name: CowRcStr<'i>,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::Declaration, ParseError<'i, Self::Error>> {
-        let property = name.to_string().to_ascii_lowercase();
+        let raw_name = name.to_string();
+        // Custom properties (--*) are case-sensitive; standard properties are lowercased.
+        let property = if raw_name.starts_with("--") {
+            raw_name
+        } else {
+            raw_name.to_ascii_lowercase()
+        };
         let start = input.position();
         // Consume all remaining tokens for this declaration.
         while input.next().is_ok() {}
-        let value = input.slice_from(start).trim().to_string();
-        // Strip !important if present.
-        let value = value
-            .strip_suffix("!important")
-            .map(|v| v.trim().to_string())
-            .unwrap_or(value);
+        let raw = input.slice_from(start).trim().to_string();
+        // Detect and strip `!important`.
+        let (value, important) = if let Some(v) = raw.strip_suffix("!important") {
+            (v.trim().to_string(), true)
+        } else {
+            (raw, false)
+        };
 
-        Ok(Declaration { property, value })
+        Ok(Declaration {
+            property,
+            value,
+            important,
+        })
     }
 }
 
@@ -191,13 +499,16 @@ impl<'i> RuleBodyItemParser<'i, Declaration, ()> for NovaDeclarationParser {
 mod tests {
     use super::*;
 
+    /// Default viewport width for tests.
+    const TEST_VP: f32 = 1280.0;
+
     #[test]
     fn parse_simple_stylesheet() {
         let css = r#"
             body { color: black; background-color: white; }
             h1 { font-size: 32px; font-weight: bold; }
         "#;
-        let rules = parse_stylesheet(css);
+        let rules = parse_stylesheet(css, TEST_VP);
         assert_eq!(rules.len(), 2);
         assert!(!rules[0].declarations.is_empty());
         assert!(!rules[1].declarations.is_empty());
@@ -206,7 +517,7 @@ mod tests {
     #[test]
     fn parse_class_selector() {
         let css = ".container { max-width: 960px; margin: 0 auto; }";
-        let rules = parse_stylesheet(css);
+        let rules = parse_stylesheet(css, TEST_VP);
         assert_eq!(rules.len(), 1);
         assert!(rules[0].selector.selectors[0].parts[0].classes.contains(&"container".to_string()));
     }
@@ -214,7 +525,7 @@ mod tests {
     #[test]
     fn parse_multiple_selectors() {
         let css = "h1, h2, h3 { font-weight: bold; }";
-        let rules = parse_stylesheet(css);
+        let rules = parse_stylesheet(css, TEST_VP);
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].selector.selectors.len(), 3);
     }
@@ -223,16 +534,29 @@ mod tests {
     fn parse_inline_style_basic() {
         let decls = parse_inline_style("color: red; font-size: 16px");
         assert_eq!(decls.len(), 2);
-        assert_eq!(decls[0].0, "color");
-        assert_eq!(decls[0].1, "red");
-        assert_eq!(decls[1].0, "font-size");
-        assert_eq!(decls[1].1, "16px");
+        assert_eq!(decls[0].property, "color");
+        assert_eq!(decls[0].value, "red");
+        assert!(!decls[0].important);
+        assert_eq!(decls[1].property, "font-size");
+        assert_eq!(decls[1].value, "16px");
+        assert!(!decls[1].important);
+    }
+
+    #[test]
+    fn parse_inline_style_important() {
+        let decls = parse_inline_style("color: red !important; font-size: 16px");
+        assert_eq!(decls.len(), 2);
+        assert_eq!(decls[0].property, "color");
+        assert_eq!(decls[0].value, "red");
+        assert!(decls[0].important, "color should be marked !important");
+        assert_eq!(decls[1].property, "font-size");
+        assert!(!decls[1].important);
     }
 
     #[test]
     fn parse_descendant_selector() {
         let css = "div p { color: blue; }";
-        let rules = parse_stylesheet(css);
+        let rules = parse_stylesheet(css, TEST_VP);
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].selector.selectors[0].parts.len(), 2);
     }
@@ -240,7 +564,7 @@ mod tests {
     #[test]
     fn skips_invalid_declarations() {
         let css = "body { color: ; background: white; }";
-        let rules = parse_stylesheet(css);
+        let rules = parse_stylesheet(css, TEST_VP);
         assert_eq!(rules.len(), 1);
         // At least the valid declaration should be there.
         assert!(!rules[0].declarations.is_empty());
@@ -269,7 +593,163 @@ mod tests {
                 text-decoration: none;
             }
         "#;
-        let rules = parse_stylesheet(css);
+        let rules = parse_stylesheet(css, TEST_VP);
         assert!(rules.len() >= 2); // body and div at minimum
+    }
+
+    // ── @media query tests ─────────────────────────────────────────────
+
+    #[test]
+    fn media_query_max_width_matching() {
+        let css = r#"
+            body { color: black; }
+            @media (max-width: 700px) {
+                div { width: auto; }
+            }
+        "#;
+        // Viewport 500px — should include the media rule.
+        let rules = parse_stylesheet(css, 500.0);
+        assert_eq!(rules.len(), 2, "expected 2 rules at 500px viewport");
+
+        // Viewport 1024px — should skip the media rule.
+        let rules = parse_stylesheet(css, 1024.0);
+        assert_eq!(rules.len(), 1, "expected 1 rule at 1024px viewport");
+    }
+
+    #[test]
+    fn media_query_min_width_matching() {
+        let css = r#"
+            body { color: black; }
+            @media (min-width: 768px) {
+                .sidebar { display: block; }
+            }
+        "#;
+        // Viewport 1024px — should include.
+        let rules = parse_stylesheet(css, 1024.0);
+        assert_eq!(rules.len(), 2);
+
+        // Viewport 500px — should skip.
+        let rules = parse_stylesheet(css, 500.0);
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn media_query_screen_and_max_width() {
+        let css = r#"
+            body { color: black; }
+            @media screen and (max-width: 1024px) {
+                div { margin: 0 auto; width: auto; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, 800.0);
+        assert_eq!(rules.len(), 2);
+
+        let rules = parse_stylesheet(css, 1280.0);
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn media_query_print_never_matches() {
+        let css = r#"
+            body { color: black; }
+            @media print {
+                body { color: white; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, 1280.0);
+        assert_eq!(rules.len(), 1, "print media should be skipped");
+    }
+
+    #[test]
+    fn media_query_multiple_blocks() {
+        let css = r#"
+            body { color: black; }
+            @media (max-width: 700px) {
+                .mobile { display: block; }
+            }
+            h1 { font-size: 32px; }
+            @media (min-width: 1200px) {
+                .desktop { display: flex; }
+            }
+        "#;
+        // At 500px: body + .mobile + h1 = 3 rules
+        let rules = parse_stylesheet(css, 500.0);
+        assert_eq!(rules.len(), 3);
+
+        // At 1280px: body + h1 + .desktop = 3 rules
+        let rules = parse_stylesheet(css, 1280.0);
+        assert_eq!(rules.len(), 3);
+
+        // At 900px: body + h1 = 2 rules
+        let rules = parse_stylesheet(css, 900.0);
+        assert_eq!(rules.len(), 2);
+    }
+
+    #[test]
+    fn media_query_example_com() {
+        let css = r#"
+            body { background-color: #f0f0f2; }
+            div { width: 600px; }
+            @media (max-width: 700px) {
+                div { margin: 0 auto; width: auto; }
+            }
+        "#;
+        // Wide viewport — media block skipped.
+        let rules = parse_stylesheet(css, 1280.0);
+        assert_eq!(rules.len(), 2);
+
+        // Narrow viewport — media block included.
+        let rules = parse_stylesheet(css, 500.0);
+        assert_eq!(rules.len(), 3);
+        // The last rule should be the div override from the media block.
+        let last = &rules[2];
+        assert!(last.declarations.iter().any(|d| d.property == "width" && d.value == "auto"));
+    }
+
+    // ── Phase 6C: @font-face tests ──────────────────────────────────────
+
+    #[test]
+    fn font_face_extracted() {
+        let css = r#"
+            @font-face {
+                font-family: "MyFont";
+                src: url("/fonts/myfont.woff2");
+            }
+            body { color: black; }
+        "#;
+        let sheet = parse_stylesheet_full(css, TEST_VP);
+        // The body rule should still be present.
+        assert_eq!(sheet.rules.len(), 1, "body rule should be present");
+        // The font-face should be extracted.
+        assert_eq!(sheet.font_faces.len(), 1, "one @font-face should be extracted");
+        assert_eq!(sheet.font_faces[0].family, "MyFont");
+        assert!(sheet.font_faces[0].src.contains("myfont.woff2"));
+    }
+
+    #[test]
+    fn font_face_does_not_break_rules() {
+        // @font-face between two regular rules — both rules should be parsed.
+        let css = r#"
+            h1 { font-size: 32px; }
+            @font-face {
+                font-family: "Custom";
+                src: url("/fonts/custom.woff2");
+            }
+            p { color: blue; }
+        "#;
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 2, "h1 and p rules should both be present");
+    }
+
+    #[test]
+    fn multiple_font_faces() {
+        let css = r#"
+            @font-face { font-family: "FontA"; src: url("/a.woff2"); }
+            @font-face { font-family: "FontB"; src: url("/b.woff2"); }
+            body { margin: 0; }
+        "#;
+        let sheet = parse_stylesheet_full(css, TEST_VP);
+        assert_eq!(sheet.font_faces.len(), 2);
+        assert_eq!(sheet.rules.len(), 1);
     }
 }

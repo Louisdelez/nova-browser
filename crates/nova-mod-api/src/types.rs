@@ -63,6 +63,10 @@ pub enum RenderOp {
         text: String,
         font_size: f32,
         color: Color,
+        /// CSS font-weight (400 = normal, 700 = bold). None defaults to 400.
+        font_weight: Option<u16>,
+        /// CSS font-style ("italic", "oblique"). None defaults to normal.
+        font_style: Option<String>,
     },
     /// Draw an image from a GPU texture.
     DrawTexture {
@@ -124,6 +128,33 @@ pub enum RenderOp {
         width: f32,
         height: f32,
         url: String,
+    },
+    /// Fill a rectangle with rounded corners using an SDF approach.
+    ///
+    /// `radius` contains the corner radii in CSS order:
+    /// `[top-left, top-right, bottom-right, bottom-left]`.
+    FillRoundedRect {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: Color,
+        /// Corner radii in pixels: [top-left, top-right, bottom-right, bottom-left].
+        radius: [f32; 4],
+    },
+    /// Draw a box-shadow behind an element.
+    ///
+    /// Rendered as an offset filled rectangle with a semi-transparent color.
+    /// True Gaussian blur is not implemented; this is a flat shadow.
+    BoxShadow {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: Color,
+        offset_x: f32,
+        offset_y: f32,
+        blur: f32,
     },
 }
 

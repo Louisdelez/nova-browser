@@ -7,11 +7,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use tracing::{debug, error, info};
-use uuid::Uuid;
+use tracing::{debug, info};
 
 use nova_mod_api::{
-    Color, GpuBridge, GpuBufferHandle, GpuTextureHandle, NovaError, RenderCommands, RenderOp,
+    GpuBridge, GpuBufferHandle, GpuTextureHandle, NovaError, RenderCommands, RenderOp,
 };
 
 /// The GPU compositor manages the wgpu device and renders frames.
@@ -109,7 +108,7 @@ impl GpuBridgeImpl {
 impl GpuBridge for GpuBridgeImpl {
     fn alloc_buffer(&self, size: usize) -> Result<GpuBufferHandle, NovaError> {
         let handle = GpuBufferHandle::new();
-        let mut comp = self
+        let comp = self
             .compositor
             .write()
             .map_err(|e| NovaError::GpuError(format!("lock poisoned: {e}")))?;

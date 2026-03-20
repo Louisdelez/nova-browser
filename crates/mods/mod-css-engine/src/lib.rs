@@ -44,6 +44,64 @@ pub mod parser;
 pub mod selector;
 pub mod values;
 
+/// A discovered `@font-face` font URL with its family name.
+#[derive(Debug, Clone)]
+pub struct FontFaceUrl {
+    /// The `font-family` name declared in the `@font-face` rule.
+    pub family: String,
+    /// The resolved URL extracted from the `src` descriptor.
+    pub url: String,
+}
+
+/// Extract `@font-face` URLs from CSS text.
+///
+/// Parses the stylesheet for `@font-face` rules and returns the font-family
+/// name paired with the first `url(...)` found in each rule's `src` descriptor.
+/// `viewport_width` is used to evaluate `@media` queries that may wrap font-face
+/// rules (typically 1280.0 is a reasonable default).
+pub fn extract_font_face_urls(css: &str, viewport_width: f32) -> Vec<FontFaceUrl> {
+    let sheet = parser::parse_stylesheet_full(css, viewport_width);
+    sheet
+        .font_faces
+        .iter()
+        .filter_map(|ff| {
+            let url = parse_url_from_src(&ff.src)?;
+            Some(FontFaceUrl {
+                family: ff.family.clone(),
+                url,
+            })
+        })
+        .collect()
+}
+
+/// Parse a URL from a CSS `src` descriptor value.
+///
+/// Handles `url("path")`, `url('path')`, and `url(path)` forms.
+/// Returns the first `url(...)` found, or `None` if no URL is present.
+fn parse_url_from_src(src: &str) -> Option<String> {
+    let lower = src.to_ascii_lowercase();
+    let idx = lower.find("url(")?;
+    let after = &src[idx + 4..];
+    let trimmed = after.trim_start();
+    let (url_str, _) = if trimmed.starts_with('"') {
+        let inner = &trimmed[1..];
+        let end = inner.find('"')?;
+        (&inner[..end], &inner[end + 1..])
+    } else if trimmed.starts_with('\'') {
+        let inner = &trimmed[1..];
+        let end = inner.find('\'')?;
+        (&inner[..end], &inner[end + 1..])
+    } else {
+        let end = trimmed.find(')')?;
+        (trimmed[..end].trim(), &trimmed[end..])
+    };
+    if url_str.is_empty() {
+        None
+    } else {
+        Some(url_str.to_string())
+    }
+}
+
 /// The CSS engine mod.
 pub struct CssEngineMod {
     manifest: ModManifest,
@@ -109,12 +167,15 @@ impl NovaMod for CssEngineMod {
 
                 // Parse the stylesheet into rules and convert to a StyleMap
                 // containing all declarations (for use by ComputeStyles later).
-                let rules = parser::parse_stylesheet(&source);
+                // ParseCss just extracts rules; media queries are evaluated
+                // later during ComputeStyles. Use a wide default viewport so
+                // that all rules are kept at this stage.
+                let rules = parser::parse_stylesheet(&source, 1280.0);
                 let mut all_props = Vec::new();
                 for rule in &rules {
-                    for (prop, val) in &rule.declarations {
-                        let style_val = values::parse_value(prop, val);
-                        all_props.push((prop.clone(), style_val));
+                    for decl in &rule.declarations {
+                        let style_val = values::parse_value(&decl.property, &decl.value);
+                        all_props.push((decl.property.clone(), style_val));
                     }
                 }
 
@@ -128,9 +189,10 @@ impl NovaMod for CssEngineMod {
                     properties: all_props,
                 }))
             }
-            ContentRequest::ComputeStyles { dom, stylesheets } => {
+            ContentRequest::ComputeStyles { dom, stylesheets, viewport_width } => {
                 info!(
                     stylesheet_count = stylesheets.len(),
+                    viewport_width = viewport_width,
                     "CSS ENGINE: computing styles for DOM"
                 );
 
@@ -160,7 +222,7 @@ impl NovaMod for CssEngineMod {
                 // Run the cascade: extract <style> elements, parse CSS, match
                 // selectors, apply specificity ordering, and write computed
                 // styles as data-nova-style attributes.
-                let styled_dom = cascade::compute_styles(dom_node, &extra_css);
+                let styled_dom = cascade::compute_styles(dom_node, &extra_css, viewport_width);
 
                 Ok(TypedData::Dom(styled_dom))
             }
@@ -265,7 +327,7 @@ mod tests {
             }],
         };
 
-        let result = cascade::compute_styles(dom, &[]);
+        let result = cascade::compute_styles(dom, &[], 1280.0);
 
         // Verify the result is a valid DOM.
         match &result {
@@ -345,9 +407,9 @@ mod tests {
             }
         "#;
 
-        let rules = parser::parse_stylesheet(css);
+        let rules = parser::parse_stylesheet(css, 1280.0);
         // Should parse body and div rules. a:link/a:visited may partially parse.
-        // @media is skipped.
+        // @media (max-width: 700px) is skipped at 1280px viewport.
         assert!(rules.len() >= 2, "expected at least 2 rules, got {}", rules.len());
 
         // Check body rule.
@@ -359,7 +421,7 @@ mod tests {
         assert!(body_rule.is_some(), "should find body rule");
         let body_decls = &body_rule.unwrap().declarations;
         assert!(
-            body_decls.iter().any(|(p, _)| p == "background-color"),
+            body_decls.iter().any(|d| d.property == "background-color"),
             "body should have background-color"
         );
     }

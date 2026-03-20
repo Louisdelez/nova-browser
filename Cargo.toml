@@ -66,6 +66,7 @@ nova-registry = { path = "crates/nova-registry" }
 nova-security = { path = "crates/nova-security" }
 nova-pipeline = { path = "crates/nova-pipeline" }
 nova-shell = { path = "crates/nova-shell" }
+mod-css-engine = { path = "crates/mods/mod-css-engine" }
 
 [profile.release]
 lto = true

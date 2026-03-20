@@ -100,8 +100,12 @@ pub struct BrowserWindow {
     // -- Scrolling state --
     /// Current vertical scroll offset in pixels (0 = top of page).
     scroll_y: f32,
+    /// Current horizontal scroll offset in pixels (0 = left of page).
+    scroll_x: f32,
     /// Total height of the rendered content in pixels.
     content_height: f32,
+    /// Total width of the rendered content in pixels.
+    content_width: f32,
 
     // -- Link interaction state --
     /// Clickable link regions extracted from `RenderOp::Link` ops.
@@ -133,6 +137,7 @@ impl BrowserWindow {
     ) -> Self {
         let hit_regions = Self::extract_hit_regions(&commands);
         let content_height = Self::compute_content_height(&commands);
+        let content_width = Self::compute_content_width(&commands);
         let fb = Framebuffer::new(width, height);
         let tokio_handle = tokio::runtime::Handle::current();
         let viewport = Viewport {
@@ -157,7 +162,9 @@ impl BrowserWindow {
             cursor_y: 0.0,
             pending_navigation: None,
             scroll_y: 0.0,
+            scroll_x: 0.0,
             content_height,
+            content_width,
             hit_regions,
             last_clicked_url: None,
             core,
@@ -211,11 +218,35 @@ impl BrowserWindow {
 
     // -- Scrolling helpers --------------------------------------------------
 
+    /// Compute the total content width by scanning all render ops for the
+    /// maximum `(x + width)` value.
+    fn compute_content_width(commands: &RenderCommands) -> f32 {
+        let mut max_x: f32 = 0.0;
+        for op in &commands.ops {
+            let right = match op {
+                RenderOp::FillRect { x, width, .. } => x + width,
+                RenderOp::DrawText { x, text, font_size, .. } => {
+                    x + text.len() as f32 * font_size * 0.6
+                }
+                RenderOp::StrokeRect { x, width, .. } => x + width,
+                RenderOp::DrawImage { x, width, .. } => x + width,
+                _ => 0.0,
+            };
+            if right > max_x {
+                max_x = right;
+            }
+        }
+        max_x
+    }
+
     /// Clamp `scroll_y` to the valid range `[0, max_scroll]`.
     fn clamp_scroll(&mut self) {
         let page_viewport = (self.height as f32 - URL_BAR_HEIGHT).max(0.0);
         let max_scroll = (self.content_height - page_viewport).max(0.0);
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
+        // Clamp horizontal scroll.
+        let max_scroll_x = (self.content_width - self.width as f32).max(0.0);
+        self.scroll_x = self.scroll_x.clamp(0.0, max_scroll_x);
     }
 
     // -- Link interaction helpers -------------------------------------------
@@ -231,7 +262,7 @@ impl BrowserWindow {
             return None;
         }
 
-        let page_x = win_x as f32;
+        let page_x = win_x as f32 + self.scroll_x;
         let page_y = (win_y as f32 - URL_BAR_HEIGHT) + self.scroll_y;
 
         for region in &self.hit_regions {
@@ -402,10 +433,11 @@ impl BrowserWindow {
     fn rebuild_framebuffer(&mut self) {
         self.framebuffer.reset(self.width, self.height);
 
-        // Render page content shifted down by the URL bar and up by scroll offset.
+        // Render page content shifted down by the URL bar and by scroll offset.
         self.framebuffer.render_scrolled(
             &self.render_commands,
             URL_BAR_HEIGHT,
+            self.scroll_x,
             self.scroll_y,
             self.content_height,
         );
@@ -510,7 +542,7 @@ impl BrowserWindow {
         }
 
         self.framebuffer
-            .draw_text(text_x, text_y, &self.url_bar_text, URL_BAR_FONT_SIZE, text_color);
+            .draw_text(text_x, text_y, &self.url_bar_text, URL_BAR_FONT_SIZE, text_color, None, None);
 
         // -- Cursor (vertical line at the cursor position) --
         if self.url_bar_focused && !self.url_bar_select_all {
@@ -769,8 +801,10 @@ impl BrowserWindow {
                 info!("In-place navigation successful! {} render ops", cmds.ops.len());
                 self.hit_regions = Self::extract_hit_regions(&cmds);
                 self.content_height = Self::compute_content_height(&cmds);
+                self.content_width = Self::compute_content_width(&cmds);
                 self.render_commands = cmds;
                 self.scroll_y = 0.0;
+                self.scroll_x = 0.0;
                 self.url_bar_focused = false;
                 self.url_bar_select_all = false;
                 self.url_bar_text = url.to_string();
@@ -862,13 +896,21 @@ impl ApplicationHandler for BrowserWindow {
             }
             // ── Mouse wheel scrolling ──────────────────────────────
             WindowEvent::MouseWheel { delta, .. } => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => -y * SCROLL_STEP,
-                    MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (-x * SCROLL_STEP, -y * SCROLL_STEP),
+                    MouseScrollDelta::PixelDelta(pos) => (-pos.x as f32, -pos.y as f32),
                 };
 
+                let mut changed = false;
                 if dy.abs() > 0.01 {
                     self.scroll_y += dy;
+                    changed = true;
+                }
+                if dx.abs() > 0.01 {
+                    self.scroll_x += dx;
+                    changed = true;
+                }
+                if changed {
                     self.clamp_scroll();
                     self.request_redraw();
                 }
@@ -893,6 +935,14 @@ impl ApplicationHandler for BrowserWindow {
                         }
                         Key::Named(NamedKey::ArrowUp) => {
                             self.scroll_y -= ARROW_SCROLL_STEP;
+                            true
+                        }
+                        Key::Named(NamedKey::ArrowRight) => {
+                            self.scroll_x += ARROW_SCROLL_STEP;
+                            true
+                        }
+                        Key::Named(NamedKey::ArrowLeft) => {
+                            self.scroll_x -= ARROW_SCROLL_STEP;
                             true
                         }
                         Key::Named(NamedKey::PageDown) => {

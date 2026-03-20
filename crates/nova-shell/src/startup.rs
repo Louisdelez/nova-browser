@@ -1,6 +1,5 @@
 //! Startup sequence — initializes the core and loads the essential mod pack.
 
-use std::sync::Arc;
 
 use tracing::info;
 

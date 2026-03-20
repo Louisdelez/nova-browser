@@ -44,8 +44,212 @@ fn is_color_property(property: &str) -> bool {
     )
 }
 
+/// Resolve a `calc(...)` CSS expression.
+///
+/// If all operands are in `px` (or plain numbers), evaluates the expression fully
+/// and returns `StyleValue::Px`. If the expression contains `%` or other
+/// context-dependent units, returns `StyleValue::Str` preserving the original
+/// value so downstream consumers can resolve it at layout time.
+fn resolve_calc(raw: &str) -> Option<StyleValue> {
+    // Strip the outer `calc(` prefix and matching `)` suffix.
+    let inner = raw.strip_prefix("calc(")?.strip_suffix(')')?;
+    let inner = inner.trim();
+
+    // If expression contains %, vh, or vw we cannot fully resolve it here.
+    // Preserve the original calc() string for downstream resolution.
+    if inner.contains('%') || inner.contains("vh") || inner.contains("vw") {
+        return Some(StyleValue::Str(raw.to_string()));
+    }
+
+    // Tokenise the expression into (value_in_px, operator) pairs.
+    // We evaluate left-to-right honouring standard operator precedence by doing
+    // two passes: first * and /, then + and -.
+    match eval_calc_expr(inner) {
+        Some(px) => Some(StyleValue::Px(px)),
+        None => Some(StyleValue::Str(raw.to_string())),
+    }
+}
+
+/// Evaluate a `calc` inner expression that contains only px / plain-number
+/// operands.  Returns the result in px.
+fn eval_calc_expr(expr: &str) -> Option<f32> {
+    let tokens = tokenise_calc(expr)?;
+    eval_tokens(&tokens)
+}
+
+/// A calc token: either a numeric value (already in px) or an operator.
+#[derive(Debug, Clone)]
+enum CalcToken {
+    Value(f32),
+    Op(char),
+}
+
+/// Convert a calc expression string into a flat list of tokens.
+///
+/// Handles nested parentheses by recursively evaluating sub-expressions.
+fn tokenise_calc(expr: &str) -> Option<Vec<CalcToken>> {
+    let expr = expr.trim();
+    let mut tokens: Vec<CalcToken> = Vec::new();
+    let chars: Vec<char> = expr.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Skip whitespace.
+        if chars[i].is_whitespace() {
+            i += 1;
+            continue;
+        }
+
+        // Nested parentheses — recursively evaluate the sub-expression.
+        if chars[i] == '(' {
+            let start = i + 1;
+            let mut depth = 1usize;
+            i += 1;
+            while i < len && depth > 0 {
+                if chars[i] == '(' {
+                    depth += 1;
+                } else if chars[i] == ')' {
+                    depth -= 1;
+                }
+                i += 1;
+            }
+            let sub: String = chars[start..i - 1].iter().collect();
+            let val = eval_calc_expr(&sub)?;
+            tokens.push(CalcToken::Value(val));
+            continue;
+        }
+
+        // Operator characters.  A '-' can be a unary minus on the first token
+        // or after another operator — handled via the number parser below.
+        if matches!(chars[i], '+' | '*' | '/') {
+            tokens.push(CalcToken::Op(chars[i]));
+            i += 1;
+            continue;
+        }
+
+        // A '-' that follows an existing value token is a subtraction operator.
+        // A '-' at the start or after another operator is part of a negative number.
+        if chars[i] == '-' {
+            let after_op = tokens.last().map_or(true, |t| matches!(t, CalcToken::Op(_)));
+            if !after_op {
+                tokens.push(CalcToken::Op('-'));
+                i += 1;
+                continue;
+            }
+            // Fall through: parse it as part of a number literal.
+        }
+
+        // Parse a number literal (possibly with a unit suffix).
+        let start = i;
+        // Consume optional leading '-'.
+        if i < len && chars[i] == '-' {
+            i += 1;
+        }
+        // Consume digits and decimal point.
+        while i < len && (chars[i].is_ascii_digit() || chars[i] == '.') {
+            i += 1;
+        }
+        // Consume unit suffix (letters only, e.g. "px", "em", "rem", "pt").
+        let unit_start = i;
+        while i < len && chars[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+
+        let num_str: String = chars[start..unit_start].iter().collect();
+        let unit: String = chars[unit_start..i].iter().collect();
+
+        let num: f32 = num_str.parse().ok()?;
+        let px = match unit.as_str() {
+            "px" | "" => num,
+            "em" | "rem" => num * 16.0,
+            "pt" => num * 1.333,
+            _ => return None, // Unknown unit — bail out.
+        };
+        tokens.push(CalcToken::Value(px));
+    }
+
+    Some(tokens)
+}
+
+/// Evaluate a flat token list respecting `*`/`/` before `+`/`-`.
+fn eval_tokens(tokens: &[CalcToken]) -> Option<f32> {
+    if tokens.is_empty() {
+        return None;
+    }
+
+    // First pass: resolve * and /.
+    let mut after_mul_div: Vec<CalcToken> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        match &tokens[i] {
+            CalcToken::Op('*') => {
+                let left = match after_mul_div.pop()? {
+                    CalcToken::Value(v) => v,
+                    _ => return None,
+                };
+                i += 1;
+                let right = match tokens.get(i)? {
+                    CalcToken::Value(v) => *v,
+                    _ => return None,
+                };
+                after_mul_div.push(CalcToken::Value(left * right));
+            }
+            CalcToken::Op('/') => {
+                let left = match after_mul_div.pop()? {
+                    CalcToken::Value(v) => v,
+                    _ => return None,
+                };
+                i += 1;
+                let right = match tokens.get(i)? {
+                    CalcToken::Value(v) => *v,
+                    _ => return None,
+                };
+                if right == 0.0 {
+                    return None;
+                }
+                after_mul_div.push(CalcToken::Value(left / right));
+            }
+            other => after_mul_div.push(other.clone()),
+        }
+        i += 1;
+    }
+
+    // Second pass: resolve + and -.
+    let mut result = match after_mul_div.first()? {
+        CalcToken::Value(v) => *v,
+        _ => return None,
+    };
+    let mut i = 1;
+    while i < after_mul_div.len() {
+        let op = match &after_mul_div[i] {
+            CalcToken::Op(c) => *c,
+            _ => return None,
+        };
+        i += 1;
+        let rhs = match after_mul_div.get(i)? {
+            CalcToken::Value(v) => *v,
+            _ => return None,
+        };
+        match op {
+            '+' => result += rhs,
+            '-' => result -= rhs,
+            _ => return None,
+        }
+        i += 1;
+    }
+
+    Some(result)
+}
+
 /// Try to parse a CSS length (`px`, `em`, `rem`, `%`) or plain number.
+///
+/// Also handles `calc()` expressions.
 fn parse_length_or_number(raw: &str) -> Option<StyleValue> {
+    if raw.starts_with("calc(") {
+        return resolve_calc(raw);
+    }
+
     if raw.ends_with("px") {
         raw[..raw.len() - 2].trim().parse::<f32>().ok().map(StyleValue::Px)
     } else if raw.ends_with('%') {
@@ -421,6 +625,53 @@ mod tests {
                 assert_eq!(c.b, 0x99);
             }
             other => panic!("expected Color, got {other:?}"),
+        }
+    }
+
+    // ── calc() tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn calc_subtraction_px() {
+        // calc(100px - 20px) → Px(80.0)
+        match parse_value("width", "calc(100px - 20px)") {
+            StyleValue::Px(v) => assert!((v - 80.0).abs() < 0.01, "expected 80, got {v}"),
+            other => panic!("expected Px(80), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calc_addition_px() {
+        // calc(50px + 50px) → Px(100.0)
+        match parse_value("width", "calc(50px + 50px)") {
+            StyleValue::Px(v) => assert!((v - 100.0).abs() < 0.01, "expected 100, got {v}"),
+            other => panic!("expected Px(100), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calc_multiplication_px() {
+        // calc(100px * 2) → Px(200.0)
+        match parse_value("width", "calc(100px * 2)") {
+            StyleValue::Px(v) => assert!((v - 200.0).abs() < 0.01, "expected 200, got {v}"),
+            other => panic!("expected Px(200), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calc_division_px() {
+        // calc(200px / 2) → Px(100.0)
+        match parse_value("width", "calc(200px / 2)") {
+            StyleValue::Px(v) => assert!((v - 100.0).abs() < 0.01, "expected 100, got {v}"),
+            other => panic!("expected Px(100), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calc_mixed_percent_preserved_as_str() {
+        // calc(100% - 20px) — cannot resolve without context, stored as Str.
+        match parse_value("width", "calc(100% - 20px)") {
+            StyleValue::Str(s) => assert_eq!(s, "calc(100% - 20px)"),
+            other => panic!("expected Str, got {other:?}"),
         }
     }
 }

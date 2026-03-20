@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, oneshot, RwLock};
-use tracing::{debug, error, warn};
+use tokio::sync::{oneshot, RwLock};
+use tracing::debug;
 
 use nova_mod_api::{
     ContentRequest, ModId, NovaError, NovaMod, TypedData,

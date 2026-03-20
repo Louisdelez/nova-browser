@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use semver::Version;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, info, warn};
 
 use nova_mod_api::{
     capability::CapabilityType,

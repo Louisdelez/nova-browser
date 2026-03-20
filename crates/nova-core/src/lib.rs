@@ -15,19 +15,18 @@ pub mod bridge;
 use std::sync::{Arc, RwLock as StdRwLock};
 
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::info;
 
 use nova_gpu::{GpuBridgeImpl, GpuCompositor};
 use nova_ipc::IpcBus;
 use nova_mod_api::{
-    CapabilityType, ContentRequest, CoreApi, GpuBridge, LogLevel, ModId, ModManifest,
-    ModStorage, NovaError, NovaMod, TypedData, Viewport,
+    CapabilityType, CoreApi, ModManifest, NovaError, NovaMod, TypedData, Viewport,
 };
 use nova_pipeline::PipelineEngine;
 use nova_registry::CapabilityRegistry;
 use nova_security::SecurityManager;
 
-use crate::bridge::{CoreApiBridge, MemoryModStorage};
+use crate::bridge::CoreApiBridge;
 
 /// The NOVA core — the micro-kernel.
 pub struct NovaCore {

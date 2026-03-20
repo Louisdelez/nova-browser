@@ -37,6 +37,20 @@ pub enum ContentRequest {
         context_id: Option<u64>,
     },
 
+    /// Execute JavaScript code with a live DOM tree for mutation.
+    ExecScriptWithDom {
+        source: String,
+        dom: Box<DomNode>,
+        context_id: Option<u64>,
+    },
+
+    /// Dispatch a browser event to a JS context.
+    DispatchEvent {
+        element_handle: u64,
+        event_type: String,
+        context_id: u64,
+    },
+
     /// Decode an image.
     DecodeImage {
         data: Bytes,
@@ -53,6 +67,8 @@ pub enum ContentRequest {
     ComputeStyles {
         dom: Box<TypedData>,
         stylesheets: Vec<TypedData>,
+        /// Viewport width in CSS pixels, used for `@media` query evaluation.
+        viewport_width: f32,
     },
 
     /// Perform layout.
@@ -105,6 +121,12 @@ pub enum TypedData {
 
     /// JavaScript execution result.
     JsResult(JsValue),
+
+    /// JavaScript execution result bundled with the (possibly mutated) DOM.
+    JsResultWithDom {
+        value: JsValue,
+        dom: Box<DomNode>,
+    },
 
     /// Nothing (void response).
     None,
@@ -258,6 +280,8 @@ pub struct LayoutBox {
     pub content: LayoutContent,
     pub style: StyleMap,
     pub children: Vec<LayoutBox>,
+    /// The CSS `z-index` value for this box. Defaults to 0 (auto).
+    pub z_index: i32,
 }
 
 /// What a layout box contains.

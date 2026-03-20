@@ -40,6 +40,7 @@ use nova_mod_api::content::{DomNode, JsValue};
 use nova_mod_api::CoreApi;
 
 use crate::fetch_api;
+use crate::shadow_dom::{CustomElementRegistry, ShadowRoot, ShadowRootMode};
 
 // ── Handle allocation ────────────────────────────────────────────────────────
 
@@ -141,6 +142,10 @@ pub struct JsDomTree {
     listeners: HashMap<(ElementHandle, String), Vec<EventCallback>>,
     /// Log of pending callbacks that were triggered (for the interpreter loop).
     pub pending_events: Vec<(ElementHandle, String)>,
+    /// Shadow roots attached to host elements.
+    pub shadow_roots: HashMap<ElementHandle, ShadowRoot>,
+    /// Custom element registry (equivalent to `window.customElements`).
+    pub custom_elements: CustomElementRegistry,
 }
 
 impl JsDomTree {
@@ -152,6 +157,8 @@ impl JsDomTree {
             next_handle: 1,
             listeners: HashMap::new(),
             pending_events: Vec::new(),
+            shadow_roots: HashMap::new(),
+            custom_elements: CustomElementRegistry::new(),
         };
 
         // Reserve handle 0 for the document root.
@@ -1035,6 +1042,48 @@ impl JsDomTree {
             self.find_by_class(&selector[1..], handle)
         } else {
             self.find_by_tag(selector, handle)
+        }
+    }
+
+    // ── Shadow DOM API ─────────────────────────────────────────────────────────
+
+    /// `element.attachShadow({ mode })` — creates a shadow root.
+    pub fn attach_shadow(&mut self, host: ElementHandle, mode: ShadowRootMode) -> Option<ElementHandle> {
+        if self.shadow_roots.contains_key(&host) {
+            warn!(host, "shadow root already attached");
+            return None;
+        }
+        if !self.nodes.contains_key(&host) {
+            warn!(host, "attachShadow: host handle not found");
+            return None;
+        }
+        let shadow = ShadowRoot::new(host, mode);
+        self.shadow_roots.insert(host, shadow);
+        debug!(host, mode = mode.as_str(), "shadow root attached");
+        Some(host)
+    }
+
+    /// `element.shadowRoot` — returns the shadow root if mode is Open.
+    pub fn get_shadow_root(&self, host: ElementHandle) -> Option<&ShadowRoot> {
+        self.shadow_roots.get(&host).and_then(|sr| {
+            if sr.mode == ShadowRootMode::Open { Some(sr) } else { None }
+        })
+    }
+
+    /// Get a mutable reference to the shadow root.
+    pub fn get_shadow_root_mut(&mut self, host: ElementHandle) -> Option<&mut ShadowRoot> {
+        self.shadow_roots.get_mut(&host)
+    }
+
+    /// Append a child to a shadow root's tree.
+    pub fn shadow_append_child(&mut self, host: ElementHandle, child: ElementHandle) -> bool {
+        if let Some(shadow) = self.shadow_roots.get_mut(&host) {
+            shadow.append_child(child);
+            debug!(host, child, "shadow root appendChild");
+            true
+        } else {
+            warn!(host, "no shadow root attached");
+            false
         }
     }
 

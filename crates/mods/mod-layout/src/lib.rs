@@ -24,6 +24,8 @@
 //! | `flex`        | `Display::Flex`, direction from `flex-direction`    |
 //! | `none`        | `Display::None`                                    |
 
+pub mod incremental;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -424,22 +426,6 @@ fn add_node(
                 props.push(("nova-form-type".into(), StyleValue::Str(form_type)));
                 props.push(("nova-form-value".into(), StyleValue::Str(label.clone())));
 
-                // Propagate the field's name attribute for form submission.
-                let field_name = attributes.iter()
-                    .find(|(k, _)| k == "name")
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_default();
-                props.push(("nova-form-name".into(), StyleValue::Str(field_name)));
-
-                // Inherit form context from parent <form> element (via parent_style_props).
-                for (key, val) in parent_style_props {
-                    if matches!(key.as_str(), "nova-form-action" | "nova-form-method" | "nova-form-enctype") {
-                        if !props.iter().any(|(k, _)| k == key) {
-                            props.push((key.clone(), val.clone()));
-                        }
-                    }
-                }
-
                 let ctx = NodeContext {
                     content: LayoutContent::Block,
                     style: StyleMap { properties: props },
@@ -562,26 +548,6 @@ fn add_node(
                 if let Some(href) = attributes.iter().find(|(k, _)| k == "href") {
                     props.push(("href".into(), StyleValue::Str(href.1.clone())));
                 }
-            }
-
-            // Propagate form attributes for <form> elements so child form
-            // fields can inherit the action, method, and enctype.
-            if tag == "form" {
-                let action = attributes.iter()
-                    .find(|(k, _)| k == "action")
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_default();
-                let method = attributes.iter()
-                    .find(|(k, _)| k == "method")
-                    .map(|(_, v)| v.to_lowercase())
-                    .unwrap_or_else(|| "get".into());
-                let enctype = attributes.iter()
-                    .find(|(k, _)| k == "enctype")
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_else(|| "application/x-www-form-urlencoded".into());
-                props.push(("nova-form-action".into(), StyleValue::Str(action)));
-                props.push(("nova-form-method".into(), StyleValue::Str(method)));
-                props.push(("nova-form-enctype".into(), StyleValue::Str(enctype)));
             }
 
             // ── Inline Formatting Context ──────────────────────────

@@ -42,6 +42,7 @@ pub mod animation;
 pub mod cascade;
 pub mod defaults;
 pub mod media;
+pub mod parallel;
 pub mod parser;
 pub mod selector;
 pub mod values;

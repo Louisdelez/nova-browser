@@ -13,3 +13,4 @@ bytes = { workspace = true }
 async-trait = { workspace = true }
 semver = { workspace = true }
 cssparser = { workspace = true }
+rayon = { workspace = true }

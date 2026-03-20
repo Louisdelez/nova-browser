@@ -47,6 +47,7 @@ pub mod dom_bridge;
 pub mod event_system;
 pub mod fetch_api;
 pub mod quickjs_runtime;
+pub mod shadow_dom;
 pub mod storage;
 pub mod timers;
 

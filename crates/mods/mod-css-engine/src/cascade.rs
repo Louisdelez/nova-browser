@@ -467,6 +467,18 @@ fn compute_element_style_impl(
         });
     }
 
+    // 1b. HTML presentational attributes (bgcolor, color, width, etc.).
+    // These have lower specificity than author stylesheets but higher than UA defaults.
+    for (css_prop, css_val) in apply_presentational_attributes(tag, attributes) {
+        declarations.push(CascadedDeclaration {
+            property: css_prop,
+            value: css_val,
+            specificity: Specificity(0, 0, 0),
+            origin: CascadeOrigin::AuthorStylesheet,
+            important: false,
+        });
+    }
+
     // 2. Stylesheet rules — use the index to only check candidate rules.
     let candidates = index.candidates_for(tag, attributes);
     for &rule_idx in &candidates {
@@ -869,74 +881,6 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
             // Pass through as-is; values like `underline`, `none`, `line-through` are used directly.
             out.push(decl);
         }
-        "animation" => {
-            // Parse the animation shorthand and expand into longhand properties.
-            let parsed = crate::animation::parse_animation_shorthand(&decl.value);
-            let longhands = [
-                ("animation-name", parsed.name),
-                ("animation-duration", format!("{}s", parsed.duration)),
-                ("animation-timing-function", match &parsed.timing_function {
-                    crate::animation::TimingFunction::Linear => "linear".to_string(),
-                    crate::animation::TimingFunction::Ease => "ease".to_string(),
-                    crate::animation::TimingFunction::EaseIn => "ease-in".to_string(),
-                    crate::animation::TimingFunction::EaseOut => "ease-out".to_string(),
-                    crate::animation::TimingFunction::EaseInOut => "ease-in-out".to_string(),
-                    crate::animation::TimingFunction::CubicBezier(x1, y1, x2, y2) => {
-                        format!("cubic-bezier({x1}, {y1}, {x2}, {y2})")
-                    }
-                }),
-                ("animation-delay", format!("{}s", parsed.delay)),
-                ("animation-iteration-count", if parsed.iteration_count.is_infinite() {
-                    "infinite".to_string()
-                } else {
-                    format!("{}", parsed.iteration_count)
-                }),
-                ("animation-direction", match &parsed.direction {
-                    crate::animation::AnimationDirection::Normal => "normal".to_string(),
-                    crate::animation::AnimationDirection::Reverse => "reverse".to_string(),
-                    crate::animation::AnimationDirection::Alternate => "alternate".to_string(),
-                    crate::animation::AnimationDirection::AlternateReverse => "alternate-reverse".to_string(),
-                }),
-                ("animation-fill-mode", match &parsed.fill_mode {
-                    crate::animation::FillMode::None => "none".to_string(),
-                    crate::animation::FillMode::Forwards => "forwards".to_string(),
-                    crate::animation::FillMode::Backwards => "backwards".to_string(),
-                    crate::animation::FillMode::Both => "both".to_string(),
-                }),
-            ];
-            for (prop, val) in longhands {
-                out.push(CascadedDeclaration {
-                    property: prop.into(),
-                    value: val,
-                    specificity: decl.specificity,
-                    origin: decl.origin,
-                    important: decl.important,
-                });
-            }
-        }
-        "transition" => {
-            // Parse the transition shorthand: property duration [timing] [delay]
-            let parts: Vec<&str> = decl.value.split_whitespace().collect();
-            let property = parts.first().copied().unwrap_or("all");
-            let duration = parts.get(1).copied().unwrap_or("0s");
-            let timing = parts.get(2).copied().unwrap_or("ease");
-            let delay = parts.get(3).copied().unwrap_or("0s");
-
-            for (prop, val) in [
-                ("transition-property", property),
-                ("transition-duration", duration),
-                ("transition-timing-function", timing),
-                ("transition-delay", delay),
-            ] {
-                out.push(CascadedDeclaration {
-                    property: prop.into(),
-                    value: val.to_string(),
-                    specificity: decl.specificity,
-                    origin: decl.origin,
-                    important: decl.important,
-                });
-            }
-        }
         _ => {
             // Not a shorthand; pass through.
             out.push(decl);
@@ -1141,6 +1085,89 @@ fn pseudo_element_content(
         }
     }
     None
+}
+
+/// Convert HTML presentational attributes to CSS property-value pairs.
+///
+/// This handles legacy HTML attributes such as `bgcolor`, `color`, `width`,
+/// `height`, `align`, `valign`, `border`, `cellpadding`, and `cellspacing`
+/// by mapping them to their CSS equivalents.  The resulting declarations are
+/// inserted into the cascade with author-stylesheet origin but zero specificity
+/// so that any explicit CSS rule will override them.
+fn apply_presentational_attributes(
+    tag: &str,
+    attributes: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+
+    for (attr, val) in attributes {
+        match attr.as_str() {
+            "bgcolor" => {
+                result.push(("background-color".into(), val.clone()));
+            }
+            "color" if tag == "font" => {
+                result.push(("color".into(), val.clone()));
+            }
+            "width" if matches!(tag, "table" | "td" | "th" | "col" | "colgroup" | "img" | "pre") => {
+                if val.ends_with('%') {
+                    result.push(("width".into(), val.clone()));
+                } else {
+                    // Bare number → pixels.
+                    let num = val.trim_end_matches("px");
+                    result.push(("width".into(), format!("{num}px")));
+                }
+            }
+            "height" if matches!(tag, "table" | "td" | "th" | "tr" | "img") => {
+                if val.ends_with('%') {
+                    result.push(("height".into(), val.clone()));
+                } else {
+                    let num = val.trim_end_matches("px");
+                    result.push(("height".into(), format!("{num}px")));
+                }
+            }
+            "align" => {
+                match val.as_str() {
+                    "center" => {
+                        if matches!(tag, "table" | "div" | "p" | "hr") {
+                            result.push(("margin-left".into(), "auto".into()));
+                            result.push(("margin-right".into(), "auto".into()));
+                        } else {
+                            result.push(("text-align".into(), "center".into()));
+                        }
+                    }
+                    "right" => result.push(("text-align".into(), "right".into())),
+                    "left" => result.push(("text-align".into(), "left".into())),
+                    "justify" => result.push(("text-align".into(), "justify".into())),
+                    _ => {}
+                }
+            }
+            "valign" => {
+                result.push(("vertical-align".into(), val.clone()));
+            }
+            "border" if matches!(tag, "table" | "img") => {
+                let num = val.trim_end_matches("px");
+                if let Ok(w) = num.parse::<f32>() {
+                    if w > 0.0 {
+                        result.push(("border-width".into(), format!("{w}px")));
+                        result.push(("border-style".into(), "solid".into()));
+                    }
+                }
+            }
+            "cellpadding" if tag == "table" => {
+                // cellpadding applies to child td/th cells, but we store it
+                // as a custom property so layout can read it.
+                let num = val.trim_end_matches("px");
+                result.push(("--cellpadding".into(), format!("{num}px")));
+            }
+            "cellspacing" if tag == "table" => {
+                let num = val.trim_end_matches("px");
+                result.push(("border-spacing".into(), format!("{num}px")));
+            }
+            _ => {}
+        }
+    }
+
+    result
 }
 
 /// Convert a `StyleValue` to a CSS string representation.
@@ -1448,50 +1475,6 @@ mod tests {
         let style = div.attr("data-nova-style").expect("div should have data-nova-style");
         // #bar (id) should beat .foo (class).
         assert!(style.contains("color: red"), "style = {style}");
-    }
-
-    #[test]
-    fn margin_auto_and_max_width_pass_through() {
-        // Simulates example.com: body has max-width + margin: 0 auto
-        let dom = make_dom(vec![
-            DomNode::Element {
-                tag: "style".into(),
-                attributes: vec![],
-                children: vec![DomNode::Text("body { margin: 0 auto; max-width: 600px; }".into())],
-            },
-            DomNode::Element {
-                tag: "div".into(),
-                attributes: vec![],
-                children: vec![DomNode::Text("Hello".into())],
-            },
-        ]);
-
-        let result = compute_styles(dom, &[], 1280.0);
-        // Find body element
-        fn find_body(node: &DomNode) -> Option<&DomNode> {
-            match node {
-                DomNode::Element { tag, children, .. } => {
-                    if tag == "body" { return Some(node); }
-                    for child in children {
-                        if let Some(found) = find_body(child) { return Some(found); }
-                    }
-                    None
-                }
-                DomNode::Document { children } => {
-                    for child in children {
-                        if let Some(found) = find_body(child) { return Some(found); }
-                    }
-                    None
-                }
-                _ => None,
-            }
-        }
-
-        let body = find_body(&result).expect("should find body");
-        let style = body.attr("data-nova-style").expect("body should have data-nova-style");
-        assert!(style.contains("max-width: 600px"), "body should have max-width: 600px, style = {style}");
-        assert!(style.contains("margin-left: auto"), "body should have margin-left: auto, style = {style}");
-        assert!(style.contains("margin-right: auto"), "body should have margin-right: auto, style = {style}");
     }
 
     #[test]

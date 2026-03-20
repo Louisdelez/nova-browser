@@ -1080,12 +1080,22 @@ fn flatten_node_recursive(
                                     existing.1 = StyleValue::Px(px);
                                 }
                             }
-                        } else if let Some(px) = val.strip_suffix("px").and_then(|s| s.parse::<f32>().ok()) {
-                            child_props.push((prop, StyleValue::Px(px)));
-                        } else if val.starts_with("rgb") || val.starts_with('#') {
-                            child_props.push((prop, StyleValue::Str(val.to_string())));
                         } else {
-                            child_props.push((prop, StyleValue::Keyword(val.to_string())));
+                            // Replace existing property in-place so that
+                            // e.g. <a>'s color: #0000ee overrides the
+                            // inherited color: #000000 from the parent.
+                            let new_val = if let Some(px) = val.strip_suffix("px").and_then(|s| s.parse::<f32>().ok()) {
+                                StyleValue::Px(px)
+                            } else if val.starts_with("rgb") || val.starts_with('#') {
+                                StyleValue::Str(val.to_string())
+                            } else {
+                                StyleValue::Keyword(val.to_string())
+                            };
+                            if let Some(existing) = child_props.iter_mut().find(|(k, _)| *k == prop) {
+                                existing.1 = new_val;
+                            } else {
+                                child_props.push((prop, new_val));
+                            }
                         }
                     }
                 }

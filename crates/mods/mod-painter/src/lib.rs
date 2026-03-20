@@ -303,7 +303,10 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
 
     // Paint text content.
     if let LayoutContent::Text(ref text) = layout_box.content {
-        if !text.trim().is_empty() {
+        // Skip single-space text nodes — the layout engine already handles
+        // spacing via node positioning. Drawing the space character on top
+        // of the positional gap would create double spacing.
+        if !text.trim().is_empty() && text != " " {
             let font_size = extract_font_size(&layout_box.style);
             let text_color = multiply_alpha(extract_text_color(&layout_box.style), opacity);
             let font_weight = extract_font_weight(&layout_box.style);

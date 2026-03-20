@@ -84,7 +84,7 @@ fn capability_for_request(req: &ContentRequest) -> nova_mod_api::CapabilityType 
     use nova_mod_api::CapabilityType;
 
     match req {
-        ContentRequest::Fetch { url, .. } => {
+        ContentRequest::Fetch { url, .. } | ContentRequest::FetchWithBody { url, .. } => {
             let protocol = url
                 .split("://")
                 .next()

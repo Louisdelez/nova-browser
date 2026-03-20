@@ -456,6 +456,7 @@ pub fn register_bridge_functions<'js>(
                 &event_type,
                 "__quickjs_callback__",
                 vec![],
+                false,
             );
         })))?;
     }

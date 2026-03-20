@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 nova-mod-api = { workspace = true }
 nova-core = { workspace = true }
+nova-gpu = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -29,3 +30,5 @@ winit = "0.30"
 wgpu = "24"
 pollster = "0.4.0"
 fontdue = "0.9.3"
+rustybuzz = "0.20"
+url = { workspace = true }

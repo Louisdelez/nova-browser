@@ -4,6 +4,9 @@
 //! Takes RenderCommands from mods and draws them to the screen using wgpu.
 //! This is the only part of NOVA that directly talks to the GPU.
 
+pub mod compositor;
+pub mod vello_backend;
+
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -13,7 +16,13 @@ use nova_mod_api::{
     GpuBridge, GpuBufferHandle, GpuTextureHandle, NovaError, RenderCommands, RenderOp,
 };
 
+use crate::compositor::LayerTree;
+use crate::vello_backend::VelloBackend;
+
 /// The GPU compositor manages the wgpu device and renders frames.
+///
+/// Integrates the layer-based compositor for efficient scrolling and the
+/// Vello backend (stub) for future GPU-native rendering.
 pub struct GpuCompositor {
     /// Tracked textures.
     textures: RwLock<HashMap<GpuTextureHandle, TextureInfo>>,
@@ -21,6 +30,10 @@ pub struct GpuCompositor {
     buffers: RwLock<HashMap<GpuBufferHandle, BufferInfo>>,
     /// Whether the compositor is initialized.
     initialized: bool,
+    /// Layer tree for compositing (built from render commands).
+    layer_tree: Option<LayerTree>,
+    /// Vello rendering backend (stub for future GPU rendering).
+    vello_backend: VelloBackend,
 }
 
 struct TextureInfo {
@@ -39,6 +52,8 @@ impl GpuCompositor {
             textures: RwLock::new(HashMap::new()),
             buffers: RwLock::new(HashMap::new()),
             initialized: false,
+            layer_tree: None,
+            vello_backend: VelloBackend::new(),
         }
     }
 
@@ -47,13 +62,56 @@ impl GpuCompositor {
     pub fn init(&mut self) -> Result<(), NovaError> {
         info!("GPU: initializing compositor");
 
+        // Initialize the Vello backend (stub).
+        self.vello_backend.init(1.0);
+
         // In the future, this will create the wgpu::Instance, Adapter, Device, Queue.
         // For now, we mark as initialized and will use a software fallback
         // until we integrate with the UI shell's window handle.
         self.initialized = true;
 
-        info!("GPU: compositor ready");
+        info!("GPU: compositor ready (layer compositor + vello stub active)");
         Ok(())
+    }
+
+    /// Build a layer tree from render commands for efficient compositing.
+    ///
+    /// Call this after navigation or when render commands change. The layer
+    /// tree enables smooth scrolling by caching layer content and only
+    /// updating transforms.
+    pub fn build_layer_tree(
+        &mut self,
+        commands: &RenderCommands,
+        viewport_width: f32,
+        viewport_height: f32,
+        url_bar_height: f32,
+    ) {
+        let tree = LayerTree::from_render_commands(
+            commands,
+            viewport_width,
+            viewport_height,
+            url_bar_height,
+        );
+        info!(
+            layers = tree.layer_count(),
+            "Layer tree built for compositing"
+        );
+        self.layer_tree = Some(tree);
+    }
+
+    /// Get a reference to the current layer tree (if built).
+    pub fn layer_tree(&self) -> Option<&LayerTree> {
+        self.layer_tree.as_ref()
+    }
+
+    /// Get a mutable reference to the current layer tree.
+    pub fn layer_tree_mut(&mut self) -> Option<&mut LayerTree> {
+        self.layer_tree.as_mut()
+    }
+
+    /// Get a reference to the Vello backend.
+    pub fn vello_backend(&self) -> &VelloBackend {
+        &self.vello_backend
     }
 
     /// Render a frame from collected render commands.
@@ -64,6 +122,15 @@ impl GpuCompositor {
         }
 
         debug!("GPU: rendering frame with {} ops", commands.ops.len());
+
+        // If we have a layer tree, use it for compositing info.
+        if let Some(ref tree) = self.layer_tree {
+            debug!(
+                layers = tree.layer_count(),
+                needs_repaint = tree.needs_repaint(),
+                "GPU: compositing with layer tree"
+            );
+        }
 
         // For now, log what we would render.
         // Full wgpu integration comes when we connect to the UI shell window.

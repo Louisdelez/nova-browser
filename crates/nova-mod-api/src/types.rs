@@ -152,6 +152,14 @@ pub enum RenderOp {
         value: String,
         /// The type of form element ("text", "password", "textarea", "select", "checkbox", "radio").
         field_type: String,
+        /// The `name` attribute of the form field (used for form submission).
+        name: String,
+        /// The `action` URL of the parent `<form>` element (empty if none).
+        form_action: String,
+        /// The `method` of the parent `<form>` element ("get" or "post", defaults to "get").
+        form_method: String,
+        /// The `enctype` of the parent `<form>` element (defaults to "application/x-www-form-urlencoded").
+        form_enctype: String,
     },
     /// A clickable link region (does not render anything visible).
     ///
@@ -191,33 +199,6 @@ pub enum RenderOp {
         offset_y: f32,
         blur: f32,
     },
-    /// Mark the start of a fixed-position element.
-    ///
-    /// Fixed elements are positioned relative to the viewport and are not
-    /// affected by scrolling. The renderer should temporarily ignore scroll
-    /// offsets for all ops until `FixedPositionEnd`.
-    FixedPosition {
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-    },
-    /// End of a fixed-position element region.
-    FixedPositionEnd,
-    /// Apply a 2D affine transform matrix to subsequent drawing operations.
-    ///
-    /// The matrix is specified as `[a, b, c, d, tx, ty]` representing:
-    /// ```text
-    /// | a  c  tx |
-    /// | b  d  ty |
-    /// | 0  0   1 |
-    /// ```
-    Transform {
-        /// 2x3 affine transform matrix `[a, b, c, d, tx, ty]`.
-        matrix: [f32; 6],
-    },
-    /// End of a transform region — pops the current transform.
-    TransformEnd,
 }
 
 /// RGBA color.

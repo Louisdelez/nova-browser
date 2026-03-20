@@ -86,7 +86,7 @@ impl SecurityManager {
     /// Determine which permissions are needed for a given request type.
     fn permissions_for_request(request: &ContentRequest) -> Vec<Permission> {
         match request {
-            ContentRequest::Fetch { .. } => vec![Permission::NetworkFetch],
+            ContentRequest::Fetch { .. } | ContentRequest::FetchWithBody { .. } => vec![Permission::NetworkFetch],
             ContentRequest::Paint { .. } => vec![Permission::GpuRender],
             ContentRequest::DecodeImage { .. } => vec![Permission::GpuDecode],
             ContentRequest::DecodeVideo { .. } => vec![Permission::GpuDecode],

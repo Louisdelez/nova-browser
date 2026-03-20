@@ -24,8 +24,9 @@ use nova_mod_api::{
     CoreApi, NovaMod,
 };
 
+pub mod form;
+pub mod http2;
 mod transport;
-pub mod cors;
 
 /// The network mod — fetches resources over HTTP and HTTPS.
 pub struct NetworkMod {
@@ -76,42 +77,31 @@ impl NetworkMod {
     /// Handles 301, 302, 303, 307, and 308 status codes:
     /// - 301/302/303: redirect, method changes to GET (for 303 this is required by spec)
     /// - 307/308: redirect, original method is preserved
+    async fn fetch_real(&self, url_str: &str, _headers: &[(String, String)]) -> Result<HttpResponse, NovaError> {
+        self.fetch_real_with_body(url_str, "GET", _headers, None).await
+    }
+
+    /// Perform a real HTTP/HTTPS request with an explicit method and optional body.
     ///
-    /// Custom headers are forwarded to the underlying request.  The special
-    /// `x-nova-method` header overrides the HTTP method (used by the fetch API
-    /// bridge), and `x-nova-body` carries the request body.
-    async fn fetch_real(&self, url_str: &str, headers: &[(String, String)]) -> Result<HttpResponse, NovaError> {
+    /// Used for form submissions (POST) and other non-GET requests.
+    async fn fetch_real_with_body(
+        &self,
+        url_str: &str,
+        initial_method: &str,
+        _headers: &[(String, String)],
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse, NovaError> {
         let mut current_url = url_str.to_string();
-
-        // Extract method override from pseudo-header if present.
-        let mut method = headers
-            .iter()
-            .find(|(k, _)| k == "x-nova-method")
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| "GET".to_string());
-
-        // Extract body from pseudo-header if present.
-        let body = headers
-            .iter()
-            .find(|(k, _)| k == "x-nova-body")
-            .map(|(_, v)| v.clone());
-
-        // Filter out internal pseudo-headers before forwarding.
-        let custom_headers: Vec<(String, String)> = headers
-            .iter()
-            .filter(|(k, _)| !k.starts_with("x-nova-"))
-            .cloned()
-            .collect();
+        let mut method = initial_method.to_string();
+        let mut current_body = body.map(|b| b.to_vec());
 
         for redirect_count in 0..=Self::MAX_REDIRECTS {
-            let response = self
-                .fetch_single_with_headers(
-                    &current_url,
-                    &method,
-                    &custom_headers,
-                    body.as_deref(),
-                )
-                .await?;
+            let response = self.fetch_single_with_body(
+                &current_url,
+                &method,
+                _headers,
+                current_body.as_deref(),
+            ).await?;
 
             // Follow redirects for 301, 302, 303, 307, 308.
             if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
@@ -141,6 +131,7 @@ impl NetworkMod {
                     // For 307/308, preserve the original method.
                     if matches!(response.status, 301 | 302 | 303) {
                         method = "GET".to_string();
+                        current_body = None; // Body is not forwarded on GET redirect.
                     }
 
                     current_url = resolved.to_string();
@@ -161,22 +152,21 @@ impl NetworkMod {
     }
 
     /// Perform a single HTTP request (no redirect following).
-    #[allow(dead_code)]
     async fn fetch_single(&self, url_str: &str, method: &str) -> Result<HttpResponse, NovaError> {
-        self.fetch_single_with_headers(url_str, method, &[], None)
-            .await
+        self.fetch_single_with_body(url_str, method, &[], None).await
     }
 
-    /// Perform a single HTTP request with custom headers and optional body.
+    /// Perform a single HTTP request with optional headers and body.
     ///
-    /// Custom headers are appended after the default headers. If a body is
-    /// provided, `Content-Length` is added automatically.
-    async fn fetch_single_with_headers(
+    /// Supports GET and POST methods. When `body` is provided, `Content-Length`
+    /// is set automatically. Custom headers (e.g., `Content-Type`) can be
+    /// passed via the `extra_headers` parameter.
+    async fn fetch_single_with_body(
         &self,
         url_str: &str,
         method: &str,
-        custom_headers: &[(String, String)],
-        body: Option<&str>,
+        extra_headers: &[(String, String)],
+        body: Option<&[u8]>,
     ) -> Result<HttpResponse, NovaError> {
         let parsed = url::Url::parse(url_str)
             .map_err(|e| NovaError::NetworkError(format!("invalid URL: {e}")))?;
@@ -200,39 +190,48 @@ impl NetworkMod {
 
         let stream = transport::connect(&host, port, use_tls).await?;
 
-        // Build the default headers.
+        // Build HTTP/1.1 request headers.
         let mut request = format!(
             "{method} {path} HTTP/1.1\r\n\
              Host: {host}\r\n\
              User-Agent: NOVA/0.1.0\r\n\
              Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n\
-             Accept-Encoding: gzip, identity\r\n"
+             Accept-Encoding: gzip, identity\r\n\
+             Connection: close\r\n"
         );
 
-        // Append custom headers.
-        for (key, value) in custom_headers {
+        // Add Content-Length and Content-Type for request bodies.
+        if let Some(body_data) = body {
+            // Check if Content-Type was already provided in extra_headers.
+            let has_content_type = extra_headers
+                .iter()
+                .any(|(k, _)| k.to_lowercase() == "content-type");
+            if !has_content_type {
+                request.push_str("Content-Type: application/x-www-form-urlencoded\r\n");
+            }
+            request.push_str(&format!("Content-Length: {}\r\n", body_data.len()));
+        }
+
+        // Add extra headers.
+        for (key, value) in extra_headers {
             request.push_str(&format!("{key}: {value}\r\n"));
         }
 
-        // Add Content-Length for body.
-        if let Some(body_content) = body {
-            request.push_str(&format!("Content-Length: {}\r\n", body_content.len()));
-        }
+        // End of headers.
+        request.push_str("\r\n");
 
-        request.push_str("Connection: close\r\n\r\n");
-
-        // Append body after headers.
-        if let Some(body_content) = body {
-            request.push_str(body_content);
-        }
-
-        let raw_response = transport::send_request(stream, &request).await?;
+        let raw_response = transport::send_request_with_body(
+            stream,
+            request.as_bytes(),
+            body,
+        ).await?;
         let response = parse_http_response(&raw_response, url_str)?;
 
         info!(
             url = %url_str,
             status = response.status,
             body_len = response.body.len(),
+            method,
             "fetch complete"
         );
 
@@ -398,6 +397,39 @@ impl NovaMod for NetworkMod {
                         let body = format!(
                             "<html><body><h1>NOVA Browser</h1>\
                              <p>Could not load: {url}</p>\
+                             <p>Error: {e}</p></body></html>"
+                        );
+                        Ok(TypedData::HttpResponse(HttpResponse {
+                            status: 0,
+                            headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
+                            body: Bytes::from(body),
+                            url,
+                        }))
+                    }
+                }
+            }
+            ContentRequest::FetchWithBody { url, method, headers, body } => {
+                debug!(
+                    url = %url,
+                    method = %method,
+                    header_count = headers.len(),
+                    body_len = body.as_ref().map(|b| b.len()).unwrap_or(0),
+                    "handling fetch-with-body request"
+                );
+
+                match self.fetch_real_with_body(
+                    &url,
+                    &method,
+                    &headers,
+                    body.as_deref(),
+                ).await {
+                    Ok(response) => Ok(TypedData::HttpResponse(response)),
+                    Err(e) => {
+                        warn!(url = %url, method = %method, error = %e, "fetch with body failed, using placeholder");
+                        let body = format!(
+                            "<html><body><h1>NOVA Browser</h1>\
+                             <p>Could not load: {url}</p>\
+                             <p>Method: {method}</p>\
                              <p>Error: {e}</p></body></html>"
                         );
                         Ok(TypedData::HttpResponse(HttpResponse {

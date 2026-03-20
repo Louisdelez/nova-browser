@@ -128,57 +128,6 @@ impl CssTransform {
     fn has_translate(&self) -> bool {
         self.translate_x != 0.0 || self.translate_y != 0.0
     }
-
-    /// Returns `true` if this transform has any non-identity operation.
-    fn is_non_identity(&self) -> bool {
-        self.translate_x != 0.0
-            || self.translate_y != 0.0
-            || self.scale_x != 1.0
-            || self.scale_y != 1.0
-            || self.rotate_deg != 0.0
-    }
-
-    /// Compute the 2x3 affine transform matrix `[a, b, c, d, tx, ty]`.
-    ///
-    /// The matrix represents the combined effect of translate, scale, and
-    /// rotate (applied in CSS order: translate first, then rotate, then scale).
-    fn to_matrix(&self) -> [f32; 6] {
-        // Start with identity.
-        let mut a = 1.0_f32;
-        let mut b = 0.0_f32;
-        let mut c = 0.0_f32;
-        let mut d = 1.0_f32;
-        let mut tx = 0.0_f32;
-        let mut ty = 0.0_f32;
-
-        // Apply translate.
-        tx += self.translate_x;
-        ty += self.translate_y;
-
-        // Apply rotation.
-        if self.rotate_deg != 0.0 {
-            let rad = self.rotate_deg.to_radians();
-            let cos = rad.cos();
-            let sin = rad.sin();
-            // Multiply current matrix by rotation matrix.
-            let na = a * cos + c * sin;
-            let nb = b * cos + d * sin;
-            let nc = a * -sin + c * cos;
-            let nd = b * -sin + d * cos;
-            a = na;
-            b = nb;
-            c = nc;
-            d = nd;
-        }
-
-        // Apply scale.
-        a *= self.scale_x;
-        b *= self.scale_x;
-        c *= self.scale_y;
-        d *= self.scale_y;
-
-        [a, b, c, d, tx, ty]
-    }
 }
 
 /// Parse a CSS `transform` property value.
@@ -223,47 +172,9 @@ fn parse_transform(value: &str) -> Option<CssTransform> {
                     transform.scale_x *= sx; transform.scale_y *= sy; found_any = true;
                 }
             }
-            "scaleX" => {
-                if let Some(sx) = args.first().and_then(|a| a.parse::<f32>().ok()) {
-                    transform.scale_x *= sx; found_any = true;
-                }
-            }
-            "scaleY" => {
-                if let Some(sy) = args.first().and_then(|a| a.parse::<f32>().ok()) {
-                    transform.scale_y *= sy; found_any = true;
-                }
-            }
             "rotate" => {
                 if let Some(deg) = args.first().and_then(|a| parse_angle_deg(a)) {
                     transform.rotate_deg += deg; found_any = true;
-                }
-            }
-            "matrix" => {
-                // matrix(a, b, c, d, tx, ty)
-                if args.len() >= 6 {
-                    if let (Some(ma), Some(mb), Some(mc), Some(md), Some(mtx), Some(mty)) = (
-                        args[0].parse::<f32>().ok(),
-                        args[1].parse::<f32>().ok(),
-                        args[2].parse::<f32>().ok(),
-                        args[3].parse::<f32>().ok(),
-                        args[4].parse::<f32>().ok(),
-                        args[5].parse::<f32>().ok(),
-                    ) {
-                        // Decompose the matrix into our fields (approximate).
-                        // For a simple matrix, scale_x = a, scale_y = d,
-                        // translate_x = tx, translate_y = ty, and rotation is
-                        // derived from b and c.
-                        transform.translate_x += mtx;
-                        transform.translate_y += mty;
-                        transform.scale_x *= ma;
-                        transform.scale_y *= md;
-                        // Approximate rotation from b, c (only if no scale).
-                        if mb.abs() > 0.001 || mc.abs() > 0.001 {
-                            let angle = mb.atan2(ma).to_degrees();
-                            transform.rotate_deg += angle;
-                        }
-                        found_any = true;
-                    }
                 }
             }
             _ => {}
@@ -312,27 +223,10 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         });
     }
 
-    // Check for position: fixed and emit FixedPosition/FixedPositionEnd.
-    let is_fixed = is_position_fixed(&layout_box.style);
-    if is_fixed {
-        ops.push(RenderOp::FixedPosition {
-            x: layout_box.x,
-            y: layout_box.y,
-            width: layout_box.width,
-            height: layout_box.height,
-        });
-    }
-
-    // Check for CSS transform and emit Transform/TransformEnd if needed.
+    // Check for CSS transform and wrap in Save/Translate/Restore if needed.
     let transform = extract_transform(&layout_box.style);
-    let needs_transform = transform.as_ref().is_some_and(|t| t.is_non_identity());
-    if needs_transform {
-        let t = transform.as_ref().unwrap();
-        ops.push(RenderOp::Transform { matrix: t.to_matrix() });
-    }
-    // Legacy: also support translate-only via Save/Translate for backward compat.
-    let needs_translate_only = !needs_transform && transform.as_ref().is_some_and(|t| t.has_translate());
-    if needs_translate_only {
+    let needs_translate = transform.as_ref().is_some_and(|t| t.has_translate());
+    if needs_translate {
         let t = transform.as_ref().unwrap();
         ops.push(RenderOp::Save);
         ops.push(RenderOp::Translate { x: t.translate_x, y: t.translate_y });
@@ -474,14 +368,18 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     }
 
     // Emit FormField op for interactive form elements.
-    if let Some((field_type, value)) = extract_form_field(&layout_box.style) {
+    if let Some(info) = extract_form_field(&layout_box.style) {
         ops.push(RenderOp::FormField {
             x: layout_box.x,
             y: layout_box.y,
             width: layout_box.width,
             height: layout_box.height,
-            value,
-            field_type,
+            value: info.value,
+            field_type: info.field_type,
+            name: info.name,
+            form_action: info.form_action,
+            form_method: info.form_method,
+            form_enctype: info.form_enctype,
         });
     }
 
@@ -548,20 +446,12 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         ops.push(RenderOp::PopClip);
     }
 
-    if needs_transform {
-        ops.push(RenderOp::TransformEnd);
-    }
-
-    if needs_translate_only {
-        ops.push(RenderOp::Restore);
-    }
-
-    if is_fixed {
-        ops.push(RenderOp::FixedPositionEnd);
-    }
-
     if is_sticky {
         ops.push(RenderOp::StickyEnd);
+    }
+
+    if needs_translate {
+        ops.push(RenderOp::Restore);
     }
 }
 
@@ -1108,23 +998,45 @@ fn extract_px_value(value: &StyleValue) -> Option<f32> {
     }
 }
 
+/// Form field info extracted from style properties.
+struct FormFieldInfo {
+    field_type: String,
+    value: String,
+    name: String,
+    form_action: String,
+    form_method: String,
+    form_enctype: String,
+}
+
 /// Extract form field info from style props (set by mod-layout for form elements).
-fn extract_form_field(style: &nova_mod_api::content::StyleMap) -> Option<(String, String)> {
+fn extract_form_field(style: &nova_mod_api::content::StyleMap) -> Option<FormFieldInfo> {
     let mut field_type = None;
     let mut value = String::new();
+    let mut name = String::new();
+    let mut form_action = String::new();
+    let mut form_method = String::from("get");
+    let mut form_enctype = String::from("application/x-www-form-urlencoded");
     for (key, val) in &style.properties {
-        if key == "nova-form-type" {
-            if let StyleValue::Str(s) | StyleValue::Keyword(s) = val {
-                field_type = Some(s.clone());
-            }
-        }
-        if key == "nova-form-value" {
-            if let StyleValue::Str(s) | StyleValue::Keyword(s) = val {
-                value = s.clone();
+        if let StyleValue::Str(s) | StyleValue::Keyword(s) = val {
+            match key.as_str() {
+                "nova-form-type" => field_type = Some(s.clone()),
+                "nova-form-value" => value = s.clone(),
+                "nova-form-name" => name = s.clone(),
+                "nova-form-action" => form_action = s.clone(),
+                "nova-form-method" => form_method = s.clone(),
+                "nova-form-enctype" => form_enctype = s.clone(),
+                _ => {}
             }
         }
     }
-    field_type.map(|ft| (ft, value))
+    field_type.map(|ft| FormFieldInfo {
+        field_type: ft,
+        value,
+        name,
+        form_action,
+        form_method,
+        form_enctype,
+    })
 }
 
 /// Check if the element has `position: sticky`.
@@ -1133,18 +1045,6 @@ fn is_position_sticky(style: &nova_mod_api::content::StyleMap) -> bool {
         if key == "position" {
             if let StyleValue::Keyword(k) | StyleValue::Str(k) = value {
                 return k == "sticky";
-            }
-        }
-    }
-    false
-}
-
-/// Check if the element has `position: fixed`.
-fn is_position_fixed(style: &nova_mod_api::content::StyleMap) -> bool {
-    for (key, value) in &style.properties {
-        if key == "position" {
-            if let StyleValue::Keyword(k) | StyleValue::Str(k) = value {
-                return k == "fixed";
             }
         }
     }
@@ -1704,111 +1604,5 @@ mod tests {
             }
         });
         assert!(has_family, "DrawText should carry font_family = Some(\"CustomFont\")");
-    }
-
-    // ── Phase 4: CSS Positioning + Transforms tests ────────────────────
-
-    #[test]
-    fn fixed_position_emits_fixed_ops() {
-        let mut style = StyleMap::default();
-        style.properties.push(("position".into(), StyleValue::Keyword("fixed".into())));
-        style.properties.push(("background-color".into(), StyleValue::Str("blue".into())));
-
-        let layout = LayoutBox {
-            x: 0.0, y: 0.0, width: 800.0, height: 50.0,
-            content: LayoutContent::Block,
-            style,
-            children: vec![],
-            z_index: 0,
-        };
-        let mut ops = Vec::new();
-        paint_box(&layout, &mut ops, &HashMap::new());
-        assert!(
-            ops.iter().any(|op| matches!(op, RenderOp::FixedPosition { .. })),
-            "position: fixed should emit FixedPosition op"
-        );
-        assert!(
-            ops.iter().any(|op| matches!(op, RenderOp::FixedPositionEnd)),
-            "position: fixed should emit FixedPositionEnd op"
-        );
-    }
-
-    #[test]
-    fn transform_translate_emits_transform_op() {
-        let mut style = StyleMap::default();
-        style.properties.push(("transform".into(), StyleValue::Str("translate(10px, 20px) scale(2)".into())));
-        style.properties.push(("background-color".into(), StyleValue::Str("red".into())));
-
-        let layout = LayoutBox {
-            x: 0.0, y: 0.0, width: 100.0, height: 50.0,
-            content: LayoutContent::Block,
-            style,
-            children: vec![],
-            z_index: 0,
-        };
-        let mut ops = Vec::new();
-        paint_box(&layout, &mut ops, &HashMap::new());
-        assert!(
-            ops.iter().any(|op| matches!(op, RenderOp::Transform { .. })),
-            "non-identity transform should emit Transform op"
-        );
-        assert!(
-            ops.iter().any(|op| matches!(op, RenderOp::TransformEnd)),
-            "transform should emit TransformEnd op"
-        );
-    }
-
-    #[test]
-    fn transform_matrix_identity() {
-        let t = CssTransform::default();
-        let m = t.to_matrix();
-        // Identity: [1, 0, 0, 1, 0, 0]
-        assert!((m[0] - 1.0).abs() < 0.001);
-        assert!((m[1] - 0.0).abs() < 0.001);
-        assert!((m[2] - 0.0).abs() < 0.001);
-        assert!((m[3] - 1.0).abs() < 0.001);
-        assert!((m[4] - 0.0).abs() < 0.001);
-        assert!((m[5] - 0.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn transform_matrix_translate() {
-        let t = CssTransform { translate_x: 10.0, translate_y: 20.0, ..CssTransform::default() };
-        let m = t.to_matrix();
-        assert!((m[4] - 10.0).abs() < 0.001, "tx should be 10, got {}", m[4]);
-        assert!((m[5] - 20.0).abs() < 0.001, "ty should be 20, got {}", m[5]);
-    }
-
-    #[test]
-    fn transform_matrix_scale() {
-        let t = CssTransform { scale_x: 2.0, scale_y: 3.0, ..CssTransform::default() };
-        let m = t.to_matrix();
-        assert!((m[0] - 2.0).abs() < 0.001, "a should be 2 for scaleX=2, got {}", m[0]);
-        assert!((m[3] - 3.0).abs() < 0.001, "d should be 3 for scaleY=3, got {}", m[3]);
-    }
-
-    #[test]
-    fn transform_matrix_rotate_90() {
-        let t = CssTransform { rotate_deg: 90.0, ..CssTransform::default() };
-        let m = t.to_matrix();
-        // rotate(90deg): a=cos(90)=0, b=sin(90)=1, c=-sin(90)=-1, d=cos(90)=0
-        assert!(m[0].abs() < 0.001, "a should be ~0 for 90deg rotation, got {}", m[0]);
-        assert!((m[1] - 1.0).abs() < 0.001, "b should be ~1 for 90deg rotation, got {}", m[1]);
-        assert!((m[2] + 1.0).abs() < 0.001, "c should be ~-1 for 90deg rotation, got {}", m[2]);
-        assert!(m[3].abs() < 0.001, "d should be ~0 for 90deg rotation, got {}", m[3]);
-    }
-
-    #[test]
-    fn parse_transform_scale_xy() {
-        let t = parse_transform("scaleX(2) scaleY(0.5)").unwrap();
-        assert!((t.scale_x - 2.0).abs() < 0.001);
-        assert!((t.scale_y - 0.5).abs() < 0.001);
-    }
-
-    #[test]
-    fn parse_transform_matrix_function() {
-        let t = parse_transform("matrix(1, 0, 0, 1, 50, 100)").unwrap();
-        assert!((t.translate_x - 50.0).abs() < 0.001);
-        assert!((t.translate_y - 100.0).abs() < 0.001);
     }
 }

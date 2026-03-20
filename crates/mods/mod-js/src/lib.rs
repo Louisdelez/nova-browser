@@ -222,7 +222,7 @@ impl NovaMod for JsMod {
                     if let Some(ref qjs) = js_ctx.quickjs {
                         qjs.eval_with_dom(&source)
                     } else {
-                        eval_script(&source, Arc::clone(&tree))
+                        eval_script_with_core(&source, Arc::clone(&tree), self.core.as_ref())
                     }
                 };
 

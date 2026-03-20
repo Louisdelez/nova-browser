@@ -11,6 +11,8 @@ use std::collections::HashMap;
 
 use nova_mod_api::{Color, RenderCommands, RenderOp};
 
+use crate::text_shaping::TextShaper;
+
 // ---------------------------------------------------------------------------
 // Clip rectangle
 // ---------------------------------------------------------------------------
@@ -65,6 +67,11 @@ impl FontVariant {
 /// Loads up to 4 TTF fonts at startup (regular, bold, italic, bold-italic)
 /// and rasterizes glyphs on demand, caching them in a `HashMap` keyed by
 /// `(variant, char, font_size_in_tenths)`.
+///
+/// Optionally includes a [`TextShaper`] for rustybuzz-based text shaping
+/// (ligatures, kerning, BiDi, complex scripts). When available, the shaper
+/// is used for text measurement and glyph positioning while fontdue handles
+/// the actual rasterization.
 struct FontRenderer {
     regular: fontdue::Font,
     bold: Option<fontdue::Font>,
@@ -77,6 +84,8 @@ struct FontRenderer {
     custom_fonts: HashMap<String, fontdue::Font>,
     /// Cache for custom font glyphs, keyed by (family_lowercase, character, font_size * 10).
     custom_cache: HashMap<(String, char, u32), CachedGlyph>,
+    /// Optional rustybuzz text shaper for kerning, ligatures, and BiDi.
+    text_shaper: Option<TextShaper>,
 }
 
 impl FontRenderer {
@@ -86,13 +95,34 @@ impl FontRenderer {
     /// variants if available. Returns `None` if the regular font is not found.
     fn new() -> Option<Self> {
         let regular_bytes = Self::find_font_bytes("DejaVuSans.ttf")?;
+
+        // Initialize the rustybuzz text shaper from the same font data.
+        let mut text_shaper = TextShaper::new(&regular_bytes);
+        if text_shaper.is_some() {
+            tracing::info!("rustybuzz TextShaper initialized for text shaping");
+        } else {
+            tracing::warn!("rustybuzz TextShaper failed to initialize; falling back to fontdue-only");
+        }
+
         let settings = fontdue::FontSettings::default();
         let regular = fontdue::Font::from_bytes(regular_bytes, settings).ok()?;
 
-        let bold = Self::find_font_bytes("DejaVuSans-Bold.ttf")
-            .and_then(|b| fontdue::Font::from_bytes(b, fontdue::FontSettings::default()).ok());
-        let italic = Self::find_font_bytes("DejaVuSans-Oblique.ttf")
-            .and_then(|b| fontdue::Font::from_bytes(b, fontdue::FontSettings::default()).ok());
+        let bold_bytes = Self::find_font_bytes("DejaVuSans-Bold.ttf");
+        let bold = bold_bytes
+            .as_ref()
+            .and_then(|b| fontdue::Font::from_bytes(b.clone(), fontdue::FontSettings::default()).ok());
+        if let (Some(shaper), Some(bytes)) = (&mut text_shaper, &bold_bytes) {
+            shaper.set_bold(bytes);
+        }
+
+        let italic_bytes = Self::find_font_bytes("DejaVuSans-Oblique.ttf");
+        let italic = italic_bytes
+            .as_ref()
+            .and_then(|b| fontdue::Font::from_bytes(b.clone(), fontdue::FontSettings::default()).ok());
+        if let (Some(shaper), Some(bytes)) = (&mut text_shaper, &italic_bytes) {
+            shaper.set_italic(bytes);
+        }
+
         let bold_italic = Self::find_font_bytes("DejaVuSans-BoldOblique.ttf")
             .and_then(|b| fontdue::Font::from_bytes(b, fontdue::FontSettings::default()).ok());
 
@@ -100,6 +130,7 @@ impl FontRenderer {
             bold = bold.is_some(),
             italic = italic.is_some(),
             bold_italic = bold_italic.is_some(),
+            text_shaper = text_shaper.is_some(),
             "Font renderer initialized with variants"
         );
 
@@ -111,6 +142,7 @@ impl FontRenderer {
             cache: HashMap::new(),
             custom_fonts: HashMap::new(),
             custom_cache: HashMap::new(),
+            text_shaper,
         })
     }
 
@@ -123,6 +155,10 @@ impl FontRenderer {
         let key = family.to_lowercase();
         if self.custom_fonts.contains_key(&key) {
             return; // already loaded
+        }
+        // Also load into the text shaper if available.
+        if let Some(ref mut shaper) = self.text_shaper {
+            shaper.load_custom_font(family, &data);
         }
         let settings = fontdue::FontSettings::default();
         match fontdue::Font::from_bytes(data, settings) {
@@ -235,28 +271,6 @@ impl FontRenderer {
 // Framebuffer
 // ---------------------------------------------------------------------------
 
-/// A saved scroll state for fixed-position elements.
-#[derive(Debug, Clone, Copy)]
-struct SavedScrollState {
-    scroll_x: f32,
-    scroll_y: f32,
-}
-
-/// An entry on the transform stack, storing a 2x3 affine matrix.
-#[derive(Debug, Clone, Copy)]
-struct TransformEntry {
-    /// Affine matrix `[a, b, c, d, tx, ty]`.
-    matrix: [f32; 6],
-}
-
-impl TransformEntry {
-    /// Apply this transform to a point `(x, y)`, returning the transformed point.
-    fn apply(&self, x: f32, y: f32) -> (f32, f32) {
-        let [a, b, c, d, tx, ty] = self.matrix;
-        (a * x + c * y + tx, b * x + d * y + ty)
-    }
-}
-
 /// A simple software framebuffer.
 pub struct Framebuffer {
     pub width: u32,
@@ -270,10 +284,6 @@ pub struct Framebuffer {
     clip_stack: Vec<ClipRect>,
     /// Extra y-offset applied by sticky positioning (reset each frame).
     translate_y_offset: f32,
-    /// Stack of saved scroll states for fixed-position elements.
-    fixed_position_stack: Vec<SavedScrollState>,
-    /// Stack of active affine transforms.
-    transform_stack: Vec<TransformEntry>,
 }
 
 impl Framebuffer {
@@ -288,8 +298,6 @@ impl Framebuffer {
             font_renderer,
             clip_stack: Vec::new(),
             translate_y_offset: 0.0,
-            fixed_position_stack: Vec::new(),
-            transform_stack: Vec::new(),
         }
     }
 
@@ -321,9 +329,17 @@ impl Framebuffer {
     }
 
     /// Measure the width of text at a given font size without rendering.
-    /// Returns the width in pixels.
+    ///
+    /// When the rustybuzz [`TextShaper`] is available, uses shaped glyph
+    /// advances for accurate measurement (including kerning and ligatures).
+    /// Otherwise falls back to fontdue per-character advance widths.
     pub fn measure_text_width(&mut self, text: &str, font_size: f32) -> f32 {
         if let Some(ref mut renderer) = self.font_renderer {
+            // Prefer the text shaper for more accurate measurement.
+            if let Some(ref shaper) = renderer.text_shaper {
+                return shaper.measure_width(text, font_size);
+            }
+
             let mut width: f32 = 0.0;
             for ch in text.chars() {
                 let glyph = renderer.rasterize(ch, font_size, FontVariant::Regular);
@@ -335,25 +351,6 @@ impl Framebuffer {
             let scale = font_size / 16.0;
             text.len() as f32 * 8.0 * scale
         }
-    }
-
-    /// Apply the current transform stack to a point `(x, y)`.
-    ///
-    /// When no transforms are active, returns the point unchanged.
-    /// Otherwise, applies all stacked transforms in order (bottom to top).
-    #[inline]
-    fn apply_transform(&self, x: f32, y: f32) -> (f32, f32) {
-        if self.transform_stack.is_empty() {
-            return (x, y);
-        }
-        let mut rx = x;
-        let mut ry = y;
-        for entry in &self.transform_stack {
-            let (nx, ny) = entry.apply(rx, ry);
-            rx = nx;
-            ry = ny;
-        }
-        (rx, ry)
     }
 
     /// Compute the effective clip bounds from the clip stack.
@@ -601,6 +598,82 @@ impl Framebuffer {
         let mut cy = y.round() as i32;
         let line_height = (font_size * 1.2).round() as i32;
 
+        // Try shaped rendering when the text shaper is available.
+        let use_shaper = renderer.text_shaper.is_some() && !text.contains('\n');
+        if use_shaper {
+            let is_bold = font_weight.unwrap_or(400) >= 700;
+            let is_italic = font_style
+                .map(|s| s == "italic" || s == "oblique")
+                .unwrap_or(false);
+
+            let shaped_run = if let Some(ref family_key) = custom_family_key {
+                renderer.text_shaper.as_ref().unwrap()
+                    .shape_custom(text, font_size, &[], family_key)
+            } else {
+                renderer.text_shaper.as_ref().unwrap()
+                    .shape_variant(text, font_size, &[], is_bold, is_italic)
+            };
+
+            // Map cluster indices back to characters for fontdue rasterization.
+            let chars: Vec<char> = text.chars().collect();
+            let mut cursor_x = x;
+
+            for glyph in &shaped_run.glyphs {
+                // Find the character for this cluster.
+                let ch = chars
+                    .get(glyph.cluster as usize)
+                    .copied()
+                    .unwrap_or('?');
+
+                // Line wrapping check.
+                let glyph_cx = (cursor_x + glyph.x_offset).round() as i32;
+                if glyph_cx + (glyph.x_advance as i32) > fb_width && glyph_cx > x.round() as i32 {
+                    cursor_x = x;
+                    cy += line_height;
+                }
+
+                // Rasterize with fontdue (by character).
+                let (metrics, bitmap) = if let Some(ref family_key) = custom_family_key {
+                    if let Some(cached) = renderer.rasterize_custom(family_key, ch, font_size) {
+                        (cached.metrics, cached.bitmap.clone())
+                    } else {
+                        let cached = renderer.rasterize(ch, font_size, variant);
+                        (cached.metrics, cached.bitmap.clone())
+                    }
+                } else {
+                    let cached = renderer.rasterize(ch, font_size, variant);
+                    (cached.metrics, cached.bitmap.clone())
+                };
+
+                // Position using shaped offsets.
+                let draw_x = (cursor_x + glyph.x_offset).round() as i32;
+                let draw_y = cy;
+                let gx = draw_x + metrics.xmin;
+                let gy = draw_y - metrics.ymin + glyph.y_offset.round() as i32;
+                let bw = metrics.width;
+                let bh = metrics.height;
+
+                for row in 0..bh {
+                    for col in 0..bw {
+                        let coverage = bitmap[row * bw + col];
+                        self.blend_glyph_pixel(
+                            gx + col as i32,
+                            gy + row as i32,
+                            coverage,
+                            color,
+                        );
+                    }
+                }
+
+                cursor_x += glyph.x_advance;
+            }
+
+            // Put the renderer back.
+            self.font_renderer = Some(renderer);
+            return;
+        }
+
+        // Fallback: character-by-character rendering without shaping.
         for ch in text.chars() {
             if ch == '\n' {
                 cx = x.round() as i32;
@@ -738,8 +811,6 @@ impl Framebuffer {
         self.clear(Color::WHITE);
         self.clip_stack.clear();
         self.translate_y_offset = 0.0;
-        self.fixed_position_stack.clear();
-        self.transform_stack.clear();
 
         // Load any custom @font-face fonts that haven't been loaded yet.
         if !commands.fonts.is_empty() {
@@ -750,45 +821,32 @@ impl Framebuffer {
 
         for op in &commands.ops {
             let sy_extra = self.translate_y_offset;
-
-            // Compute effective scroll offsets (fixed positioning disables scroll).
-            let (eff_sx, eff_sy) = if !self.fixed_position_stack.is_empty() {
-                (0.0_f32, 0.0_f32)
-            } else {
-                (sx, scroll_y)
-            };
-
             match op {
                 RenderOp::FillRect { x, y, width, height, color } => {
-                    let (rx, ry) = self.apply_transform(*x - eff_sx, *y + y_offset - eff_sy + sy_extra);
-                    self.fill_rect(rx, ry, *width, *height, *color);
+                    self.fill_rect(*x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, *color);
                 }
                 RenderOp::DrawText { x, y, text, font_size, color, font_weight, font_style, font_family } => {
-                    let (rx, ry) = self.apply_transform(*x - eff_sx, *y + y_offset - eff_sy + sy_extra);
                     self.draw_text(
-                        rx, ry, text, *font_size, *color,
+                        *x - sx, *y + y_offset - scroll_y + sy_extra, text, *font_size, *color,
                         *font_weight, font_style.as_deref(), font_family.as_deref(),
                     );
                 }
                 RenderOp::StrokeRect { x, y, width, height, color, width_px } => {
-                    let (rx, ry) = self.apply_transform(*x - eff_sx, *y + y_offset - eff_sy + sy_extra);
-                    self.stroke_rect(rx, ry, *width, *height, *color, *width_px);
+                    self.stroke_rect(*x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, *color, *width_px);
                 }
                 RenderOp::DrawImage {
                     x, y, width, height,
                     img_width, img_height, pixels,
                 } => {
-                    let (rx, ry) = self.apply_transform(*x - eff_sx, *y + y_offset - eff_sy + sy_extra);
                     self.draw_image(
-                        rx, ry, *width, *height,
+                        *x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height,
                         *img_width, *img_height, pixels,
                     );
                 }
                 RenderOp::PushClip { x, y, width, height } => {
-                    let (rx, ry) = self.apply_transform(*x - eff_sx, *y + y_offset - eff_sy + sy_extra);
                     self.clip_stack.push(ClipRect {
-                        x: rx.round() as i32,
-                        y: ry.round() as i32,
+                        x: (*x - sx).round() as i32,
+                        y: (*y + y_offset - scroll_y + sy_extra).round() as i32,
                         width: width.round() as i32,
                         height: height.round() as i32,
                     });
@@ -797,19 +855,20 @@ impl Framebuffer {
                     self.clip_stack.pop();
                 }
                 RenderOp::FillRoundedRect { x, y, width, height, color, radius } => {
-                    let (rx, ry) = self.apply_transform(*x - eff_sx, *y + y_offset - eff_sy + sy_extra);
                     self.fill_rounded_rect(
-                        rx, ry, *width, *height, *color, *radius,
+                        *x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, *color, *radius,
                     );
                 }
                 RenderOp::BoxShadow {
                     x, y, width, height, color, offset_x, offset_y, blur: _,
                 } => {
-                    let (rx, ry) = self.apply_transform(
-                        *x + *offset_x - eff_sx,
-                        *y + *offset_y + y_offset - eff_sy + sy_extra,
+                    self.fill_rect(
+                        *x + *offset_x - sx,
+                        *y + *offset_y + y_offset - scroll_y + sy_extra,
+                        *width,
+                        *height,
+                        *color,
                     );
-                    self.fill_rect(rx, ry, *width, *height, *color);
                 }
                 // Sticky positioning: adjust the y-offset for subsequent ops
                 // so the element sticks to the viewport during scroll.
@@ -824,23 +883,6 @@ impl Framebuffer {
                 }
                 RenderOp::StickyEnd => {
                     self.translate_y_offset = 0.0;
-                }
-                // Fixed positioning: save scroll state and ignore scroll.
-                RenderOp::FixedPosition { .. } => {
-                    self.fixed_position_stack.push(SavedScrollState {
-                        scroll_x: sx,
-                        scroll_y,
-                    });
-                }
-                RenderOp::FixedPositionEnd => {
-                    self.fixed_position_stack.pop();
-                }
-                // CSS transforms: push/pop affine transform matrix.
-                RenderOp::Transform { matrix } => {
-                    self.transform_stack.push(TransformEntry { matrix: *matrix });
-                }
-                RenderOp::TransformEnd => {
-                    self.transform_stack.pop();
                 }
                 // Link ops are metadata-only; they don't draw anything.
                 RenderOp::Link { .. } => {}

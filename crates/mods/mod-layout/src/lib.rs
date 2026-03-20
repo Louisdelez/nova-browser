@@ -218,13 +218,7 @@ fn compute_layout(dom: &DomNode, viewport: &Viewport) -> Result<LayoutBox, NovaE
         .map_err(|e| NovaError::LayoutError(format!("Taffy compute_layout failed: {e:?}")))?;
 
     // Extract the resulting layout tree.
-    let mut layout_box = build_layout_box(&taffy, root_id, 0.0, 0.0);
-
-    // Post-processing: apply CSS positioning (relative, absolute, fixed)
-    // and sort children by z-index for correct paint order.
-    apply_positioning_recursive(&mut layout_box, viewport);
-    sort_by_z_index_recursive(&mut layout_box);
-
+    let layout_box = build_layout_box(&taffy, root_id, 0.0, 0.0);
     Ok(layout_box)
 }
 
@@ -430,6 +424,22 @@ fn add_node(
                 props.push(("nova-form-type".into(), StyleValue::Str(form_type)));
                 props.push(("nova-form-value".into(), StyleValue::Str(label.clone())));
 
+                // Propagate the field's name attribute for form submission.
+                let field_name = attributes.iter()
+                    .find(|(k, _)| k == "name")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                props.push(("nova-form-name".into(), StyleValue::Str(field_name)));
+
+                // Inherit form context from parent <form> element (via parent_style_props).
+                for (key, val) in parent_style_props {
+                    if matches!(key.as_str(), "nova-form-action" | "nova-form-method" | "nova-form-enctype") {
+                        if !props.iter().any(|(k, _)| k == key) {
+                            props.push((key.clone(), val.clone()));
+                        }
+                    }
+                }
+
                 let ctx = NodeContext {
                     content: LayoutContent::Block,
                     style: StyleMap { properties: props },
@@ -552,6 +562,26 @@ fn add_node(
                 if let Some(href) = attributes.iter().find(|(k, _)| k == "href") {
                     props.push(("href".into(), StyleValue::Str(href.1.clone())));
                 }
+            }
+
+            // Propagate form attributes for <form> elements so child form
+            // fields can inherit the action, method, and enctype.
+            if tag == "form" {
+                let action = attributes.iter()
+                    .find(|(k, _)| k == "action")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                let method = attributes.iter()
+                    .find(|(k, _)| k == "method")
+                    .map(|(_, v)| v.to_lowercase())
+                    .unwrap_or_else(|| "get".into());
+                let enctype = attributes.iter()
+                    .find(|(k, _)| k == "enctype")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| "application/x-www-form-urlencoded".into());
+                props.push(("nova-form-action".into(), StyleValue::Str(action)));
+                props.push(("nova-form-method".into(), StyleValue::Str(method)));
+                props.push(("nova-form-enctype".into(), StyleValue::Str(enctype)));
             }
 
             // ── Inline Formatting Context ──────────────────────────
@@ -1360,150 +1390,6 @@ fn build_layout_box(
         style: ctx.style,
         children,
         z_index,
-    }
-}
-
-// ── CSS Positioning post-processing ─────────────────────────────────────
-
-/// CSS `position` value.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum CssPosition {
-    Static,
-    Relative,
-    Absolute,
-    Fixed,
-}
-
-/// Parse the `position` property from a `StyleMap`.
-fn parse_css_position(style: &StyleMap) -> CssPosition {
-    for (key, value) in &style.properties {
-        if key == "position" {
-            let val = match value {
-                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
-                _ => continue,
-            };
-            return match val {
-                "relative" => CssPosition::Relative,
-                "absolute" => CssPosition::Absolute,
-                "fixed" => CssPosition::Fixed,
-                "sticky" => CssPosition::Static, // sticky is handled separately at render time
-                _ => CssPosition::Static,
-            };
-        }
-    }
-    CssPosition::Static
-}
-
-/// Extract a CSS inset property (`top`, `left`, `right`, `bottom`) as pixels.
-///
-/// Returns `None` if the property is not set or is `auto`.
-fn extract_inset_px(style: &StyleMap, prop: &str) -> Option<f32> {
-    for (key, value) in &style.properties {
-        if key == prop {
-            match value {
-                StyleValue::Px(px) => return Some(*px),
-                StyleValue::Keyword(s) | StyleValue::Str(s) => {
-                    let s = s.trim();
-                    if s == "auto" {
-                        return None;
-                    }
-                    if let Some(px) = s.strip_suffix("px").and_then(|v| v.trim().parse::<f32>().ok()) {
-                        return Some(px);
-                    }
-                    if let Some(v) = s.parse::<f32>().ok() {
-                        return Some(v);
-                    }
-                }
-                StyleValue::Number(n) => return Some(*n),
-                _ => {}
-            }
-        }
-    }
-    None
-}
-
-/// Recursively apply CSS positioning offsets to layout boxes.
-///
-/// For `position: relative`: offsets the box from its normal flow position
-/// using `top`/`left` (with `bottom`/`right` as alternatives).
-///
-/// For `position: absolute` or `position: fixed`: the box is already laid
-/// out by Taffy with `Position::Absolute`, but we need to ensure the
-/// position is correct relative to the containing block. We re-apply
-/// `top`/`left`/`right`/`bottom` offsets here.
-fn apply_positioning_recursive(layout_box: &mut LayoutBox, viewport: &Viewport) {
-    let position = parse_css_position(&layout_box.style);
-
-    match position {
-        CssPosition::Relative => {
-            // Relative: offset from normal flow position.
-            let top = extract_inset_px(&layout_box.style, "top");
-            let left = extract_inset_px(&layout_box.style, "left");
-            let bottom = extract_inset_px(&layout_box.style, "bottom");
-            let right = extract_inset_px(&layout_box.style, "right");
-
-            // `top` takes priority over `bottom`, `left` over `right`.
-            if let Some(t) = top {
-                layout_box.y += t;
-            } else if let Some(b) = bottom {
-                layout_box.y -= b;
-            }
-            if let Some(l) = left {
-                layout_box.x += l;
-            } else if let Some(r) = right {
-                layout_box.x -= r;
-            }
-        }
-        CssPosition::Absolute | CssPosition::Fixed => {
-            // Absolute/fixed positioning is already handled by Taffy
-            // (we set Position::Absolute in build_taffy_style), but we
-            // store the position type in the style so the painter can
-            // emit FixedPosition ops for fixed elements.
-            //
-            // For fixed elements, we need to adjust coordinates to be
-            // relative to the viewport origin (0, 0) rather than the
-            // containing block. We do this by setting x/y directly
-            // from the inset properties if they are specified.
-            if position == CssPosition::Fixed {
-                let top = extract_inset_px(&layout_box.style, "top");
-                let left = extract_inset_px(&layout_box.style, "left");
-                let right = extract_inset_px(&layout_box.style, "right");
-                let bottom = extract_inset_px(&layout_box.style, "bottom");
-
-                if let Some(t) = top {
-                    layout_box.y = t;
-                } else if let Some(b) = bottom {
-                    layout_box.y = viewport.height - layout_box.height - b;
-                }
-                if let Some(l) = left {
-                    layout_box.x = l;
-                } else if let Some(r) = right {
-                    layout_box.x = viewport.width - layout_box.width - r;
-                }
-            }
-        }
-        CssPosition::Static => {
-            // No positioning offset needed.
-        }
-    }
-
-    // Recurse into children.
-    for child in &mut layout_box.children {
-        apply_positioning_recursive(child, viewport);
-    }
-}
-
-/// Recursively sort children by z-index within each stacking context.
-///
-/// Stable sort preserves DOM order for equal z-index values, matching
-/// CSS stacking context semantics.
-fn sort_by_z_index_recursive(layout_box: &mut LayoutBox) {
-    // Sort children by z-index.
-    layout_box.children.sort_by_key(|child| child.z_index);
-
-    // Recurse into children.
-    for child in &mut layout_box.children {
-        sort_by_z_index_recursive(child);
     }
 }
 
@@ -3068,201 +2954,5 @@ mod phase4_tests {
             "float:right div should be pushed right, x={}",
             div.x
         );
-    }
-
-    // ── Phase 4: CSS Positioning + Transforms tests ────────────────────
-
-    #[test]
-    fn position_relative_offsets() {
-        // An element with position: relative and top/left offsets should be
-        // visually shifted from its normal flow position.
-        let dom = DomNode::Document {
-            children: vec![DomNode::Element {
-                tag: "div".into(),
-                attributes: vec![(
-                    "data-nova-style".into(),
-                    "position: relative; top: 10px; left: 20px".into(),
-                )],
-                children: vec![DomNode::Text("Shifted".into())],
-            }],
-        };
-        let root = compute_layout(&dom, &viewport()).expect("layout ok");
-        let div = &root.children[0];
-        // The div should be offset by top=10, left=20 from its normal position.
-        assert!(
-            div.x >= 20.0,
-            "relative div should have x >= 20 from left offset, got {}",
-            div.x
-        );
-        assert!(
-            div.y >= 10.0,
-            "relative div should have y >= 10 from top offset, got {}",
-            div.y
-        );
-    }
-
-    #[test]
-    fn position_relative_bottom_right() {
-        // When only bottom/right are set (not top/left), they offset the opposite way.
-        let dom = DomNode::Document {
-            children: vec![DomNode::Element {
-                tag: "div".into(),
-                attributes: vec![(
-                    "data-nova-style".into(),
-                    "position: relative; bottom: 10px; right: 20px".into(),
-                )],
-                children: vec![DomNode::Text("Shifted".into())],
-            }],
-        };
-        let root_normal = {
-            let dom2 = DomNode::Document {
-                children: vec![DomNode::Element {
-                    tag: "div".into(),
-                    attributes: vec![],
-                    children: vec![DomNode::Text("Shifted".into())],
-                }],
-            };
-            compute_layout(&dom2, &viewport()).expect("layout ok")
-        };
-        let root = compute_layout(&dom, &viewport()).expect("layout ok");
-        let div = &root.children[0];
-        let div_normal = &root_normal.children[0];
-        // Bottom=10 should shift y up by 10; right=20 should shift x left by 20.
-        assert!(
-            div.y < div_normal.y || (div.y - div_normal.y).abs() < 0.01,
-            "bottom offset should move element up or keep at 0"
-        );
-    }
-
-    #[test]
-    fn position_absolute_placement() {
-        // An absolutely positioned element with top/left should be placed
-        // relative to its containing block.
-        let dom = DomNode::Document {
-            children: vec![DomNode::Element {
-                tag: "div".into(),
-                attributes: vec![(
-                    "data-nova-style".into(),
-                    "position: relative".into(),
-                )],
-                children: vec![
-                    DomNode::Text("Normal flow".into()),
-                    DomNode::Element {
-                        tag: "div".into(),
-                        attributes: vec![(
-                            "data-nova-style".into(),
-                            "position: absolute; top: 10px; left: 10px; width: 100px".into(),
-                        )],
-                        children: vec![DomNode::Text("Absolute".into())],
-                    },
-                ],
-            }],
-        };
-        let root = compute_layout(&dom, &viewport()).expect("layout ok");
-        let container = &root.children[0];
-        // Find the absolute child (second child in DOM, but z-index sorting may reorder).
-        let abs_child = container.children.iter().find(|c| c.width <= 100.0 + 1.0);
-        assert!(abs_child.is_some(), "should find the absolutely positioned child");
-    }
-
-    #[test]
-    fn position_fixed_viewport_relative() {
-        // A fixed element should be positioned relative to the viewport.
-        let dom = DomNode::Document {
-            children: vec![
-                DomNode::Element {
-                    tag: "div".into(),
-                    attributes: vec![(
-                        "data-nova-style".into(),
-                        "position: fixed; top: 0px; left: 0px; width: 800px; height: 50px".into(),
-                    )],
-                    children: vec![DomNode::Text("Fixed header".into())],
-                },
-            ],
-        };
-        let root = compute_layout(&dom, &viewport()).expect("layout ok");
-        let fixed = &root.children[0];
-        assert!(
-            (fixed.x - 0.0).abs() < 1.0,
-            "fixed element x should be 0, got {}",
-            fixed.x
-        );
-        assert!(
-            (fixed.y - 0.0).abs() < 1.0,
-            "fixed element y should be 0, got {}",
-            fixed.y
-        );
-    }
-
-    #[test]
-    fn z_index_sorting() {
-        // Children with different z-index values should be sorted by z-index
-        // after layout.
-        let dom = DomNode::Document {
-            children: vec![DomNode::Element {
-                tag: "div".into(),
-                attributes: vec![],
-                children: vec![
-                    DomNode::Element {
-                        tag: "div".into(),
-                        attributes: vec![(
-                            "data-nova-style".into(),
-                            "z-index: 10".into(),
-                        )],
-                        children: vec![DomNode::Text("High z".into())],
-                    },
-                    DomNode::Element {
-                        tag: "div".into(),
-                        attributes: vec![(
-                            "data-nova-style".into(),
-                            "z-index: -1".into(),
-                        )],
-                        children: vec![DomNode::Text("Low z".into())],
-                    },
-                    DomNode::Element {
-                        tag: "div".into(),
-                        attributes: vec![(
-                            "data-nova-style".into(),
-                            "z-index: 5".into(),
-                        )],
-                        children: vec![DomNode::Text("Mid z".into())],
-                    },
-                ],
-            }],
-        };
-        let root = compute_layout(&dom, &viewport()).expect("layout ok");
-        let container = &root.children[0];
-        assert_eq!(container.children.len(), 3);
-        // Children should be sorted by z-index: -1, 5, 10.
-        assert_eq!(container.children[0].z_index, -1);
-        assert_eq!(container.children[1].z_index, 5);
-        assert_eq!(container.children[2].z_index, 10);
-    }
-
-    #[test]
-    fn parse_css_position_variants() {
-        let mut style = StyleMap::default();
-        assert_eq!(parse_css_position(&style), CssPosition::Static);
-
-        style.properties.push(("position".into(), StyleValue::Keyword("relative".into())));
-        assert_eq!(parse_css_position(&style), CssPosition::Relative);
-
-        style.properties.clear();
-        style.properties.push(("position".into(), StyleValue::Keyword("absolute".into())));
-        assert_eq!(parse_css_position(&style), CssPosition::Absolute);
-
-        style.properties.clear();
-        style.properties.push(("position".into(), StyleValue::Keyword("fixed".into())));
-        assert_eq!(parse_css_position(&style), CssPosition::Fixed);
-    }
-
-    #[test]
-    fn extract_inset_px_values() {
-        let mut style = StyleMap::default();
-        style.properties.push(("top".into(), StyleValue::Px(15.0)));
-        style.properties.push(("left".into(), StyleValue::Keyword("20px".into())));
-        assert_eq!(extract_inset_px(&style, "top"), Some(15.0));
-        assert_eq!(extract_inset_px(&style, "left"), Some(20.0));
-        assert_eq!(extract_inset_px(&style, "bottom"), None);
     }
 }

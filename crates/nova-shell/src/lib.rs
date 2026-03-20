@@ -7,4 +7,5 @@ pub mod history;
 pub mod renderer;
 pub mod startup;
 pub mod tab;
+pub mod text_shaping;
 pub mod window;

@@ -1,6 +1,7 @@
 //! TCP + TLS transport layer.
 //!
 //! Handles raw TCP connections and optional TLS wrapping via rustls.
+//! Supports ALPN negotiation for HTTP/2 (`h2`) and HTTP/1.1.
 
 use std::sync::Arc;
 
@@ -12,10 +13,29 @@ use rustls::pki_types::ServerName;
 
 use nova_mod_api::NovaError;
 
+use crate::http2::NegotiatedProtocol;
+
 /// An abstraction over a plain TCP or TLS stream.
 pub enum Transport {
     Plain(TcpStream),
     Tls(tokio_rustls::client::TlsStream<TcpStream>),
+}
+
+impl Transport {
+    /// Get the ALPN-negotiated protocol for this transport.
+    ///
+    /// Returns `NegotiatedProtocol::None` for plain TCP connections.
+    /// For TLS connections, checks the negotiated ALPN protocol.
+    pub fn negotiated_protocol(&self) -> NegotiatedProtocol {
+        match self {
+            Transport::Plain(_) => NegotiatedProtocol::None,
+            Transport::Tls(tls) => {
+                let (_, conn) = tls.get_ref();
+                let alpn = conn.alpn_protocol();
+                crate::http2::detect_protocol(alpn)
+            }
+        }
+    }
 }
 
 /// Connect to a host:port, optionally wrapping in TLS.
@@ -49,9 +69,12 @@ pub async fn connect(host: &str, port: u16, use_tls: bool) -> Result<Transport, 
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
 
-        let config = ClientConfig::builder()
+        let mut config = ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
+
+        // Configure ALPN protocols: prefer h2, fall back to http/1.1.
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         let connector = TlsConnector::from(Arc::new(config));
 
@@ -61,19 +84,7 @@ pub async fn connect(host: &str, port: u16, use_tls: bool) -> Result<Transport, 
         let tls_stream = connector
             .connect(server_name, tcp)
             .await
-            .map_err(|e| {
-                let detail = format!("{e}");
-                let hint = if detail.contains("CertificateRequired") || detail.contains("certificate") {
-                    " The site's SSL certificate could not be verified. It may be expired, self-signed, or issued by an untrusted authority."
-                } else if detail.contains("HandshakeFailure") {
-                    " The server rejected the TLS handshake. It may not support modern TLS versions."
-                } else {
-                    ""
-                };
-                NovaError::TlsError(format!(
-                    "Certificate error for {host}: {detail}.{hint}"
-                ))
-            })?;
+            .map_err(|e| NovaError::TlsError(format!("TLS handshake with {host} failed: {e}")))?;
 
         Ok(Transport::Tls(tls_stream))
     } else {
@@ -83,21 +94,44 @@ pub async fn connect(host: &str, port: u16, use_tls: bool) -> Result<Transport, 
 
 /// Send an HTTP request and read the full response.
 pub async fn send_request(transport: Transport, request: &str) -> Result<Vec<u8>, NovaError> {
+    send_request_with_body(transport, request.as_bytes(), None).await
+}
+
+/// Send an HTTP request with optional body and read the full response.
+///
+/// `headers_bytes` contains the HTTP request line and headers (including
+/// the final `\r\n\r\n`). If `body` is provided, it is sent immediately
+/// after the headers.
+pub async fn send_request_with_body(
+    transport: Transport,
+    headers_bytes: &[u8],
+    body: Option<&[u8]>,
+) -> Result<Vec<u8>, NovaError> {
     match transport {
         Transport::Plain(mut stream) => {
             stream
-                .write_all(request.as_bytes())
+                .write_all(headers_bytes)
                 .await
                 .map_err(|e| NovaError::NetworkError(format!("write failed: {e}")))?;
-
+            if let Some(body) = body {
+                stream
+                    .write_all(body)
+                    .await
+                    .map_err(|e| NovaError::NetworkError(format!("body write failed: {e}")))?;
+            }
             read_response(&mut stream).await
         }
         Transport::Tls(mut stream) => {
             stream
-                .write_all(request.as_bytes())
+                .write_all(headers_bytes)
                 .await
                 .map_err(|e| NovaError::NetworkError(format!("TLS write failed: {e}")))?;
-
+            if let Some(body) = body {
+                stream
+                    .write_all(body)
+                    .await
+                    .map_err(|e| NovaError::NetworkError(format!("TLS body write failed: {e}")))?;
+            }
             read_response(&mut stream).await
         }
     }

@@ -19,6 +19,16 @@ pub enum ContentRequest {
         headers: Vec<(String, String)>,
     },
 
+    /// Fetch a URL with an HTTP method and optional request body.
+    ///
+    /// Used for form submissions (POST) and other non-GET requests.
+    FetchWithBody {
+        url: String,
+        method: String,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+    },
+
     /// Parse a document (routed based on MIME type).
     Parse {
         data: Bytes,

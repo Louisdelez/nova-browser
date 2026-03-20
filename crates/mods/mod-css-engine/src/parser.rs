@@ -343,10 +343,16 @@ pub fn parse_stylesheet_full(css: &str, viewport_width: f32) -> ParsedStylesheet
 /// `@keyframes name { 0% { ... } 50% { ... } 100% { ... } }` forms.
 fn extract_keyframes(css: &str) -> Vec<KeyframesRule> {
     let mut result = Vec::new();
-    let lower = css.to_ascii_lowercase();
     let mut search_from = 0;
 
-    while let Some(idx) = lower[search_from..].find("@keyframes") {
+    // Case-insensitive search for @keyframes directly on the original string.
+    while search_from < css.len() {
+        let haystack = &css[search_from..];
+        let idx = haystack
+            .as_bytes()
+            .windows(10)
+            .position(|w| w.eq_ignore_ascii_case(b"@keyframes"));
+        let Some(idx) = idx else { break };
         let abs_idx = search_from + idx;
         let after = &css[abs_idx + "@keyframes".len()..];
         let after = after.trim_start();

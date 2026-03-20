@@ -590,6 +590,137 @@ fn add_node(
                     .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
             }
 
+            // <svg> elements are treated as inline images with their viewBox dimensions.
+            if tag == "svg" {
+                let svg_w: f32 = attributes.iter()
+                    .find(|(k, _)| k == "width")
+                    .and_then(|(_, v)| v.trim_end_matches("px").parse().ok())
+                    .or_else(|| attributes.iter()
+                        .find(|(k, _)| k == "viewBox")
+                        .and_then(|(_, v)| {
+                            let parts: Vec<f32> = v.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+                            parts.get(2).copied()
+                        }))
+                    .unwrap_or(100.0);
+                let svg_h: f32 = attributes.iter()
+                    .find(|(k, _)| k == "height")
+                    .and_then(|(_, v)| v.trim_end_matches("px").parse().ok())
+                    .or_else(|| attributes.iter()
+                        .find(|(k, _)| k == "viewBox")
+                        .and_then(|(_, v)| {
+                            let parts: Vec<f32> = v.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+                            parts.get(3).copied()
+                        }))
+                    .unwrap_or(100.0);
+
+                let ctx = NodeContext {
+                    content: LayoutContent::Block,
+                    style: StyleMap::default(),
+                };
+                return taffy
+                    .new_leaf_with_context(
+                        Style {
+                            display: Display::Flex,
+                            size: Size {
+                                width: Dimension::Length(svg_w.min(available_width)),
+                                height: Dimension::Length(svg_h),
+                            },
+                            ..Style::DEFAULT
+                        },
+                        ctx,
+                    )
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+            }
+
+            // <canvas> elements show a blank rectangle with their specified dimensions.
+            if tag == "canvas" {
+                let canvas_w: f32 = attributes.iter()
+                    .find(|(k, _)| k == "width")
+                    .and_then(|(_, v)| v.parse().ok())
+                    .unwrap_or(300.0);
+                let canvas_h: f32 = attributes.iter()
+                    .find(|(k, _)| k == "height")
+                    .and_then(|(_, v)| v.parse().ok())
+                    .unwrap_or(150.0);
+
+                let props = vec![
+                    ("background-color".into(), StyleValue::Str("#000".to_string())),
+                ];
+                let ctx = NodeContext {
+                    content: LayoutContent::Block,
+                    style: StyleMap { properties: props },
+                };
+                return taffy
+                    .new_leaf_with_context(
+                        Style {
+                            display: Display::Flex,
+                            size: Size {
+                                width: Dimension::Length(canvas_w.min(available_width)),
+                                height: Dimension::Length(canvas_h),
+                            },
+                            ..Style::DEFAULT
+                        },
+                        ctx,
+                    )
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+            }
+
+            // <video> elements show a black rectangle placeholder.
+            if tag == "video" {
+                let vid_w: f32 = attributes.iter()
+                    .find(|(k, _)| k == "width")
+                    .and_then(|(_, v)| v.parse().ok())
+                    .unwrap_or(320.0);
+                let vid_h: f32 = attributes.iter()
+                    .find(|(k, _)| k == "height")
+                    .and_then(|(_, v)| v.parse().ok())
+                    .unwrap_or(240.0);
+
+                let props = vec![
+                    ("background-color".into(), StyleValue::Str("#000".to_string())),
+                ];
+                let ctx = NodeContext {
+                    content: LayoutContent::Block,
+                    style: StyleMap { properties: props },
+                };
+                return taffy
+                    .new_leaf_with_context(
+                        Style {
+                            display: Display::Flex,
+                            size: Size {
+                                width: Dimension::Length(vid_w.min(available_width)),
+                                height: Dimension::Length(vid_h),
+                            },
+                            ..Style::DEFAULT
+                        },
+                        ctx,
+                    )
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+            }
+
+            // <audio> elements show a small gray bar placeholder.
+            if tag == "audio" {
+                let ctx = NodeContext {
+                    content: LayoutContent::Block,
+                    style: StyleMap { properties: vec![
+                        ("background-color".into(), StyleValue::Str("#f0f0f0".to_string())),
+                    ]},
+                };
+                return taffy
+                    .new_leaf_with_context(
+                        Style {
+                            display: Display::Flex,
+                            size: Size {
+                                width: Dimension::Length(300.0_f32.min(available_width)),
+                                height: Dimension::Length(54.0),
+                            },
+                            ..Style::DEFAULT
+                        },
+                        ctx,
+                    )
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+            }
+
             let display = resolve_display(tag, attributes);
 
             // display: none produces an invisible zero-size node.
@@ -1988,7 +2119,17 @@ fn parse_dimension(val: &str) -> Option<Dimension> {
     // Handle calc() expressions.
     if val.starts_with("calc(") {
         if let Some(inner) = val.strip_prefix("calc(").and_then(|s| s.strip_suffix(')')) {
-            if let Some(px) = mod_css_engine::values::eval_calc(inner, 0.0) {
+            // Try pure-px evaluation first (no percentage or viewport units).
+            if !inner.contains('%') && !inner.contains("vw") && !inner.contains("vh") {
+                if let Some(px) = mod_css_engine::values::eval_calc(inner, 0.0) {
+                    return Some(Dimension::Length(px));
+                }
+            }
+            // For mixed units (e.g. `100% - 20px`), evaluate with a reference
+            // width of 1280px as a reasonable default. A proper implementation
+            // would defer calc resolution to layout time when the parent width
+            // is known.
+            if let Some(px) = mod_css_engine::values::eval_calc(inner, 1280.0) {
                 return Some(Dimension::Length(px));
             }
         }

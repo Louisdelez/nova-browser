@@ -86,7 +86,10 @@ impl FontRenderer {
     /// variants if available. Returns `None` if the regular font is not found.
     fn new() -> Option<Self> {
         let regular_bytes = Self::find_font_bytes("DejaVuSans.ttf")?;
-        let settings = fontdue::FontSettings::default();
+        let settings = fontdue::FontSettings {
+            scale: 40.0, // hint at a common size for better hinting
+            ..fontdue::FontSettings::default()
+        };
         let regular = fontdue::Font::from_bytes(regular_bytes, settings).ok()?;
 
         let bold = Self::find_font_bytes("DejaVuSans-Bold.ttf")
@@ -255,7 +258,10 @@ impl Framebuffer {
         let size = (width * height * 4) as usize;
         let pixels = vec![255u8; size]; // White background
         let font_renderer = FontRenderer::new();
-        tracing::info!("Font renderer loaded: regular={}", font_renderer.is_some());
+        match &font_renderer {
+            Some(_) => tracing::info!("TTF font renderer loaded successfully"),
+            None => tracing::warn!("TTF font NOT found — using bitmap fallback"),
+        }
         Self {
             width,
             height,
@@ -380,22 +386,55 @@ impl Framebuffer {
     ///
     /// `coverage` is 0–255 (0 = fully transparent, 255 = fully opaque).
     /// The glyph colour is `color`, blended against the existing pixel.
+    ///
+    /// Uses gamma-correct compositing: the background is converted from sRGB
+    /// to linear space, the blend is performed in linear, and the result is
+    /// converted back to sRGB. This eliminates the dark fringing artefact that
+    /// naive alpha blending produces on light backgrounds.
     #[inline]
     fn blend_glyph_pixel(&mut self, x: i32, y: i32, coverage: u8, color: Color) {
-        if coverage == 0 {
+        if coverage == 0 || x < 0 || y < 0 {
             return;
         }
+        let ux = x as u32;
+        let uy = y as u32;
+        if ux >= self.width || uy >= self.height {
+            return;
+        }
+
+        let idx = ((uy * self.width + ux) * 4) as usize;
+        if idx + 3 >= self.pixels.len() {
+            return;
+        }
+
         let alpha = (coverage as f32 / 255.0) * color.a;
-        self.set_pixel(
-            x,
-            y,
-            Color {
-                r: color.r,
-                g: color.g,
-                b: color.b,
-                a: alpha,
-            },
-        );
+        if alpha <= 0.0 {
+            return;
+        }
+
+        // Read existing pixel (sRGB).
+        let bg_r = self.pixels[idx] as f32 / 255.0;
+        let bg_g = self.pixels[idx + 1] as f32 / 255.0;
+        let bg_b = self.pixels[idx + 2] as f32 / 255.0;
+
+        // Gamma-correct blending (approximate sRGB gamma = 2.2).
+        #[inline]
+        fn to_linear(v: f32) -> f32 {
+            v * v
+        } // simplified gamma
+        #[inline]
+        fn to_srgb(v: f32) -> f32 {
+            v.sqrt()
+        } // simplified inverse
+
+        let r = to_srgb(to_linear(color.r) * alpha + to_linear(bg_r) * (1.0 - alpha));
+        let g = to_srgb(to_linear(color.g) * alpha + to_linear(bg_g) * (1.0 - alpha));
+        let b = to_srgb(to_linear(color.b) * alpha + to_linear(bg_b) * (1.0 - alpha));
+
+        self.pixels[idx] = (r * 255.0).round().clamp(0.0, 255.0) as u8;
+        self.pixels[idx + 1] = (g * 255.0).round().clamp(0.0, 255.0) as u8;
+        self.pixels[idx + 2] = (b * 255.0).round().clamp(0.0, 255.0) as u8;
+        self.pixels[idx + 3] = 255;
     }
 
     /// Fill a rectangle.

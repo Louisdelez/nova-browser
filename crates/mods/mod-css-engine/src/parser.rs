@@ -253,6 +253,22 @@ fn preprocess_media_queries(
                     font_faces.push(FontFaceRule { family, src });
                 }
                 // @font-face is not passed to cssparser — it would be rejected anyway.
+            } else if name.eq_ignore_ascii_case("supports") {
+                // Read the condition until '{'.
+                let query_start = i;
+                while i < len && bytes[i] != b'{' {
+                    i += 1;
+                }
+                let condition = &css[query_start..i].trim();
+
+                let block_content = read_brace_block(css, &mut i);
+
+                // Evaluate the @supports condition.
+                // We support a simplified version: check if the property is one we know.
+                if evaluate_supports_condition(condition) {
+                    result.push_str(&block_content);
+                    result.push('\n');
+                }
             } else if name.eq_ignore_ascii_case("keyframes")
                 || name.eq_ignore_ascii_case("charset")
                 || name.eq_ignore_ascii_case("import")
@@ -284,6 +300,54 @@ fn preprocess_media_queries(
     }
 
     (result, font_faces)
+}
+
+/// Evaluate a simplified `@supports` condition.
+///
+/// Supports: `(property: value)`, `not (property: value)`,
+/// and `(prop: val) and (prop: val)` combinations.
+/// Returns `true` for properties we support, `false` for unknown ones.
+fn evaluate_supports_condition(condition: &str) -> bool {
+    let condition = condition.trim();
+
+    // Handle `not (...)`
+    if let Some(inner) = condition.strip_prefix("not").map(|s| s.trim()) {
+        return !evaluate_supports_single(inner);
+    }
+
+    // Handle `(prop: value) and (prop: value)`
+    // For simplicity, return true if ALL conditions pass.
+    let parts: Vec<&str> = condition.split(" and ").collect();
+    parts.iter().all(|p| evaluate_supports_single(p.trim()))
+}
+
+/// Evaluate a single `@supports` condition like `(display: flex)`.
+fn evaluate_supports_single(condition: &str) -> bool {
+    let inner = condition
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    if let Some(colon) = inner.find(':') {
+        let prop = inner[..colon].trim();
+        // We support most common CSS properties.
+        let supported = [
+            "display", "color", "background-color", "background", "margin", "padding",
+            "width", "height", "font-size", "font-weight", "font-style", "font-family",
+            "border", "border-radius", "box-shadow", "opacity", "transform", "transition",
+            "flex", "flex-direction", "flex-wrap", "align-items", "justify-content",
+            "grid", "grid-template-columns", "grid-template-rows", "gap",
+            "position", "top", "right", "bottom", "left", "z-index",
+            "overflow", "text-align", "text-decoration", "text-transform",
+            "max-width", "min-width", "max-height", "min-height",
+            "line-height", "letter-spacing", "word-break", "overflow-wrap",
+            "box-sizing", "cursor", "visibility", "white-space",
+        ];
+        supported.contains(&prop)
+    } else {
+        // Unknown condition format — assume supported.
+        true
+    }
 }
 
 /// Read a brace-balanced block from `css` starting at position `i` (which should

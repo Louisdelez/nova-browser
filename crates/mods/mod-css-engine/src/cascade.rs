@@ -212,7 +212,7 @@ fn apply_styles_recursive(
             children,
         } => {
             // Skip elements that are never visible — no need to compute styles.
-            if matches!(tag.as_str(), "script" | "style" | "template" | "noscript" | "svg" | "math") {
+            if matches!(tag.as_str(), "script" | "style" | "template" | "noscript") {
                 return DomNode::Element { tag, attributes, children };
             }
 
@@ -332,7 +332,7 @@ fn apply_styles_recursive_with_siblings(
             children,
         } => {
             // Skip elements that are never visible — no need to compute styles.
-            if matches!(tag.as_str(), "script" | "style" | "template" | "noscript" | "svg" | "math") {
+            if matches!(tag.as_str(), "script" | "style" | "template" | "noscript") {
                 return DomNode::Element { tag, attributes, children };
             }
 
@@ -948,6 +948,33 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
         }
         "text-decoration" => {
             // Pass through as-is; values like `underline`, `none`, `line-through` are used directly.
+            out.push(decl);
+        }
+        "transition" => {
+            // Parse: property duration timing-function delay
+            // Just extract transition-property and transition-duration for now.
+            let parts: Vec<&str> = decl.value.split(',').collect();
+            for part in &parts {
+                let tokens: Vec<&str> = part.trim().split_whitespace().collect();
+                if !tokens.is_empty() {
+                    out.push(CascadedDeclaration {
+                        property: "transition-property".into(),
+                        value: tokens[0].to_string(),
+                        specificity: decl.specificity,
+                        origin: decl.origin,
+                        important: decl.important,
+                    });
+                    if tokens.len() > 1 {
+                        out.push(CascadedDeclaration {
+                            property: "transition-duration".into(),
+                            value: tokens[1].to_string(),
+                            specificity: decl.specificity,
+                            origin: decl.origin,
+                            important: decl.important,
+                        });
+                    }
+                }
+            }
             out.push(decl);
         }
         "animation" => {

@@ -399,7 +399,8 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     }
 
     // Determine opacity factor for this box (1.0 = fully opaque).
-    let opacity = extract_opacity(&layout_box.style);
+    let (filter_opacity, css_filter) = extract_css_filter(&layout_box.style);
+    let opacity = extract_opacity(&layout_box.style) * filter_opacity;
 
     // Emit box-shadow before the background (painter's order: shadow → bg → content).
     if let Some((shadow_color, offset_x, offset_y, blur)) = extract_box_shadow(&layout_box.style) {
@@ -437,7 +438,11 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     }
 
     // Paint the background if this is not a text node.
-    let bg_color = multiply_alpha(extract_background_color(&layout_box.style), opacity);
+    let bg_color = if let Some(ref f) = css_filter {
+        apply_filter_to_color(multiply_alpha(extract_background_color(&layout_box.style), opacity), f)
+    } else {
+        multiply_alpha(extract_background_color(&layout_box.style), opacity)
+    };
     if bg_color.a > 0.0 {
         let radius = extract_border_radius(&layout_box.style, layout_box.width, layout_box.height);
         if radius.iter().any(|&r| r > 0.0) {
@@ -551,7 +556,10 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     if let LayoutContent::Text(ref text) = layout_box.content {
         if !text.is_empty() {
             let font_size = extract_font_size(&layout_box.style);
-            let text_color = multiply_alpha(extract_text_color(&layout_box.style), opacity);
+            let text_color = {
+                let c = multiply_alpha(extract_text_color(&layout_box.style), opacity);
+                if let Some(ref f) = css_filter { apply_filter_to_color(c, f) } else { c }
+            };
             let font_weight = extract_font_weight(&layout_box.style);
             let font_style = extract_font_style(&layout_box.style);
             let font_family = extract_font_family(&layout_box.style);
@@ -660,22 +668,26 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     let bh = layout_box.height;
     // Top border
     if let Some((w, color, ref style)) = borders.top {
-        let color = multiply_alpha(color, opacity);
+        let c = multiply_alpha(color, opacity);
+        let color = if let Some(ref f) = css_filter { apply_filter_to_color(c, f) } else { c };
         emit_border_ops(ops, bx, by, bw, w, color, style, true);
     }
     // Bottom border
     if let Some((w, color, ref style)) = borders.bottom {
-        let color = multiply_alpha(color, opacity);
+        let c = multiply_alpha(color, opacity);
+        let color = if let Some(ref f) = css_filter { apply_filter_to_color(c, f) } else { c };
         emit_border_ops(ops, bx, by + bh - w, bw, w, color, style, true);
     }
     // Left border
     if let Some((w, color, ref style)) = borders.left {
-        let color = multiply_alpha(color, opacity);
+        let c = multiply_alpha(color, opacity);
+        let color = if let Some(ref f) = css_filter { apply_filter_to_color(c, f) } else { c };
         emit_border_ops(ops, bx, by, w, bh, color, style, false);
     }
     // Right border
     if let Some((w, color, ref style)) = borders.right {
-        let color = multiply_alpha(color, opacity);
+        let c = multiply_alpha(color, opacity);
+        let color = if let Some(ref f) = css_filter { apply_filter_to_color(c, f) } else { c };
         emit_border_ops(ops, bx + bw - w, by, w, bh, color, style, false);
     }
 
@@ -690,6 +702,17 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                 url: href,
             });
         }
+    }
+
+    // Apply CSS clip-path: inset(...) if present.
+    let clip_path_inset = extract_clip_path(&layout_box.style);
+    if let Some((top, right, bottom, left)) = clip_path_inset {
+        ops.push(RenderOp::PushClip {
+            x: layout_box.x + left,
+            y: layout_box.y + top,
+            width: (layout_box.width - left - right).max(0.0),
+            height: (layout_box.height - top - bottom).max(0.0),
+        });
     }
 
     // Check whether this box clips its overflow.
@@ -737,6 +760,10 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     if is_scroll_container && content_height > layout_box.height {
         ops.push(RenderOp::ScrollContainerEnd);
     } else if clips_overflow {
+        ops.push(RenderOp::PopClip);
+    }
+
+    if clip_path_inset.is_some() {
         ops.push(RenderOp::PopClip);
     }
 
@@ -1890,6 +1917,142 @@ fn interpolate_gradient(stops: &[(f32, Color)], t: f32) -> Color {
         }
     }
     stops.last().unwrap().1
+}
+
+// ---------------------------------------------------------------------------
+// CSS filter support
+// ---------------------------------------------------------------------------
+
+/// Represents color transform effects from CSS `filter`.
+struct FilterEffect {
+    grayscale: bool,
+    brightness: f32,
+    invert: bool,
+}
+
+/// Extract CSS filter effects from style and return an opacity multiplier
+/// and color transform.
+fn extract_css_filter(style: &nova_mod_api::content::StyleMap) -> (f32, Option<FilterEffect>) {
+    for (key, value) in &style.properties {
+        if key == "filter" {
+            let s = match value {
+                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
+                _ => continue,
+            };
+            if s.trim() == "none" { return (1.0, None); }
+
+            let mut opacity_mult = 1.0_f32;
+            let mut grayscale = false;
+            let mut brightness = 1.0_f32;
+            let mut invert = false;
+
+            // Parse filter functions
+            let mut remaining = s;
+            while let Some(paren) = remaining.find('(') {
+                let func = remaining[..paren].trim();
+                let func = func.rsplit_once(|c: char| c.is_whitespace()).map(|(_, n)| n).unwrap_or(func);
+                let after = &remaining[paren + 1..];
+                let Some(close) = after.find(')') else { break };
+                let arg = &after[..close];
+                remaining = &after[close + 1..];
+
+                match func {
+                    "opacity" => {
+                        if let Some(v) = arg.trim().strip_suffix('%') {
+                            opacity_mult *= v.trim().parse::<f32>().unwrap_or(100.0) / 100.0;
+                        } else if let Ok(v) = arg.trim().parse::<f32>() {
+                            opacity_mult *= v;
+                        }
+                    }
+                    "brightness" => {
+                        if let Some(v) = arg.trim().strip_suffix('%') {
+                            brightness = v.trim().parse::<f32>().unwrap_or(100.0) / 100.0;
+                        } else if let Ok(v) = arg.trim().parse::<f32>() {
+                            brightness = v;
+                        }
+                    }
+                    "grayscale" => {
+                        if let Some(v) = arg.trim().strip_suffix('%') {
+                            if v.trim().parse::<f32>().unwrap_or(0.0) > 50.0 { grayscale = true; }
+                        } else if let Ok(v) = arg.trim().parse::<f32>() {
+                            if v > 0.5 { grayscale = true; }
+                        }
+                    }
+                    "invert" => {
+                        if let Some(v) = arg.trim().strip_suffix('%') {
+                            if v.trim().parse::<f32>().unwrap_or(0.0) > 50.0 { invert = true; }
+                        } else if let Ok(v) = arg.trim().parse::<f32>() {
+                            if v > 0.5 { invert = true; }
+                        }
+                    }
+                    _ => {} // blur, drop-shadow, etc. — skip for now
+                }
+            }
+
+            let effect = if grayscale || brightness != 1.0 || invert {
+                Some(FilterEffect { grayscale, brightness, invert })
+            } else {
+                None
+            };
+            return (opacity_mult, effect);
+        }
+    }
+    (1.0, None)
+}
+
+/// Apply a `FilterEffect` to a color (invert, brightness, grayscale).
+fn apply_filter_to_color(color: Color, filter: &FilterEffect) -> Color {
+    let mut r = color.r;
+    let mut g = color.g;
+    let mut b = color.b;
+
+    if filter.invert {
+        r = 1.0 - r;
+        g = 1.0 - g;
+        b = 1.0 - b;
+    }
+
+    r *= filter.brightness;
+    g *= filter.brightness;
+    b *= filter.brightness;
+
+    if filter.grayscale {
+        let gray = r * 0.299 + g * 0.587 + b * 0.114;
+        r = gray;
+        g = gray;
+        b = gray;
+    }
+
+    Color::rgba(r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0), color.a)
+}
+
+// ---------------------------------------------------------------------------
+// CSS clip-path support
+// ---------------------------------------------------------------------------
+
+/// Extract a `clip-path: inset(...)` value and return `(top, right, bottom, left)` insets in px.
+fn extract_clip_path(style: &nova_mod_api::content::StyleMap) -> Option<(f32, f32, f32, f32)> {
+    for (key, value) in &style.properties {
+        if key == "clip-path" {
+            let s = match value {
+                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
+                _ => continue,
+            };
+            if let Some(inner) = s.strip_prefix("inset(").and_then(|s| s.strip_suffix(')')) {
+                let parts: Vec<f32> = inner.split_whitespace()
+                    .filter_map(|p| p.strip_suffix("px").and_then(|n| n.parse().ok())
+                        .or_else(|| p.parse().ok()))
+                    .collect();
+                match parts.len() {
+                    1 => return Some((parts[0], parts[0], parts[0], parts[0])),
+                    2 => return Some((parts[0], parts[1], parts[0], parts[1])),
+                    4 => return Some((parts[0], parts[1], parts[2], parts[3])),
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

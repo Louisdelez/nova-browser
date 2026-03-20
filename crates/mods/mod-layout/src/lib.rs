@@ -817,14 +817,65 @@ fn build_children_with_ifc(
             )?;
             result.extend(line_ids);
         } else {
-            // Block child — process normally.
+            // Block child — process normally, with margin collapsing.
             let node_id = add_node(taffy, &children[i], available_width, parent_font_size, parent_style_props)?;
+
+            // Margin collapsing: if the previous child was also a block,
+            // reduce the current child's top margin to simulate CSS margin collapse.
+            if let DomNode::Element { attributes, .. } = &children[i] {
+                if !result.is_empty() {
+                    collapse_margin_with_previous(taffy, &result, node_id, attributes);
+                }
+            }
+
             result.push(node_id);
             i += 1;
         }
     }
 
     Ok(result)
+}
+
+/// Collapse vertical margins between adjacent block children.
+///
+/// In CSS, adjacent vertical margins collapse: instead of adding both margins,
+/// the space between the blocks is `max(margin_bottom_prev, margin_top_current)`.
+/// Since Taffy doesn't collapse margins, we simulate this by adjusting the
+/// current node's top margin.
+fn collapse_margin_with_previous(
+    taffy: &mut TaffyTree<NodeContext>,
+    previous_ids: &[NodeId],
+    current_id: NodeId,
+    _attributes: &[(String, String)],
+) {
+    let prev_id = *previous_ids.last().unwrap();
+
+    // Get the previous node's bottom margin.
+    let prev_style = taffy.style(prev_id).cloned();
+    let curr_style = taffy.style(current_id).cloned();
+
+    if let (Ok(prev_s), Ok(curr_s)) = (prev_style, curr_style) {
+        let prev_bottom = match prev_s.margin.bottom {
+            LengthPercentageAuto::Length(px) => px,
+            _ => 0.0,
+        };
+        let curr_top = match curr_s.margin.top {
+            LengthPercentageAuto::Length(px) => px,
+            _ => 0.0,
+        };
+
+        if prev_bottom > 0.0 && curr_top > 0.0 {
+            // Collapse: the gap should be max(prev_bottom, curr_top), not their sum.
+            // We reduce the current node's top margin by the overlap.
+            let collapsed = prev_bottom.max(curr_top);
+            let overlap = (prev_bottom + curr_top) - collapsed;
+            let new_top = (curr_top - overlap).max(0.0);
+
+            let mut new_style = curr_s;
+            new_style.margin.top = LengthPercentageAuto::Length(new_top);
+            let _ = taffy.set_style(current_id, new_style);
+        }
+    }
 }
 
 /// Flatten an inline run (consecutive inline children) into InlineItems.

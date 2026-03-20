@@ -352,19 +352,31 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         });
     }
 
-    // Paint CSS borders if border-style is set.
-    if let Some((border_width, border_color)) = extract_border(&layout_box.style) {
-        if border_width > 0.0 {
-            let border_color = multiply_alpha(border_color, opacity);
-            ops.push(RenderOp::StrokeRect {
-                x: layout_box.x,
-                y: layout_box.y,
-                width: layout_box.width,
-                height: layout_box.height,
-                color: border_color,
-                width_px: border_width,
-            });
-        }
+    // Paint CSS borders — supports per-side or shorthand borders.
+    let borders = extract_borders_per_side(&layout_box.style);
+    let bx = layout_box.x;
+    let by = layout_box.y;
+    let bw = layout_box.width;
+    let bh = layout_box.height;
+    // Top border
+    if let Some((w, color)) = borders.top {
+        let color = multiply_alpha(color, opacity);
+        ops.push(RenderOp::FillRect { x: bx, y: by, width: bw, height: w, color });
+    }
+    // Bottom border
+    if let Some((w, color)) = borders.bottom {
+        let color = multiply_alpha(color, opacity);
+        ops.push(RenderOp::FillRect { x: bx, y: by + bh - w, width: bw, height: w, color });
+    }
+    // Left border
+    if let Some((w, color)) = borders.left {
+        let color = multiply_alpha(color, opacity);
+        ops.push(RenderOp::FillRect { x: bx, y: by, width: w, height: bh, color });
+    }
+    // Right border
+    if let Some((w, color)) = borders.right {
+        let color = multiply_alpha(color, opacity);
+        ops.push(RenderOp::FillRect { x: bx + bw - w, y: by, width: w, height: bh, color });
     }
 
     // Emit a Link op if this box has an href (i.e., it is an <a> element).
@@ -879,51 +891,80 @@ fn extract_font_family(style: &nova_mod_api::content::StyleMap) -> Option<String
     None
 }
 
-/// Extract CSS border properties (width, color) from a style map.
-///
-/// Returns `Some((width_px, color))` if a visible border is declared.
-fn extract_border(style: &nova_mod_api::content::StyleMap) -> Option<(f32, Color)> {
-    let mut border_style: Option<String> = None;
-    let mut border_width: Option<f32> = None;
-    let mut border_color: Option<Color> = None;
+/// Per-side border info.
+struct BorderSides {
+    top: Option<(f32, Color)>,
+    right: Option<(f32, Color)>,
+    bottom: Option<(f32, Color)>,
+    left: Option<(f32, Color)>,
+}
+
+/// Extract per-side CSS border properties from a style map.
+fn extract_borders_per_side(style: &nova_mod_api::content::StyleMap) -> BorderSides {
+    // Shorthand defaults.
+    let mut sh_style: Option<String> = None;
+    let mut sh_width: Option<f32> = None;
+    let mut sh_color: Option<Color> = None;
+
+    // Per-side overrides.
+    let mut side_style: [Option<String>; 4] = [None, None, None, None]; // top, right, bottom, left
+    let mut side_width: [Option<f32>; 4] = [None; 4];
+    let mut side_color: [Option<Color>; 4] = [None; 4];
 
     for (key, value) in &style.properties {
-        match key.as_str() {
-            "border-style" | "border-top-style" => {
-                if let StyleValue::Keyword(k) | StyleValue::Str(k) = value {
-                    if border_style.is_none() {
-                        border_style = Some(k.clone());
-                    }
-                }
-            }
-            "border-width" | "border-top-width" => {
-                if border_width.is_none() {
-                    match value {
-                        StyleValue::Px(px) => border_width = Some(*px),
-                        StyleValue::Str(s) | StyleValue::Keyword(s) => {
-                            border_width = parse_length_px(s);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            "border-color" | "border-top-color" => {
-                if border_color.is_none() {
-                    border_color = style_value_to_color(value);
-                }
-            }
-            _ => {}
+        let (target_style, target_width, target_color) = match key.as_str() {
+            "border-style" => { sh_style = extract_keyword(value); continue; }
+            "border-width" => { sh_width = extract_px_value(value); continue; }
+            "border-color" => { sh_color = style_value_to_color(value); continue; }
+            "border-top-style" => (&mut side_style[0], &mut side_width[0], &mut side_color[0]),
+            "border-right-style" => (&mut side_style[1], &mut side_width[1], &mut side_color[1]),
+            "border-bottom-style" => (&mut side_style[2], &mut side_width[2], &mut side_color[2]),
+            "border-left-style" => (&mut side_style[3], &mut side_width[3], &mut side_color[3]),
+            "border-top-width" => { side_width[0] = extract_px_value(value); continue; }
+            "border-right-width" => { side_width[1] = extract_px_value(value); continue; }
+            "border-bottom-width" => { side_width[2] = extract_px_value(value); continue; }
+            "border-left-width" => { side_width[3] = extract_px_value(value); continue; }
+            "border-top-color" => { side_color[0] = style_value_to_color(value); continue; }
+            "border-right-color" => { side_color[1] = style_value_to_color(value); continue; }
+            "border-bottom-color" => { side_color[2] = style_value_to_color(value); continue; }
+            "border-left-color" => { side_color[3] = style_value_to_color(value); continue; }
+            _ => continue,
+        };
+        *target_style = extract_keyword(value);
+        let _ = (target_width, target_color); // suppress unused
+    }
+
+    let make_side = |i: usize| -> Option<(f32, Color)> {
+        let style_val = side_style[i].as_deref().or(sh_style.as_deref()).unwrap_or("none");
+        if style_val == "none" || style_val == "hidden" {
+            return None;
         }
-    }
+        let w = side_width[i].or(sh_width).unwrap_or(1.0);
+        let c = side_color[i].or(sh_color).unwrap_or(Color::BLACK);
+        if w > 0.0 { Some((w, c)) } else { None }
+    };
 
-    let style_val = border_style.as_deref().unwrap_or("none");
-    if style_val == "none" || style_val == "hidden" {
-        return None;
+    BorderSides {
+        top: make_side(0),
+        right: make_side(1),
+        bottom: make_side(2),
+        left: make_side(3),
     }
+}
 
-    let width = border_width.unwrap_or(1.0);
-    let color = border_color.unwrap_or(Color::BLACK);
-    Some((width, color))
+fn extract_keyword(value: &StyleValue) -> Option<String> {
+    match value {
+        StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.clone()),
+        _ => None,
+    }
+}
+
+fn extract_px_value(value: &StyleValue) -> Option<f32> {
+    match value {
+        StyleValue::Px(px) => Some(*px),
+        StyleValue::Str(s) | StyleValue::Keyword(s) => parse_length_px(s),
+        _ => None,
+    }
 }
 
 /// Extract form field info from style props (set by mod-layout for form elements).

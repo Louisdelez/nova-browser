@@ -412,10 +412,17 @@ fn compute_element_style_impl(
         "font-family",
         "text-align",
         "text-decoration",
+        "text-transform",
+        "text-indent",
         "line-height",
+        "letter-spacing",
+        "word-spacing",
         "white-space",
         "visibility",
+        "cursor",
+        "direction",
         "list-style-type",
+        "list-style-position",
     ];
 
     // Track which inherited properties we've already found (from a closer
@@ -519,6 +526,34 @@ fn compute_element_style_impl(
             final_props.push((decl.property, decl.value));
         }
     }
+
+    // 6b. Resolve `inherit`, `initial`, and `unset` keywords.
+    for (prop, val) in &mut final_props {
+        let trimmed = val.trim();
+        match trimmed {
+            "inherit" => {
+                // Look up the property value from the nearest ancestor.
+                let inherited = find_inherited_value(prop, ancestors);
+                *val = inherited.unwrap_or_default();
+            }
+            "initial" => {
+                // Reset to the CSS initial value (remove the property — UA default will apply).
+                *val = String::new();
+            }
+            "unset" => {
+                // For inherited properties, behave like `inherit`; for others, like `initial`.
+                if INHERITED_PROPERTIES.contains(&prop.as_str()) {
+                    let inherited = find_inherited_value(prop, ancestors);
+                    *val = inherited.unwrap_or_default();
+                } else {
+                    *val = String::new();
+                }
+            }
+            _ => {}
+        }
+    }
+    // Remove properties that were reset to empty (from `initial`).
+    final_props.retain(|(_, v)| !v.is_empty());
 
     // 7. Resolve CSS custom properties (var()).
     // Collect custom properties (--*) from ancestors and this element.
@@ -1028,6 +1063,26 @@ fn pseudo_element_content(
 }
 
 /// Convert a `StyleValue` to a CSS string representation.
+/// Find the inherited value of a CSS property by looking up ancestor styles.
+fn find_inherited_value(property: &str, ancestors: &[&DomNode]) -> Option<String> {
+    for ancestor in ancestors.iter().rev() {
+        if let DomNode::Element { attributes, .. } = ancestor {
+            if let Some(style_str) = attributes.iter().find(|(k, _)| k == "data-nova-style") {
+                for decl in style_str.1.split(';') {
+                    let parts: Vec<&str> = decl.splitn(2, ':').collect();
+                    if parts.len() == 2 && parts[0].trim() == property {
+                        let val = parts[1].trim();
+                        if !val.is_empty() && val != "inherit" && val != "initial" && val != "unset" {
+                            return Some(val.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn style_value_to_css(val: &nova_mod_api::content::StyleValue) -> String {
     use nova_mod_api::content::StyleValue;
     match val {

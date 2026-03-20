@@ -977,7 +977,7 @@ fn build_taffy_style(
         "inline" => Style {
             display: Display::Flex,
             flex_direction: FlexDirection::Row,
-            flex_wrap: FlexWrap::Wrap,
+            flex_wrap: FlexWrap::NoWrap,
             size: Size {
                 width: lp.width.unwrap_or(Dimension::Auto),
                 height: Dimension::Auto,

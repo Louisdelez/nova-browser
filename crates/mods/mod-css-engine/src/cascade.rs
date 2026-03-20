@@ -185,7 +185,11 @@ fn compute_element_style(
 ) -> String {
     let mut declarations: Vec<CascadedDeclaration> = Vec::new();
 
-    // 1. User-agent defaults.
+    // 0. CSS inheritance FIRST (lowest priority — everything else overrides).
+    // Inheritable properties propagate down the tree unless explicitly overridden.
+    inherit_from_ancestors(ancestors, &mut declarations);
+
+    // 1. User-agent defaults (override inherited values for this specific tag).
     let ua_style = default_style_for_tag(tag);
     for (prop, val) in &ua_style.properties {
         let value_str = style_value_to_css(val);
@@ -197,8 +201,7 @@ fn compute_element_style(
         });
     }
 
-    // 1b. Deprecated HTML presentational attributes (lowest precedence).
-    // These map old HTML attributes to CSS equivalents.
+    // 1b. Deprecated HTML presentational attributes.
     convert_presentational_attributes(attributes, &mut declarations);
 
     // 2. Stylesheet rules (sorted by specificity).
@@ -393,6 +396,73 @@ fn style_value_to_css(val: &nova_mod_api::content::StyleValue) -> String {
         }
         StyleValue::Str(s) => s.clone(),
         StyleValue::Number(n) => format!("{n}"),
+    }
+}
+
+/// CSS properties that are inherited by default (per CSS spec).
+const INHERITED_PROPERTIES: &[&str] = &[
+    "color",
+    "font-family",
+    "font-size",
+    "font-weight",
+    "font-style",
+    "line-height",
+    "text-align",
+    "text-decoration",
+    "text-transform",
+    "letter-spacing",
+    "word-spacing",
+    "white-space",
+    "visibility",
+    "cursor",
+    "direction",
+    "list-style",
+    "list-style-type",
+];
+
+/// Inherit CSS properties from ancestor elements.
+///
+/// Walks the ancestor chain (nearest first) and collects inherited properties
+/// from their `data-nova-style` attributes. These are added at UA priority
+/// so any explicit declaration on the current element will override them.
+fn inherit_from_ancestors(
+    ancestors: &[&DomNode],
+    declarations: &mut Vec<CascadedDeclaration>,
+) {
+    // Walk ancestors from nearest to farthest.
+    for ancestor in ancestors.iter().rev() {
+        if let DomNode::Element { attributes, .. } = ancestor {
+            if let Some(style_attr) = attributes.iter().find(|(k, _)| k == "data-nova-style") {
+                for decl in style_attr.1.split(';') {
+                    let parts: Vec<&str> = decl.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        let prop = parts[0].trim();
+                        let val = parts[1].trim();
+                        // Only inherit if this property is inheritable.
+                        if INHERITED_PROPERTIES.contains(&prop) {
+                            // Only add if not already declared (don't override
+                            // UA defaults that are more specific to this element).
+                            let already_set = declarations
+                                .iter()
+                                .any(|d| d.property == prop && d.origin >= CascadeOrigin::UserAgent);
+                            // For inherited properties, we want to ADD them even if
+                            // there's a UA default, because the ancestor's value
+                            // should win over the generic UA default.
+                            // We use a special "inherited" specificity that beats UA
+                            // defaults but loses to author stylesheets and inline.
+                            if !already_set {
+                                declarations.push(CascadedDeclaration {
+                                    property: prop.to_string(),
+                                    value: val.to_string(),
+                                    specificity: Specificity(0, 0, 0),
+                                    origin: CascadeOrigin::UserAgent,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

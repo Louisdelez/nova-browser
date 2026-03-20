@@ -1695,6 +1695,11 @@ fn layout_inline_run(
                         // Only attach segment data when styles actually differ;
                         // single-style lines skip the overhead.
                         if !all_same_style && !segment_data.is_empty() {
+                            debug!(
+                                segments = %segment_data.join(";"),
+                                text = %run_text,
+                                "IFC: attaching nova-text-segments for multi-style line"
+                            );
                             props.push(("nova-text-segments".into(), StyleValue::Str(segment_data.join(";"))));
                         }
 

@@ -259,6 +259,10 @@ pub struct Framebuffer {
     pub height: u32,
     /// RGBA pixel data, row-major, 4 bytes per pixel.
     pub pixels: Vec<u8>,
+    /// Whether the pixel data has changed since the last GPU upload.
+    /// Set to `true` when any rendering modifies the pixels;
+    /// set to `false` after the data has been uploaded to the GPU texture.
+    pub dirty: bool,
     /// Optional fontdue-based renderer (None when no font file is available).
     font_renderer: Option<FontRenderer>,
     /// Stack of clip rectangles. Rendering is restricted to the intersection of
@@ -281,6 +285,7 @@ impl Framebuffer {
             width,
             height,
             pixels,
+            dirty: true,
             font_renderer,
             clip_stack: Vec::new(),
             translate_y_offset: 0.0,
@@ -295,6 +300,7 @@ impl Framebuffer {
         let size = (width * height * 4) as usize;
         self.pixels.resize(size, 255);
         self.pixels.fill(255);
+        self.dirty = true;
     }
 
     /// Load custom `@font-face` fonts into the font renderer.

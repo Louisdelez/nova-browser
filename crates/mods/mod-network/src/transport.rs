@@ -61,7 +61,19 @@ pub async fn connect(host: &str, port: u16, use_tls: bool) -> Result<Transport, 
         let tls_stream = connector
             .connect(server_name, tcp)
             .await
-            .map_err(|e| NovaError::TlsError(format!("TLS handshake with {host} failed: {e}")))?;
+            .map_err(|e| {
+                let detail = format!("{e}");
+                let hint = if detail.contains("CertificateRequired") || detail.contains("certificate") {
+                    " The site's SSL certificate could not be verified. It may be expired, self-signed, or issued by an untrusted authority."
+                } else if detail.contains("HandshakeFailure") {
+                    " The server rejected the TLS handshake. It may not support modern TLS versions."
+                } else {
+                    ""
+                };
+                NovaError::TlsError(format!(
+                    "Certificate error for {host}: {detail}.{hint}"
+                ))
+            })?;
 
         Ok(Transport::Tls(tls_stream))
     } else {

@@ -668,6 +668,30 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         });
     }
 
+    // Render iframe placeholder.
+    if let Some(iframe_src) = layout_box.style.properties.iter()
+        .find(|(k, _)| k == "nova-iframe-src")
+        .and_then(|(_, v)| if let StyleValue::Str(s) = v { Some(s.as_str()) } else { None })
+    {
+        let font_size = 11.0;
+        let label = if iframe_src.len() > 60 {
+            format!("[iframe: {}...]", &iframe_src[..57])
+        } else {
+            format!("[iframe: {iframe_src}]")
+        };
+        ops.push(RenderOp::DrawText {
+            x: layout_box.x + 4.0,
+            y: layout_box.y + font_size + 2.0,
+            text: label,
+            font_size,
+            color: Color::rgb(0.5, 0.5, 0.5),
+            font_weight: None,
+            font_style: Some("italic".to_string()),
+            font_family: None,
+            letter_spacing: None,
+        });
+    }
+
     // Paint CSS borders — supports per-side or shorthand borders.
     let borders = extract_borders_per_side(&layout_box.style);
     let bx = layout_box.x;

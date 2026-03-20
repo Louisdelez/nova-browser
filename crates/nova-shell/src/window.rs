@@ -110,6 +110,11 @@ struct GpuState {
     blit_pipeline: wgpu::RenderPipeline,
     blit_bind_group_layout: wgpu::BindGroupLayout,
     blit_sampler: wgpu::Sampler,
+    /// Cached framebuffer texture — reused across frames to avoid re-creating
+    /// the GPU texture every frame. Re-created only when the framebuffer size changes.
+    cached_fb_texture: Option<wgpu::Texture>,
+    /// Cached bind group corresponding to `cached_fb_texture`.
+    cached_bind_group: Option<wgpu::BindGroup>,
 }
 
 /// The browser window application.
@@ -526,6 +531,8 @@ impl BrowserWindow {
             blit_pipeline: pipeline,
             blit_bind_group_layout: bind_group_layout,
             blit_sampler: sampler,
+            cached_fb_texture: None,
+            cached_bind_group: None,
         });
 
         info!("GPU initialized, surface format: {:?}", format);
@@ -673,8 +680,12 @@ impl BrowserWindow {
     }
 
     /// Upload the framebuffer to GPU and render it.
-    fn render_frame(&self) {
-        let gpu = match &self.gpu {
+    ///
+    /// Uses a cached GPU texture to avoid re-creating it every frame.
+    /// The pixel data is only re-uploaded when the framebuffer's `dirty` flag
+    /// is set (i.e. when the software renderer has produced new content).
+    fn render_frame(&mut self) {
+        let gpu = match &mut self.gpu {
             Some(g) => g,
             None => return,
         };
@@ -691,38 +702,41 @@ impl BrowserWindow {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Create a texture from the framebuffer.
-        let fb_texture = gpu.device.create_texture_with_data(
-            &gpu.queue,
-            &wgpu::TextureDescriptor {
+        let fb_width = self.framebuffer.width;
+        let fb_height = self.framebuffer.height;
+        let texture_size = wgpu::Extent3d {
+            width: fb_width,
+            height: fb_height,
+            depth_or_array_layers: 1,
+        };
+
+        // Check whether the cached texture needs to be (re-)created.
+        // This happens on the first frame or when the framebuffer size changes.
+        let needs_new_texture = match &gpu.cached_fb_texture {
+            Some(tex) => tex.width() != fb_width || tex.height() != fb_height,
+            None => true,
+        };
+
+        if needs_new_texture {
+            let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("framebuffer-texture"),
-                size: wgpu::Extent3d {
-                    width: self.framebuffer.width,
-                    height: self.framebuffer.height,
-                    depth_or_array_layers: 1,
-                },
+                size: texture_size,
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            &self.framebuffer.pixels,
-        );
+            });
 
-        let fb_view = fb_texture.create_view(&Default::default());
-
-        let bind_group = gpu
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
+            let tex_view = tex.create_view(&Default::default());
+            let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("blit-bind-group"),
                 layout: &gpu.blit_bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&fb_view),
+                        resource: wgpu::BindingResource::TextureView(&tex_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -730,6 +744,31 @@ impl BrowserWindow {
                     },
                 ],
             });
+
+            gpu.cached_fb_texture = Some(tex);
+            gpu.cached_bind_group = Some(bind_group);
+            // Force upload since we have a brand-new texture.
+            self.framebuffer.dirty = true;
+        }
+
+        // Only re-upload pixel data when the framebuffer content has changed.
+        if self.framebuffer.dirty {
+            if let Some(tex) = &gpu.cached_fb_texture {
+                gpu.queue.write_texture(
+                    tex.as_image_copy(),
+                    &self.framebuffer.pixels,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(fb_width * 4),
+                        rows_per_image: Some(fb_height),
+                    },
+                    texture_size,
+                );
+            }
+            self.framebuffer.dirty = false;
+        }
+
+        let bind_group = gpu.cached_bind_group.as_ref().unwrap();
 
         let mut encoder =
             gpu.device
@@ -752,7 +791,7 @@ impl BrowserWindow {
             });
 
             pass.set_pipeline(&gpu.blit_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..6, 0..1); // fullscreen quad = 2 triangles = 6 vertices
         }
 

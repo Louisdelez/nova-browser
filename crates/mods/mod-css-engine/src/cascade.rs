@@ -20,6 +20,9 @@ use crate::values;
 /// so we can skip re-evaluating all rules for them.
 type StyleCache = RefCell<HashMap<(String, String, String), String>>;
 
+/// Map from animation name to the "to" (100%) keyframe declarations (property, value).
+type KeyframesMap = HashMap<String, Vec<(String, String)>>;
+
 // ── Rule index for fast selector pre-filtering ────────────────────────
 
 /// Pre-sorted index of CSS rules for fast selector matching.
@@ -169,18 +172,40 @@ pub fn compute_styles(dom: DomNode, extra_css: &[String], viewport_width: f32) -
     // 1. Extract embedded stylesheets.
     let embedded = extract_stylesheets(&dom);
 
-    // 2. Parse all stylesheets.
+    // 2. Parse all stylesheets (full parse to also extract @keyframes).
     let mut rules = Vec::new();
+    let mut keyframes_map: KeyframesMap = HashMap::new();
     for css in &embedded {
-        rules.extend(parser::parse_stylesheet(css, viewport_width));
+        let sheet = parser::parse_stylesheet_full(css, viewport_width);
+        rules.extend(sheet.rules);
+        for kf in sheet.keyframes {
+            let final_decls: Vec<(String, String)> = kf.keyframes.iter()
+                .filter(|(pct, _)| *pct >= 0.99) // "to" = 1.0
+                .flat_map(|(_, decls)| decls.iter().map(|d| (d.property.clone(), d.value.clone())))
+                .collect();
+            if !final_decls.is_empty() {
+                keyframes_map.insert(kf.name.clone(), final_decls);
+            }
+        }
     }
     for css in extra_css {
-        rules.extend(parser::parse_stylesheet(css, viewport_width));
+        let sheet = parser::parse_stylesheet_full(css, viewport_width);
+        rules.extend(sheet.rules);
+        for kf in sheet.keyframes {
+            let final_decls: Vec<(String, String)> = kf.keyframes.iter()
+                .filter(|(pct, _)| *pct >= 0.99)
+                .flat_map(|(_, decls)| decls.iter().map(|d| (d.property.clone(), d.value.clone())))
+                .collect();
+            if !final_decls.is_empty() {
+                keyframes_map.insert(kf.name.clone(), final_decls);
+            }
+        }
     }
 
     tracing::info!(
         embedded_count = embedded.len(),
         rule_count = rules.len(),
+        keyframes_count = keyframes_map.len(),
         "parsed CSS rules for style computation"
     );
 
@@ -194,7 +219,7 @@ pub fn compute_styles(dom: DomNode, extra_css: &[String], viewport_width: f32) -
 
     // 5. Walk DOM and apply styles.
     let ancestors: Vec<&DomNode> = Vec::new();
-    apply_styles_recursive(dom, &rules, &index, &ancestors, &cache)
+    apply_styles_recursive(dom, &rules, &index, &ancestors, &cache, &keyframes_map)
 }
 
 /// Recursively apply styles to a DOM node.
@@ -204,6 +229,7 @@ fn apply_styles_recursive(
     index: &RuleIndex,
     ancestors: &[&DomNode],
     cache: &StyleCache,
+    keyframes: &KeyframesMap,
 ) -> DomNode {
     match node {
         DomNode::Element {
@@ -224,7 +250,7 @@ fn apply_styles_recursive(
             };
 
             // Compute styles for this element.
-            let style_str = compute_element_style(&tag, &attributes, &temp_node, rules, index, ancestors, cache);
+            let style_str = compute_element_style(&tag, &attributes, &temp_node, rules, index, ancestors, cache, keyframes);
 
             // Build new attributes with data-nova-style.
             let mut new_attributes = attributes;
@@ -249,7 +275,7 @@ fn apply_styles_recursive(
             let this_ref: &DomNode = &this_node;
             new_ancestors.push(this_ref);
 
-            let mut new_children = apply_styles_to_children(children, rules, index, &new_ancestors, cache);
+            let mut new_children = apply_styles_to_children(children, rules, index, &new_ancestors, cache, keyframes);
 
             // Inject ::before and ::after pseudo-element text nodes when a CSS
             // rule targets this element with `::before` or `::after` and
@@ -282,7 +308,7 @@ fn apply_styles_recursive(
             }
         }
         DomNode::Document { children } => {
-            let new_children = apply_styles_to_children(children, rules, index, ancestors, cache);
+            let new_children = apply_styles_to_children(children, rules, index, ancestors, cache, keyframes);
             DomNode::Document {
                 children: new_children,
             }
@@ -299,6 +325,7 @@ fn apply_styles_to_children(
     index: &RuleIndex,
     ancestors: &[&DomNode],
     cache: &StyleCache,
+    keyframes: &KeyframesMap,
 ) -> Vec<DomNode> {
     let len = children.len();
     let mut result = Vec::with_capacity(len);
@@ -310,7 +337,7 @@ fn apply_styles_to_children(
             index: i,
         };
         let child = children_vec[i].clone();
-        result.push(apply_styles_recursive_with_siblings(child, rules, index, ancestors, Some(sib_ctx), cache));
+        result.push(apply_styles_recursive_with_siblings(child, rules, index, ancestors, Some(sib_ctx), cache, keyframes));
     }
 
     result
@@ -324,6 +351,7 @@ fn apply_styles_recursive_with_siblings(
     ancestors: &[&DomNode],
     siblings: Option<SiblingContext<'_>>,
     cache: &StyleCache,
+    keyframes: &KeyframesMap,
 ) -> DomNode {
     match node {
         DomNode::Element {
@@ -371,7 +399,7 @@ fn apply_styles_recursive_with_siblings(
             };
 
             let style_str = compute_element_style_with_siblings(
-                &tag, &attributes, &temp_node, rules, index, ancestors, siblings, cache,
+                &tag, &attributes, &temp_node, rules, index, ancestors, siblings, cache, keyframes,
             );
 
             let mut new_attributes = attributes;
@@ -390,7 +418,7 @@ fn apply_styles_recursive_with_siblings(
             let this_ref: &DomNode = &this_node;
             new_ancestors.push(this_ref);
 
-            let mut new_children = apply_styles_to_children(children, rules, index, &new_ancestors, cache);
+            let mut new_children = apply_styles_to_children(children, rules, index, &new_ancestors, cache, keyframes);
 
             if let Some(before_text) = pseudo_element_content(
                 &tag, &new_attributes, &this_node, rules, ancestors, PseudoElement::Before,
@@ -410,7 +438,7 @@ fn apply_styles_recursive_with_siblings(
             }
         }
         DomNode::Document { children } => {
-            let new_children = apply_styles_to_children(children, rules, index, ancestors, cache);
+            let new_children = apply_styles_to_children(children, rules, index, ancestors, cache, keyframes);
             DomNode::Document { children: new_children }
         }
         other => other,
@@ -427,8 +455,9 @@ fn compute_element_style_with_siblings(
     ancestors: &[&DomNode],
     siblings: Option<SiblingContext<'_>>,
     cache: &StyleCache,
+    keyframes: &KeyframesMap,
 ) -> String {
-    compute_element_style_impl(tag, attributes, node, rules, index, ancestors, siblings, cache)
+    compute_element_style_impl(tag, attributes, node, rules, index, ancestors, siblings, cache, keyframes)
 }
 
 fn compute_element_style(
@@ -439,8 +468,9 @@ fn compute_element_style(
     index: &RuleIndex,
     ancestors: &[&DomNode],
     cache: &StyleCache,
+    keyframes: &KeyframesMap,
 ) -> String {
-    compute_element_style_impl(tag, attributes, node, rules, index, ancestors, None, cache)
+    compute_element_style_impl(tag, attributes, node, rules, index, ancestors, None, cache, keyframes)
 }
 
 /// Internal implementation that supports optional sibling context.
@@ -453,6 +483,7 @@ fn compute_element_style_impl(
     ancestors: &[&DomNode],
     siblings: Option<SiblingContext<'_>>,
     cache: &StyleCache,
+    keyframes: &KeyframesMap,
 ) -> String {
     // Check cache: elements with the same (tag, class, id) and no inline style
     // will produce the same cascade result (modulo inheritance, which is an
@@ -597,6 +628,21 @@ fn compute_element_style_impl(
             existing.1 = decl.value;
         } else {
             final_props.push((decl.property, decl.value));
+        }
+    }
+
+    // 6a. Apply animation end-state: if the element has animation-name, apply
+    // the "to" keyframe declarations as if the animation completed instantly.
+    if let Some(anim_name) = final_props.iter().find(|(p, _)| p == "animation-name").map(|(_, v)| v.clone()) {
+        let anim_name = anim_name.trim().trim_matches('"').trim_matches('\'').to_string();
+        if let Some(decls) = keyframes.get(&anim_name) {
+            for (prop, val) in decls {
+                if let Some(existing) = final_props.iter_mut().find(|(p, _)| p == prop) {
+                    existing.1 = val.clone();
+                } else {
+                    final_props.push((prop.clone(), val.clone()));
+                }
+            }
         }
     }
 
@@ -1009,11 +1055,8 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
                     break;
                 }
             }
-            // TODO: implement animation application — currently @keyframes rules
-            // are parsed but animations are not applied. A full implementation
-            // requires a timer/event loop to interpolate between keyframes. A
-            // simple static version could apply the "to" (100%) keyframe styles
-            // as the final state.
+            // The animation end-state is applied in compute_element_style_impl
+            // (step 6a) by looking up the "to" keyframe declarations.
             out.push(decl);
         }
         _ => {

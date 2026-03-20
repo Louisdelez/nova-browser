@@ -721,6 +721,63 @@ fn add_node(
                     .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
             }
 
+            // <iframe> elements render as sized boxes with a placeholder.
+            if tag == "iframe" {
+                let iframe_w: f32 = attributes.iter()
+                    .find(|(k, _)| k == "width")
+                    .and_then(|(_, v)| v.trim_end_matches("px").parse().ok())
+                    .unwrap_or(300.0);
+                let iframe_h: f32 = attributes.iter()
+                    .find(|(k, _)| k == "height")
+                    .and_then(|(_, v)| v.trim_end_matches("px").parse().ok())
+                    .unwrap_or(150.0);
+                let src = attributes.iter()
+                    .find(|(k, _)| k == "src")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+
+                // Apply CSS dimensions if set.
+                let lp = parse_layout_props(attributes);
+                let final_w = lp.width.and_then(|d| match d {
+                    Dimension::Length(px) => Some(px),
+                    Dimension::Percent(p) => Some(p * available_width),
+                    _ => None,
+                }).unwrap_or(iframe_w).min(available_width);
+                let final_h = lp.height.and_then(|d| match d {
+                    Dimension::Length(px) => Some(px),
+                    _ => None,
+                }).unwrap_or(iframe_h);
+
+                let mut props = vec![
+                    ("background-color".into(), StyleValue::Str("#f8f8f8".to_string())),
+                    ("border-style".into(), StyleValue::Keyword("solid".into())),
+                    ("border-width".into(), StyleValue::Px(1.0)),
+                    ("border-color".into(), StyleValue::Str("#ccc".to_string())),
+                ];
+                // Store the src URL for the painter to display.
+                if !src.is_empty() {
+                    props.push(("nova-iframe-src".into(), StyleValue::Str(src)));
+                }
+
+                let ctx = NodeContext {
+                    content: LayoutContent::Block,
+                    style: StyleMap { properties: props },
+                };
+                return taffy
+                    .new_leaf_with_context(
+                        Style {
+                            display: Display::Flex,
+                            size: Size {
+                                width: Dimension::Length(final_w),
+                                height: Dimension::Length(final_h),
+                            },
+                            ..Style::DEFAULT
+                        },
+                        ctx,
+                    )
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+            }
+
             let display = resolve_display(tag, attributes);
 
             // display: none produces an invisible zero-size node.

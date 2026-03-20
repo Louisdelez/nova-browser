@@ -136,6 +136,11 @@ pub struct JsDomTree {
     listeners: HashMap<(ElementHandle, String), Vec<EventCallback>>,
     /// Log of pending callbacks that were triggered (for the interpreter loop).
     pub pending_events: Vec<(ElementHandle, String)>,
+    /// URL set by `location.href = "…"` / `window.location.href = "…"`.
+    ///
+    /// After script execution the caller can check this field to determine
+    /// whether the script requested a navigation.
+    pub navigation_url: Option<String>,
 }
 
 impl JsDomTree {
@@ -147,6 +152,7 @@ impl JsDomTree {
             next_handle: 1,
             listeners: HashMap::new(),
             pending_events: Vec::new(),
+            navigation_url: None,
         };
 
         // Reserve handle 0 for the document root.
@@ -679,6 +685,86 @@ impl JsDomTree {
     pub fn root_handle(&self) -> ElementHandle {
         self.root
     }
+
+    /// `document.createTextNode(text)` — creates a text node and returns its handle.
+    pub fn create_text_node(&mut self, text: &str) -> ElementHandle {
+        let handle = self.alloc_handle();
+        let elem = JsElement::new_text(handle, text);
+        self.nodes.insert(handle, elem);
+        debug!(handle, text, "createTextNode");
+        handle
+    }
+
+    /// `el.remove()` — removes the element from its parent.
+    pub fn remove_element(&mut self, handle: ElementHandle) {
+        // Find and remove from parent's children list.
+        let parent_handles: Vec<ElementHandle> = self.nodes.keys().cloned().collect();
+        for ph in parent_handles {
+            if let Some(parent) = self.nodes.get_mut(&ph) {
+                if parent.children.contains(&handle) {
+                    parent.children.retain(|&h| h != handle);
+                    break;
+                }
+            }
+        }
+        self.remove_subtree(handle);
+        debug!(handle, "remove");
+    }
+
+    /// `el.hasAttribute(name)` — returns whether the attribute exists.
+    pub fn has_attribute(&self, handle: ElementHandle, name: &str) -> bool {
+        self.nodes
+            .get(&handle)
+            .map(|e| e.attributes.iter().any(|(k, _)| k == name))
+            .unwrap_or(false)
+    }
+
+    /// `el.removeAttribute(name)` — removes an attribute.
+    pub fn remove_attribute(&mut self, handle: ElementHandle, name: &str) {
+        if let Some(elem) = self.nodes.get_mut(&handle) {
+            elem.attributes.retain(|(k, _)| k != name);
+            debug!(handle, name, "removeAttribute");
+        }
+    }
+
+    /// `el.parentNode` — find the parent of the given handle.
+    pub fn parent_node(&self, handle: ElementHandle) -> Option<ElementHandle> {
+        for (ph, elem) in &self.nodes {
+            if elem.children.contains(&handle) {
+                return Some(*ph);
+            }
+        }
+        None
+    }
+
+    /// Set a pending navigation URL (from `location.href = "…"`).
+    pub fn set_navigation_url(&mut self, url: &str) {
+        debug!(url, "navigation requested via location.href");
+        self.navigation_url = Some(url.to_owned());
+    }
+
+    /// `el.children` / `el.childNodes` — returns child handles (elements only for children).
+    pub fn child_element_count(&self, handle: ElementHandle) -> usize {
+        self.nodes
+            .get(&handle)
+            .map(|e| {
+                e.children
+                    .iter()
+                    .filter(|&&h| {
+                        self.nodes
+                            .get(&h)
+                            .map(|n| n.tag != "#text" && n.tag != "#comment")
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// `el.tagName` — returns the uppercase tag name.
+    pub fn tag_name(&self, handle: ElementHandle) -> Option<String> {
+        self.nodes.get(&handle).map(|e| e.tag.to_uppercase())
+    }
 }
 
 // ── Attribute parser helper ───────────────────────────────────────────────────
@@ -882,6 +968,34 @@ fn eval_statement(
         return JsValue::Undefined;
     }
 
+    // ── location.href = "…" (JS-based navigation) ────────────────────────────
+
+    if let Some((lhs, rhs)) = split_assignment(line) {
+        let lhs_trimmed = lhs.trim();
+        let rhs_trimmed = rhs.trim();
+
+        // Handle location.href, window.location.href, document.location.href,
+        // window.location, location.href assignments.
+        if lhs_trimmed == "window.location.href"
+            || lhs_trimmed == "location.href"
+            || lhs_trimmed == "document.location.href"
+            || lhs_trimmed == "window.location"
+            || lhs_trimmed == "document.location"
+        {
+            let url = unquote(rhs_trimmed);
+            debug!(url = %url, "location.href assignment — navigation requested");
+            tree.lock().unwrap().set_navigation_url(&url);
+            return JsValue::String(url);
+        }
+
+        // Handle document.title = "…"
+        if lhs_trimmed == "document.title" {
+            let value = unquote(rhs_trimmed);
+            debug!(title = %value, "document.title assignment (stored)");
+            return JsValue::String(value);
+        }
+    }
+
     // ── el.textContent = "…" ──────────────────────────────────────────────────
 
     if let Some((lhs, rhs)) = split_assignment(line) {
@@ -901,6 +1015,20 @@ fn eval_statement(
                     if let Some(&handle) = env.get(var) {
                         let value = unquote(rhs);
                         tree.lock().unwrap().set_inner_html(handle, &value);
+                        return JsValue::String(value);
+                    }
+                }
+                "className" => {
+                    if let Some(&handle) = env.get(var) {
+                        let value = unquote(rhs);
+                        tree.lock().unwrap().set_attribute(handle, "class", &value);
+                        return JsValue::String(value);
+                    }
+                }
+                "id" => {
+                    if let Some(&handle) = env.get(var) {
+                        let value = unquote(rhs);
+                        tree.lock().unwrap().set_attribute(handle, "id", &value);
                         return JsValue::String(value);
                     }
                 }
@@ -1000,6 +1128,108 @@ fn eval_statement(
         return JsValue::Undefined;
     }
 
+    // `el.removeAttribute("name")`
+    if let Some((obj, rest)) = split_method_call(line, "removeAttribute") {
+        if let Some(&handle) = env.get(obj.trim()) {
+            let name = unquote(extract_parens_inner(&rest));
+            tree.lock().unwrap().remove_attribute(handle, &name);
+        }
+        return JsValue::Undefined;
+    }
+
+    // `el.hasAttribute("name")`
+    if let Some((obj, rest)) = split_method_call(line, "hasAttribute") {
+        if let Some(&handle) = env.get(obj.trim()) {
+            let name = unquote(extract_parens_inner(&rest));
+            let has = tree.lock().unwrap().has_attribute(handle, &name);
+            return JsValue::Boolean(has);
+        }
+        return JsValue::Boolean(false);
+    }
+
+    // `el.remove()` — remove element from its parent.
+    if let Some((obj, _rest)) = split_method_call(line, "remove") {
+        if let Some(&handle) = env.get(obj.trim()) {
+            tree.lock().unwrap().remove_element(handle);
+        }
+        return JsValue::Undefined;
+    }
+
+    // `el.insertBefore(…)` — stub, treat as no-op.
+    if split_method_call(line, "insertBefore").is_some() {
+        return JsValue::Undefined;
+    }
+
+    // `el.replaceChild(…)` — stub, treat as no-op.
+    if split_method_call(line, "replaceChild").is_some() {
+        return JsValue::Undefined;
+    }
+
+    // `el.removeChild(…)` — stub, treat as no-op.
+    if split_method_call(line, "removeChild").is_some() {
+        return JsValue::Undefined;
+    }
+
+    // `el.cloneNode(…)` — stub, treat as no-op.
+    if split_method_call(line, "cloneNode").is_some() {
+        return JsValue::Undefined;
+    }
+
+    // `el.contains(…)` — stub.
+    if split_method_call(line, "contains").is_some() {
+        return JsValue::Boolean(false);
+    }
+
+    // `el.focus()` / `el.blur()` / `el.click()` — stub.
+    if split_method_call(line, "focus").is_some()
+        || split_method_call(line, "blur").is_some()
+        || split_method_call(line, "click").is_some()
+    {
+        return JsValue::Undefined;
+    }
+
+    // `el.getBoundingClientRect()` — return stub object.
+    if split_method_call(line, "getBoundingClientRect").is_some() {
+        return JsValue::Undefined;
+    }
+
+    // `el.closest(…)` — stub.
+    if split_method_call(line, "closest").is_some() {
+        return JsValue::Null;
+    }
+
+    // `el.matches(…)` — stub.
+    if split_method_call(line, "matches").is_some() {
+        return JsValue::Boolean(false);
+    }
+
+    // `el.classList.contains(…)` — stub.
+    if split_method_call(line, "classList.contains").is_some() {
+        return JsValue::Boolean(false);
+    }
+
+    // `el.classList.toggle(…)` — stub.
+    if split_method_call(line, "classList.toggle").is_some() {
+        return JsValue::Undefined;
+    }
+
+    // `el.style.*` property assignments (e.g. `el.style.display = "none"`).
+    if let Some((lhs, rhs)) = split_assignment(line) {
+        let lhs_t = lhs.trim();
+        // Match patterns like `varname.style.propname`.
+        if let Some(style_idx) = lhs_t.find(".style.") {
+            let var = &lhs_t[..style_idx];
+            let prop = &lhs_t[style_idx + 7..]; // skip ".style."
+            if let Some(&handle) = env.get(var.trim()) {
+                let value = unquote(rhs.trim());
+                // Convert camelCase to kebab-case for CSS.
+                let css_prop = camel_to_kebab(prop.trim());
+                tree.lock().unwrap().style_set_property(handle, &css_prop, &value);
+                return JsValue::String(value);
+            }
+        }
+    }
+
     // ── Window / global no-op stubs ────────────────────────────────────────────
     //
     // Many real-world pages call these APIs.  We don't implement them yet, but
@@ -1073,6 +1303,11 @@ fn eval_statement(
         return JsValue::Undefined;
     }
 
+    // `document.location.*` property reads — ignore silently.
+    if line.starts_with("document.location") {
+        return JsValue::Undefined;
+    }
+
     // `window.navigator.*` property reads — ignore silently.
     if line.starts_with("window.navigator") || line.starts_with("navigator.") {
         return JsValue::Undefined;
@@ -1085,6 +1320,128 @@ fn eval_statement(
 
     // `document.cookie` — ignore silently.
     if line.starts_with("document.cookie") {
+        return JsValue::Undefined;
+    }
+
+    // `document.title` — ignore reads.
+    if line == "document.title" {
+        return JsValue::String(String::new());
+    }
+
+    // `document.readyState` — always "complete".
+    if line == "document.readyState" {
+        return JsValue::String("complete".into());
+    }
+
+    // `document.write(…)` / `document.writeln(…)` — no-op.
+    if line.starts_with("document.write(") || line.starts_with("document.writeln(") {
+        return JsValue::Undefined;
+    }
+
+    // `document.createDocumentFragment()` — no-op stub.
+    if line.starts_with("document.createDocumentFragment(") {
+        return JsValue::Undefined;
+    }
+
+    // `window.innerWidth` / `window.innerHeight` / `window.outerWidth` / `window.outerHeight`
+    if line == "window.innerWidth" || line == "innerWidth" {
+        return JsValue::Number(1280.0);
+    }
+    if line == "window.innerHeight" || line == "innerHeight" {
+        return JsValue::Number(720.0);
+    }
+    if line == "window.outerWidth" || line == "window.outerHeight"
+        || line == "window.screen.width" || line == "window.screen.height"
+        || line == "screen.width" || line == "screen.height"
+    {
+        return JsValue::Number(1280.0);
+    }
+
+    // `window.devicePixelRatio`
+    if line == "window.devicePixelRatio" || line == "devicePixelRatio" {
+        return JsValue::Number(1.0);
+    }
+
+    // `window.pageYOffset` / `window.pageXOffset` / `window.scrollX` / `window.scrollY`
+    if line == "window.pageYOffset" || line == "window.scrollY"
+        || line == "window.pageXOffset" || line == "window.scrollX"
+        || line == "pageYOffset" || line == "pageXOffset"
+    {
+        return JsValue::Number(0.0);
+    }
+
+    // `window.performance.*` — ignore silently.
+    if line.starts_with("window.performance") || line.starts_with("performance.") {
+        return JsValue::Undefined;
+    }
+
+    // `window.localStorage.*` / `window.sessionStorage.*` — ignore silently.
+    if line.starts_with("localStorage.") || line.starts_with("window.localStorage")
+        || line.starts_with("sessionStorage.") || line.starts_with("window.sessionStorage")
+    {
+        return JsValue::Undefined;
+    }
+
+    // `JSON.stringify(…)` / `JSON.parse(…)` — no-op stubs.
+    if line.starts_with("JSON.stringify(") || line.starts_with("JSON.parse(") {
+        return JsValue::Undefined;
+    }
+
+    // `new …` constructor calls — ignore silently.
+    if line.starts_with("new ") {
+        debug!(line, "constructor call stub (no-op)");
+        return JsValue::Undefined;
+    }
+
+    // `typeof …` expressions — return "undefined".
+    if line.starts_with("typeof ") {
+        return JsValue::String("undefined".into());
+    }
+
+    // Control flow: `if`, `else`, `for`, `while`, `switch`, `try`, `catch`,
+    // `finally`, `return`, `throw`, `break`, `continue` — ignore silently.
+    // Our line-by-line interpreter cannot handle these; silently skipping is
+    // better than logging a warning for every single control flow keyword.
+    if line.starts_with("if ")
+        || line.starts_with("if(")
+        || line.starts_with("} else")
+        || line.starts_with("else ")
+        || line.starts_with("else{")
+        || line == "else"
+        || line == "}"
+        || line == "})"
+        || line == "});"
+        || line == "};"
+        || line.starts_with("for ")
+        || line.starts_with("for(")
+        || line.starts_with("while ")
+        || line.starts_with("while(")
+        || line.starts_with("switch ")
+        || line.starts_with("switch(")
+        || line.starts_with("case ")
+        || line == "default:"
+        || line.starts_with("try ")
+        || line.starts_with("try{")
+        || line.starts_with("catch ")
+        || line.starts_with("catch(")
+        || line.starts_with("finally ")
+        || line.starts_with("finally{")
+        || line.starts_with("return ")
+        || line == "return"
+        || line.starts_with("throw ")
+        || line == "break"
+        || line == "continue"
+    {
+        return JsValue::Undefined;
+    }
+
+    // Function declarations — ignore silently.
+    if line.starts_with("function ") || line.starts_with("async function ") {
+        return JsValue::Undefined;
+    }
+
+    // `void …` — return undefined.
+    if line.starts_with("void ") {
         return JsValue::Undefined;
     }
 
@@ -1145,6 +1502,14 @@ fn eval_dom_expr(
         let arg = extract_call_args(expr, "document.createElement");
         let tag = unquote(arg);
         let handle = tree.lock().unwrap().create_element(&tag);
+        return Some(handle);
+    }
+
+    // `document.createTextNode("text")`
+    if expr.starts_with("document.createTextNode(") {
+        let arg = extract_call_args(expr, "document.createTextNode");
+        let text = unquote(arg);
+        let handle = tree.lock().unwrap().create_text_node(&text);
         return Some(handle);
     }
 
@@ -1318,6 +1683,22 @@ fn parse_two_string_args(args_with_parens: &str) -> Option<(String, String)> {
     let first = unquote(inner[..pos].trim());
     let second = unquote(inner[pos + 1..].trim());
     Some((first, second))
+}
+
+/// Convert a camelCase CSS property name to kebab-case.
+///
+/// e.g. `backgroundColor` → `background-color`, `fontSize` → `font-size`.
+fn camel_to_kebab(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        if c.is_uppercase() {
+            out.push('-');
+            out.push(c.to_lowercase().next().unwrap_or(c));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Parse `addEventListener` arguments: `("type", function() { body })`.
@@ -1664,5 +2045,189 @@ mod tests {
         let root = t.root_handle();
         let handle = t.find_by_tag("p", root).unwrap();
         assert_eq!(t.get_attribute(handle, "data-tag"), Some("found".into()));
+    }
+
+    // ── New tests: location.href navigation ────────────────────────────────
+
+    #[test]
+    fn location_href_sets_navigation_url() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        let script = r#"
+            window.location.href = "https://example.com/new-page";
+        "#;
+        eval_script(script, Arc::clone(&tree));
+
+        let t = tree.lock().unwrap();
+        assert_eq!(
+            t.navigation_url.as_deref(),
+            Some("https://example.com/new-page")
+        );
+    }
+
+    #[test]
+    fn document_location_href_sets_navigation_url() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        let script = r#"
+            document.location.href = "https://example.com/other";
+        "#;
+        eval_script(script, Arc::clone(&tree));
+
+        let t = tree.lock().unwrap();
+        assert_eq!(
+            t.navigation_url.as_deref(),
+            Some("https://example.com/other")
+        );
+    }
+
+    #[test]
+    fn location_href_bare_sets_navigation_url() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        let script = r#"
+            location.href = "/relative/path";
+        "#;
+        eval_script(script, Arc::clone(&tree));
+
+        let t = tree.lock().unwrap();
+        assert_eq!(t.navigation_url.as_deref(), Some("/relative/path"));
+    }
+
+    // ── New tests: additional DOM API methods ──────────────────────────────
+
+    #[test]
+    fn create_text_node() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        let script = r#"
+            var parent = document.getElementById("main");
+            var text = document.createTextNode("New text node");
+            parent.appendChild(text);
+        "#;
+        eval_script(script, Arc::clone(&tree));
+
+        let t = tree.lock().unwrap();
+        let handle = t.get_element_by_id("main").unwrap();
+        let text = t.get_text_content(handle);
+        assert!(text.contains("New text node"), "expected 'New text node' in '{text}'");
+    }
+
+    #[test]
+    fn remove_attribute() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        let script = r#"
+            var el = document.querySelector(".intro");
+            el.removeAttribute("class");
+        "#;
+        eval_script(script, Arc::clone(&tree));
+
+        let t = tree.lock().unwrap();
+        // The element should no longer have a class attribute.
+        // query_selector(".intro") should return None now.
+        assert!(t.query_selector(".intro").is_none());
+    }
+
+    #[test]
+    fn has_attribute() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        let script = r#"
+            var el = document.getElementById("main");
+            el.hasAttribute("id");
+        "#;
+        let result = eval_script(script, Arc::clone(&tree));
+        assert!(matches!(result, JsValue::Boolean(true)));
+    }
+
+    #[test]
+    fn style_property_assignment() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        let script = r#"
+            var el = document.getElementById("main");
+            el.style.backgroundColor = "red";
+        "#;
+        eval_script(script, Arc::clone(&tree));
+
+        let dom = tree.lock().unwrap().to_dom();
+        let doc_str = format!("{dom:?}");
+        assert!(
+            doc_str.contains("background-color:red"),
+            "expected background-color:red in {doc_str}"
+        );
+    }
+
+    #[test]
+    fn classname_assignment() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        let script = r#"
+            var el = document.getElementById("main");
+            el.className = "new-class";
+        "#;
+        eval_script(script, Arc::clone(&tree));
+
+        let t = tree.lock().unwrap();
+        let handle = t.get_element_by_id("main").unwrap();
+        assert_eq!(t.get_attribute(handle, "class"), Some("new-class".into()));
+    }
+
+    // ── New tests: control flow / crash prevention stubs ───────────────────
+
+    #[test]
+    fn control_flow_and_extra_stubs_do_not_crash() {
+        let dom = make_simple_dom();
+        let tree = JsDomTree::from_dom(&dom);
+
+        let script = r#"
+            if (true) {
+            }
+            for (var i = 0; i < 10; i++) {
+            }
+            try {
+            } catch (e) {
+            } finally {
+            }
+            typeof window;
+            new Object();
+            return;
+            break;
+            continue;
+            void 0;
+            function myFunc() {}
+            document.title = "Hello";
+            document.readyState;
+            document.write("test");
+            window.innerWidth;
+            window.innerHeight;
+            window.devicePixelRatio;
+            window.pageYOffset;
+            window.performance.now();
+            localStorage.getItem("key");
+            sessionStorage.setItem("key", "val");
+            JSON.stringify({});
+            JSON.parse("{}");
+        "#;
+        let result = eval_script(script, Arc::clone(&tree));
+        // Should complete without panicking.
+        assert!(matches!(result, JsValue::Undefined));
+    }
+
+    #[test]
+    fn camel_to_kebab_conversion() {
+        assert_eq!(super::camel_to_kebab("backgroundColor"), "background-color");
+        assert_eq!(super::camel_to_kebab("fontSize"), "font-size");
+        assert_eq!(super::camel_to_kebab("display"), "display");
+        assert_eq!(super::camel_to_kebab("borderTopWidth"), "border-top-width");
     }
 }

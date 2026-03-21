@@ -374,6 +374,24 @@ impl VelloBackend {
                     scene.push_clip_layer(Fill::NonZero, current_tf(&transform_stack), &clip_rect);
                 }
 
+                RenderOp::PushRoundedClip {
+                    x,
+                    y,
+                    width,
+                    height,
+                    radius,
+                } => {
+                    let rect = Rect::new(*x as f64, *y as f64, (*x + *width) as f64, (*y + *height) as f64);
+                    let radii = RoundedRectRadii::new(
+                        radius[0] as f64,
+                        radius[1] as f64,
+                        radius[2] as f64,
+                        radius[3] as f64,
+                    );
+                    let rounded = RoundedRect::from_rect(rect, radii);
+                    scene.push_clip_layer(Fill::NonZero, current_tf(&transform_stack), &rounded);
+                }
+
                 RenderOp::PopClip => {
                     scene.pop_layer();
                 }

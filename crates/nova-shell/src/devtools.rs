@@ -655,7 +655,7 @@ impl DevTools {
 
             let text_x = tx + 10.0;
             let text_y = y + (TAB_BAR_HEIGHT - DEVTOOLS_FONT_SIZE) / 2.0;
-            fb.draw_text(text_x, text_y, label, DEVTOOLS_FONT_SIZE, TAB_TEXT, None, None, None);
+            fb.draw_text(text_x, text_y, label, DEVTOOLS_FONT_SIZE, TAB_TEXT, None, None, None, None);
         }
 
         // Draw bottom border of tab bar.
@@ -686,6 +686,7 @@ impl DevTools {
             None,
             None,
             None,
+            None,
         );
 
         // Message count indicator.
@@ -696,6 +697,7 @@ impl DevTools {
             &count_text,
             DEVTOOLS_FONT_SIZE,
             TEXT_MUTED,
+            None,
             None,
             None,
             None,
@@ -752,6 +754,7 @@ impl DevTools {
                 None,
                 None,
                 None,
+                None,
             );
 
             // Separator line.
@@ -798,6 +801,7 @@ impl DevTools {
                     None,
                     None,
                     None,
+                    None,
                 );
             }
 
@@ -813,6 +817,7 @@ impl DevTools {
                     None,
                     None,
                     None,
+                    None,
                 );
             } else if entry.tag == "#comment" {
                 let text = format!("<!-- {} -->", entry.text.as_deref().unwrap_or(""));
@@ -825,43 +830,44 @@ impl DevTools {
                     None,
                     None,
                     None,
+                    None,
                 );
             } else {
                 // Element node: <tag id="..." class="...">
                 let mut x_pos = indent;
 
                 // Opening bracket and tag name.
-                fb.draw_text(x_pos, line_y + 3.0, "<", DEVTOOLS_FONT_SIZE, TEXT_DEFAULT, None, None, None);
+                fb.draw_text(x_pos, line_y + 3.0, "<", DEVTOOLS_FONT_SIZE, TEXT_DEFAULT, None, None, None, None);
                 x_pos += DEVTOOLS_FONT_SIZE * 0.6;
 
-                fb.draw_text(x_pos, line_y + 3.0, &entry.tag, DEVTOOLS_FONT_SIZE, TAG_COLOR, None, None, None);
+                fb.draw_text(x_pos, line_y + 3.0, &entry.tag, DEVTOOLS_FONT_SIZE, TAG_COLOR, None, None, None, None);
                 x_pos += entry.tag.len() as f32 * DEVTOOLS_FONT_SIZE * 0.6;
 
                 // id attribute.
                 if let Some(ref id) = entry.id {
-                    fb.draw_text(x_pos, line_y + 3.0, " id", DEVTOOLS_FONT_SIZE, ATTR_NAME_COLOR, None, None, None);
+                    fb.draw_text(x_pos, line_y + 3.0, " id", DEVTOOLS_FONT_SIZE, ATTR_NAME_COLOR, None, None, None, None);
                     x_pos += 3.0 * DEVTOOLS_FONT_SIZE * 0.6;
-                    fb.draw_text(x_pos, line_y + 3.0, "=\"", DEVTOOLS_FONT_SIZE, TEXT_DEFAULT, None, None, None);
+                    fb.draw_text(x_pos, line_y + 3.0, "=\"", DEVTOOLS_FONT_SIZE, TEXT_DEFAULT, None, None, None, None);
                     x_pos += 2.0 * DEVTOOLS_FONT_SIZE * 0.6;
-                    fb.draw_text(x_pos, line_y + 3.0, id, DEVTOOLS_FONT_SIZE, ATTR_VALUE_COLOR, None, None, None);
+                    fb.draw_text(x_pos, line_y + 3.0, id, DEVTOOLS_FONT_SIZE, ATTR_VALUE_COLOR, None, None, None, None);
                     x_pos += id.len() as f32 * DEVTOOLS_FONT_SIZE * 0.6;
-                    fb.draw_text(x_pos, line_y + 3.0, "\"", DEVTOOLS_FONT_SIZE, TEXT_DEFAULT, None, None, None);
+                    fb.draw_text(x_pos, line_y + 3.0, "\"", DEVTOOLS_FONT_SIZE, TEXT_DEFAULT, None, None, None, None);
                     x_pos += DEVTOOLS_FONT_SIZE * 0.6;
                 }
 
                 // class attribute.
                 if let Some(ref classes) = entry.classes {
-                    fb.draw_text(x_pos, line_y + 3.0, " class", DEVTOOLS_FONT_SIZE, ATTR_NAME_COLOR, None, None, None);
+                    fb.draw_text(x_pos, line_y + 3.0, " class", DEVTOOLS_FONT_SIZE, ATTR_NAME_COLOR, None, None, None, None);
                     x_pos += 6.0 * DEVTOOLS_FONT_SIZE * 0.6;
-                    fb.draw_text(x_pos, line_y + 3.0, "=\"", DEVTOOLS_FONT_SIZE, TEXT_DEFAULT, None, None, None);
+                    fb.draw_text(x_pos, line_y + 3.0, "=\"", DEVTOOLS_FONT_SIZE, TEXT_DEFAULT, None, None, None, None);
                     x_pos += 2.0 * DEVTOOLS_FONT_SIZE * 0.6;
-                    fb.draw_text(x_pos, line_y + 3.0, classes, DEVTOOLS_FONT_SIZE, ATTR_VALUE_COLOR, None, None, None);
+                    fb.draw_text(x_pos, line_y + 3.0, classes, DEVTOOLS_FONT_SIZE, ATTR_VALUE_COLOR, None, None, None, None);
                     x_pos += classes.len() as f32 * DEVTOOLS_FONT_SIZE * 0.6;
-                    fb.draw_text(x_pos, line_y + 3.0, "\"", DEVTOOLS_FONT_SIZE, TEXT_DEFAULT, None, None, None);
+                    fb.draw_text(x_pos, line_y + 3.0, "\"", DEVTOOLS_FONT_SIZE, TEXT_DEFAULT, None, None, None, None);
                     x_pos += DEVTOOLS_FONT_SIZE * 0.6;
                 }
 
-                fb.draw_text(x_pos, line_y + 3.0, ">", DEVTOOLS_FONT_SIZE, TEXT_DEFAULT, None, None, None);
+                fb.draw_text(x_pos, line_y + 3.0, ">", DEVTOOLS_FONT_SIZE, TEXT_DEFAULT, None, None, None, None);
             }
         }
 
@@ -899,6 +905,7 @@ impl DevTools {
                         None,
                         None,
                         None,
+                        None,
                     );
 
                     let children_info = format!(
@@ -911,6 +918,7 @@ impl DevTools {
                         &children_info,
                         DEVTOOLS_FONT_SIZE,
                         TEXT_MUTED,
+                        None,
                         None,
                         None,
                         None,
@@ -943,7 +951,7 @@ impl DevTools {
             let fx = i as f32 * 60.0 + DEVTOOLS_PADDING;
             let is_active = self.network_filter == *filter;
             let color = if is_active { TAB_ACTIVE_UNDERLINE } else { TEXT_MUTED };
-            fb.draw_text(fx, filter_y, label, DEVTOOLS_FONT_SIZE, color, None, None, None);
+            fb.draw_text(fx, filter_y, label, DEVTOOLS_FONT_SIZE, color, None, None, None, None);
             if is_active {
                 fb.fill_rect(fx, filter_y + DEVTOOLS_FONT_SIZE + 2.0, 40.0, 2.0, TAB_ACTIVE_UNDERLINE);
             }
@@ -958,6 +966,7 @@ impl DevTools {
             &count_text,
             DEVTOOLS_FONT_SIZE,
             TEXT_MUTED,
+            None,
             None,
             None,
             None,
@@ -977,7 +986,7 @@ impl DevTools {
         ];
 
         for (hx, label) in &headers {
-            fb.draw_text(*hx, header_y + 3.0, label, DEVTOOLS_FONT_SIZE, TAB_TEXT, None, None, None);
+            fb.draw_text(*hx, header_y + 3.0, label, DEVTOOLS_FONT_SIZE, TAB_TEXT, None, None, None, None);
         }
 
         // Sort indicator.
@@ -1000,7 +1009,7 @@ impl DevTools {
             NetworkSortColumn::Time => "Time",
         };
         let arrow_x = sort_col_x + header_label.len() as f32 * DEVTOOLS_FONT_SIZE * 0.6;
-        fb.draw_text(arrow_x, header_y + 3.0, arrow, DEVTOOLS_FONT_SIZE, TAB_ACTIVE_UNDERLINE, None, None, None);
+        fb.draw_text(arrow_x, header_y + 3.0, arrow, DEVTOOLS_FONT_SIZE, TAB_ACTIVE_UNDERLINE, None, None, None, None);
 
         fb.fill_rect(0.0, header_y + DEVTOOLS_LINE_HEIGHT - 1.0, width, 1.0, BORDER_COLOR);
 
@@ -1029,10 +1038,10 @@ impl DevTools {
             } else {
                 req.url.clone()
             };
-            fb.draw_text(DEVTOOLS_PADDING, row_y + 3.0, &url_display, DEVTOOLS_FONT_SIZE, TEXT_DEFAULT, None, None, None);
+            fb.draw_text(DEVTOOLS_PADDING, row_y + 3.0, &url_display, DEVTOOLS_FONT_SIZE, TEXT_DEFAULT, None, None, None, None);
 
             // Method.
-            fb.draw_text(400.0, row_y + 3.0, &req.method, DEVTOOLS_FONT_SIZE, TEXT_MUTED, None, None, None);
+            fb.draw_text(400.0, row_y + 3.0, &req.method, DEVTOOLS_FONT_SIZE, TEXT_MUTED, None, None, None, None);
 
             // Status (color coded).
             let status_color = if req.status == 0 {
@@ -1049,19 +1058,19 @@ impl DevTools {
             } else {
                 req.status.to_string()
             };
-            fb.draw_text(460.0, row_y + 3.0, &status_text, DEVTOOLS_FONT_SIZE, status_color, None, None, None);
+            fb.draw_text(460.0, row_y + 3.0, &status_text, DEVTOOLS_FONT_SIZE, status_color, None, None, None, None);
 
             // Content-Type (short form).
             let type_display = short_content_type(&req.content_type);
-            fb.draw_text(520.0, row_y + 3.0, &type_display, DEVTOOLS_FONT_SIZE, TEXT_MUTED, None, None, None);
+            fb.draw_text(520.0, row_y + 3.0, &type_display, DEVTOOLS_FONT_SIZE, TEXT_MUTED, None, None, None, None);
 
             // Size.
             let size_display = format_size(req.size);
-            fb.draw_text(620.0, row_y + 3.0, &size_display, DEVTOOLS_FONT_SIZE, TEXT_MUTED, None, None, None);
+            fb.draw_text(620.0, row_y + 3.0, &size_display, DEVTOOLS_FONT_SIZE, TEXT_MUTED, None, None, None, None);
 
             // Time.
             let time_display = format_duration(req.duration_ms);
-            fb.draw_text(700.0, row_y + 3.0, &time_display, DEVTOOLS_FONT_SIZE, TEXT_MUTED, None, None, None);
+            fb.draw_text(700.0, row_y + 3.0, &time_display, DEVTOOLS_FONT_SIZE, TEXT_MUTED, None, None, None, None);
         }
 
         // Empty state.
@@ -1073,6 +1082,7 @@ impl DevTools {
                 "No network requests recorded.",
                 DEVTOOLS_FONT_SIZE,
                 TEXT_MUTED,
+                None,
                 None,
                 None,
                 None,

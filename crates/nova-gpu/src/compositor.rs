@@ -553,6 +553,7 @@ mod tests {
                     font_weight: None,
                     font_style: None,
                     font_family: None,
+                    letter_spacing: None,
                 },
                 RenderOp::FillRect {
                     x: 0.0,

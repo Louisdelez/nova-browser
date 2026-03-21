@@ -1059,6 +1059,7 @@ impl Framebuffer {
         font_weight: Option<u16>,
         font_style: Option<&str>,
         font_family: Option<&str>,
+        letter_spacing: Option<f32>,
     ) {
         if self.font_renderer.is_none() {
             self.draw_text_bitmap(x, y, text, font_size, color);
@@ -1203,6 +1204,9 @@ impl Framebuffer {
                 }
 
                 cursor_x += glyph.x_advance;
+                if let Some(ls) = letter_spacing {
+                    cursor_x += ls;
+                }
             }
 
             // Put the renderer back.
@@ -1252,6 +1256,9 @@ impl Framebuffer {
                     }
                 }
                 cx += advance.round() as i32;
+                if let Some(ls) = letter_spacing {
+                    cx += ls.round() as i32;
+                }
             } else {
                 // fontdue fallback.
                 let (metrics, bitmap) = if let Some(ref family_key) = custom_family_key {
@@ -1283,6 +1290,9 @@ impl Framebuffer {
                     }
                 }
                 cx += metrics.advance_width as i32;
+                if let Some(ls) = letter_spacing {
+                    cx += ls.round() as i32;
+                }
             }
         }
 
@@ -1410,12 +1420,13 @@ impl Framebuffer {
                     let (tx, ty) = apply_pos(&self.current_transform, *x, *y);
                     self.fill_rect(tx, ty, *width, *height, c);
                 }
-                RenderOp::DrawText { x, y, text, font_size, color, font_weight, font_style, font_family } => {
+                RenderOp::DrawText { x, y, text, font_size, color, font_weight, font_style, font_family, letter_spacing } => {
                     let c = self.apply_opacity(*color);
                     let (tx, ty) = apply_pos(&self.current_transform, *x, *y);
                     self.draw_text(
                         tx, ty, text, *font_size, c,
                         *font_weight, font_style.as_deref(), font_family.as_deref(),
+                        *letter_spacing,
                     );
                 }
                 RenderOp::StrokeRect { x, y, width, height, color, width_px } => {
@@ -1434,6 +1445,18 @@ impl Framebuffer {
                     );
                 }
                 RenderOp::PushClip { x, y, width, height } => {
+                    let (tx, ty) = apply_pos(&self.current_transform, *x, *y);
+                    self.clip_stack.push(ClipRect {
+                        x: tx.round() as i32,
+                        y: ty.round() as i32,
+                        width: width.round() as i32,
+                        height: height.round() as i32,
+                    });
+                }
+                RenderOp::PushRoundedClip { x, y, width, height, .. } => {
+                    // For the software renderer, rounded clips are approximated
+                    // as rectangular clips. Full rounded clipping would require
+                    // per-pixel SDF masking which is expensive on CPU.
                     let (tx, ty) = apply_pos(&self.current_transform, *x, *y);
                     self.clip_stack.push(ClipRect {
                         x: tx.round() as i32,

@@ -1155,7 +1155,10 @@ fn add_node(
                     || key == "white-space" || key == "overflow"
                     || key == "overflow-x" || key == "overflow-y"
                     || key == "text-overflow"
-                    || key == "text-transform" || key == "font-family" {
+                    || key == "text-transform" || key == "font-family"
+                    || key == "letter-spacing" || key == "text-shadow"
+                    || key == "text-indent" || key == "direction"
+                    || key == "vertical-align" {
                     text_props.push((key.clone(), value.clone()));
                 }
             }
@@ -1580,6 +1583,34 @@ fn flatten_node_recursive(
                 })
                 .unwrap_or("normal");
 
+            // Extract letter-spacing for width adjustment.
+            let letter_spacing: f32 = style_props.iter()
+                .find(|(k, _)| k == "letter-spacing")
+                .and_then(|(_, v)| match v {
+                    StyleValue::Px(px) => Some(*px),
+                    StyleValue::Str(s) | StyleValue::Keyword(s) => {
+                        let s = s.trim();
+                        if s == "normal" { return None; }
+                        if let Some(rest) = s.strip_suffix("em") {
+                            return rest.trim().parse::<f32>().ok().map(|n| n * font_size);
+                        }
+                        if let Some(rest) = s.strip_suffix("px") {
+                            return rest.trim().parse::<f32>().ok();
+                        }
+                        s.parse::<f32>().ok()
+                    }
+                    _ => None,
+                })
+                .unwrap_or(0.0);
+
+            /// Add letter-spacing to a measured word width.
+            fn apply_letter_spacing(base_width: f32, text: &str, spacing: f32) -> f32 {
+                if spacing == 0.0 { return base_width; }
+                let char_count = text.chars().count();
+                if char_count <= 1 { return base_width; }
+                base_width + spacing * (char_count - 1) as f32
+            }
+
             match white_space {
                 "pre" | "pre-wrap" => {
                     // Preserve whitespace: split by newlines, then keep spaces.
@@ -1606,7 +1637,7 @@ fn flatten_node_recursive(
                                 if should_append {
                                     if let Some(InlineItem::Word { text: t, width: w, .. }) = items.last_mut() {
                                         t.push(ch);
-                                        *w = measure_text_width(t, font_size);
+                                        *w = apply_letter_spacing(measure_text_width(t, font_size), t, letter_spacing);
                                         continue;
                                     }
                                 }
@@ -1632,7 +1663,7 @@ fn flatten_node_recursive(
                                 style: style_props.to_vec(),
                             });
                         }
-                        let w = measure_text_width(word, font_size);
+                        let w = apply_letter_spacing(measure_text_width(word, font_size), word, letter_spacing);
                         items.push(InlineItem::Word {
                             text: word.to_string(),
                             width: w,
@@ -1658,7 +1689,7 @@ fn flatten_node_recursive(
                                     style: style_props.to_vec(),
                                 });
                             }
-                            let w = measure_text_width(word, font_size);
+                            let w = apply_letter_spacing(measure_text_width(word, font_size), word, letter_spacing);
                             items.push(InlineItem::Word {
                                 text: word.to_string(),
                                 width: w,
@@ -1682,7 +1713,7 @@ fn flatten_node_recursive(
                                 });
                             }
                         }
-                        let w = measure_text_width(word, font_size);
+                        let w = apply_letter_spacing(measure_text_width(word, font_size), word, letter_spacing);
                         items.push(InlineItem::Word {
                             text: word.to_string(),
                             width: w,
@@ -1938,8 +1969,42 @@ fn layout_inline_run(
     // DrawText call, merge consecutive same-style Word+Space+Word sequences
     // into single text runs. This ensures spaces are rendered within the
     // same DrawText call as adjacent words, eliminating side-bearing gaps.
+
+    // Extract text-indent for the first line.
+    let text_indent = parent_style_props.iter()
+        .find(|(k, _)| k == "text-indent")
+        .and_then(|(_, v)| match v {
+            StyleValue::Px(px) => Some(*px),
+            StyleValue::Str(s) | StyleValue::Keyword(s) => {
+                let s = s.trim();
+                if let Some(rest) = s.strip_suffix("em") {
+                    rest.trim().parse::<f32>().ok().map(|n| n * parent_font_size)
+                } else if let Some(rest) = s.strip_suffix("rem") {
+                    rest.trim().parse::<f32>().ok().map(|n| n * 16.0)
+                } else if let Some(rest) = s.strip_suffix("px") {
+                    rest.trim().parse::<f32>().ok()
+                } else if let Some(rest) = s.strip_suffix('%') {
+                    rest.trim().parse::<f32>().ok().map(|pct| available_width * pct / 100.0)
+                } else {
+                    s.parse::<f32>().ok()
+                }
+            }
+            _ => None,
+        })
+        .unwrap_or(0.0);
+
+    // Extract direction: rtl — swap default text-align to right.
+    let direction_rtl = parent_style_props.iter()
+        .find(|(k, _)| k == "direction")
+        .and_then(|(_, v)| match v {
+            StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.as_str()),
+            _ => None,
+        })
+        .map(|d| d == "rtl")
+        .unwrap_or(false);
+
     let mut line_box_ids = Vec::new();
-    for line in &lines {
+    for (line_index, line) in lines.iter().enumerate() {
         let mut item_ids = Vec::new();
         let mut max_height = line_height;
 
@@ -1981,22 +2046,48 @@ fn layout_inline_run(
                         }
                     }
 
+                    // Check vertical-align for this inline item.
+                    let valign = style.iter()
+                        .find(|(k, _)| k == "vertical-align")
+                        .and_then(|(_, v)| match v {
+                            StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.as_str()),
+                            _ => None,
+                        });
+                    let align_self = match valign {
+                        Some("middle") => Some(AlignSelf::Center),
+                        Some("top") => Some(AlignSelf::FlexStart),
+                        Some("bottom") => Some(AlignSelf::FlexEnd),
+                        Some("sub") => Some(AlignSelf::FlexEnd),
+                        Some("super") => Some(AlignSelf::FlexStart),
+                        _ => None, // baseline (default)
+                    };
+                    // For sub/super, apply a vertical offset via margin.
+                    let valign_margin_top = match valign {
+                        Some("sub") => LengthPercentageAuto::Length(fs * 0.3),
+                        Some("super") => LengthPercentageAuto::Length(-fs * 0.4),
+                        _ => LengthPercentageAuto::Length(0.0),
+                    };
+
                     let ctx = NodeContext {
                         content: LayoutContent::Text(merged_text),
                         style: StyleMap { properties: style.clone() },
                     };
+                    let mut item_style = Style {
+                        display: Display::Flex,
+                        size: Size {
+                            width: Dimension::Length(merged_width),
+                            height: Dimension::Length(lh),
+                        },
+                        ..Style::DEFAULT
+                    };
+                    if let Some(a) = align_self {
+                        item_style.align_self = Some(a);
+                    }
+                    if matches!(valign, Some("sub") | Some("super")) {
+                        item_style.margin.top = valign_margin_top;
+                    }
                     let id = taffy
-                        .new_leaf_with_context(
-                            Style {
-                                display: Display::Flex,
-                                size: Size {
-                                    width: Dimension::Length(merged_width),
-                                    height: Dimension::Length(lh),
-                                },
-                                ..Style::DEFAULT
-                            },
-                            ctx,
-                        )
+                        .new_leaf_with_context(item_style, ctx)
                         .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
                     item_ids.push(id);
                 }
@@ -2047,17 +2138,27 @@ fn layout_inline_run(
         }
 
         // Create the line box container (flex-row, items aligned to baseline).
-        // Apply text-align from parent style.
-        let justify = match parent_style_props.iter()
+        // Apply text-align from parent style (with direction: rtl support).
+        let text_align = parent_style_props.iter()
             .find(|(k, _)| k == "text-align")
             .and_then(|(_, v)| match v {
                 StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.as_str()),
                 _ => None,
-            }) {
+            });
+        let justify = match text_align {
             Some("center") => Some(JustifyContent::Center),
             Some("right") | Some("end") => Some(JustifyContent::FlexEnd),
+            Some("left") | Some("start") => None,
             Some("justify") => Some(JustifyContent::SpaceBetween),
+            None if direction_rtl => Some(JustifyContent::FlexEnd),
             _ => None, // left / default
+        };
+
+        // Apply text-indent as left padding on the first line only.
+        let line_padding_left = if line_index == 0 && text_indent > 0.0 {
+            LengthPercentage::Length(text_indent)
+        } else {
+            LengthPercentage::Length(0.0)
         };
 
         let line_ctx = NodeContext {
@@ -2071,6 +2172,12 @@ fn layout_inline_run(
                     flex_direction: FlexDirection::Row,
                     align_items: Some(AlignItems::Baseline),
                     justify_content: justify,
+                    padding: Rect {
+                        left: line_padding_left,
+                        right: LengthPercentage::Length(0.0),
+                        top: LengthPercentage::Length(0.0),
+                        bottom: LengthPercentage::Length(0.0),
+                    },
                     size: Size {
                         width: Dimension::Percent(1.0),
                         height: Dimension::Auto,
@@ -2342,10 +2449,46 @@ fn layout_table(
         .find(|(k, _)| k == "cellpadding")
         .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(1.0);
+    // Use HTML cellspacing attribute first, then CSS border-spacing, then default.
     let cellspacing: f32 = table_attrs
         .iter()
         .find(|(k, _)| k == "cellspacing")
         .and_then(|(_, v)| v.parse().ok())
+        .or_else(|| {
+            // Check CSS border-spacing from data-nova-style.
+            table_attrs.iter()
+                .find(|(k, _)| k == "data-nova-style")
+                .and_then(|(_, style_str)| {
+                    for decl in style_str.split(';') {
+                        let parts: Vec<&str> = decl.splitn(2, ':').collect();
+                        if parts.len() == 2 && parts[0].trim() == "border-spacing" {
+                            let val = parts[1].trim();
+                            // border-spacing accepts one or two values; use the first.
+                            let first = val.split_whitespace().next().unwrap_or(val);
+                            if let Some(rest) = first.strip_suffix("px") {
+                                return rest.trim().parse::<f32>().ok();
+                            }
+                            return first.parse::<f32>().ok();
+                        }
+                    }
+                    None
+                })
+        })
+        .or_else(|| {
+            // Also check parent_style_props for border-spacing.
+            parent_style_props.iter()
+                .find(|(k, _)| k == "border-spacing")
+                .and_then(|(_, v)| match v {
+                    StyleValue::Px(px) => Some(*px),
+                    StyleValue::Str(s) | StyleValue::Keyword(s) => {
+                        let first = s.split_whitespace().next().unwrap_or(s);
+                        first.strip_suffix("px")
+                            .and_then(|r| r.parse::<f32>().ok())
+                            .or_else(|| first.parse::<f32>().ok())
+                    }
+                    _ => None,
+                })
+        })
         .unwrap_or(2.0);
     let border: f32 = table_attrs
         .iter()
@@ -2359,6 +2502,30 @@ fn layout_table(
         Some(Dimension::Percent(pct)) => (available_width * pct).min(available_width),
         _ => available_width,
     };
+
+    // Extract caption-side from CSS (default: "top").
+    let caption_side = table_attrs.iter()
+        .find(|(k, _)| k == "data-nova-style")
+        .and_then(|(_, style_str)| {
+            for decl in style_str.split(';') {
+                let parts: Vec<&str> = decl.splitn(2, ':').collect();
+                if parts.len() == 2 && parts[0].trim() == "caption-side" {
+                    return Some(parts[1].trim().to_string());
+                }
+            }
+            None
+        })
+        .unwrap_or_else(|| "top".to_string());
+
+    // Collect <caption> elements from table children.
+    let mut caption_nodes: Vec<&DomNode> = Vec::new();
+    for child in children {
+        if let DomNode::Element { tag, .. } = child {
+            if tag == "caption" {
+                caption_nodes.push(child);
+            }
+        }
+    }
 
     // Phase 1: Collect all rows.
     let mut all_rows: Vec<TableRow> = Vec::new();
@@ -2841,8 +3008,27 @@ fn layout_table(
         },
     };
 
+    // Layout caption nodes if any.
+    let mut caption_ids: Vec<NodeId> = Vec::new();
+    for cap_node in &caption_nodes {
+        let cap_id = add_node(taffy, cap_node, table_width, parent_font_size, parent_style_props, viewport, depth + 1)?;
+        caption_ids.push(cap_id);
+    }
+
+    // Build the final children list: captions before or after rows based on caption-side.
+    let mut table_children_ids: Vec<NodeId> = Vec::new();
+    if caption_side != "bottom" {
+        // caption-side: top (default) — captions come first.
+        table_children_ids.extend(&caption_ids);
+        table_children_ids.extend(&row_ids);
+    } else {
+        // caption-side: bottom — rows first, then captions.
+        table_children_ids.extend(&row_ids);
+        table_children_ids.extend(&caption_ids);
+    }
+
     taffy
-        .new_with_children(table_style, &row_ids)
+        .new_with_children(table_style, &table_children_ids)
         .map(|id| {
             taffy.set_node_context(id, Some(table_ctx)).ok();
             id

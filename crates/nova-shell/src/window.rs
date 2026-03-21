@@ -800,6 +800,7 @@ impl BrowserWindow {
                         self.framebuffer.draw_text(
                             fx + 4.0, text_y, &display_text, font_size, text_color,
                             None, None, None,
+                            None,
                         );
                     }
                 }
@@ -822,6 +823,7 @@ impl BrowserWindow {
                         self.framebuffer.draw_text(
                             fx + 4.0, text_y, &display_text, font_size, text_color,
                             None, None, None,
+                            None,
                         );
                     }
                 }
@@ -844,6 +846,7 @@ impl BrowserWindow {
                         self.framebuffer.draw_text(
                             fx + 4.0, text_y, &display_text, font_size, text_color,
                             None, None, None,
+                            None,
                         );
                     }
                 }
@@ -864,6 +867,7 @@ impl BrowserWindow {
                             bx + 1.0, by + box_size - 2.0,
                             "\u{2713}", box_size - 2.0, Color::WHITE,
                             Some(700), None, None,
+                            None,
                         );
                     }
                 }
@@ -886,6 +890,7 @@ impl BrowserWindow {
                         "\u{25BC}", font_size * 0.6,
                         Color::rgb(0.3, 0.3, 0.3),
                         None, None, None,
+                        None,
                     );
                     // Display the selected option's label, or the value.
                     let display_text = if !value.is_empty() {
@@ -903,6 +908,7 @@ impl BrowserWindow {
                         fy + font_size + (h - font_size) / 2.0 - 2.0,
                         &display_text, font_size, Color::BLACK,
                         None, None, None,
+                        None,
                     );
                 }
                 _ => {
@@ -1026,6 +1032,7 @@ impl BrowserWindow {
             self.framebuffer.draw_text(
                 fx + 6.0, text_y, label, font_size, text_color,
                 None, None, None,
+                None,
             );
 
             // Separator line between options.
@@ -1132,7 +1139,7 @@ impl BrowserWindow {
         }
 
         self.framebuffer
-            .draw_text(text_x, text_y, &self.url_bar_text, URL_BAR_FONT_SIZE, text_color, None, None, None);
+            .draw_text(text_x, text_y, &self.url_bar_text, URL_BAR_FONT_SIZE, text_color, None, None, None, None);
 
         // -- Cursor (vertical line at the cursor position) --
         if self.url_bar_focused && !self.url_bar_select_all {
@@ -1772,6 +1779,7 @@ impl BrowserWindow {
             None,
             None,
             None,
+            None,
         );
 
         // Match count.
@@ -1793,6 +1801,7 @@ impl BrowserWindow {
                 &count_text,
                 11.0,
                 Color { r: 0.4, g: 0.4, b: 0.4, a: 1.0 },
+                None,
                 None,
                 None,
                 None,
@@ -1871,6 +1880,7 @@ impl BrowserWindow {
             None,
             None,
             None,
+            None,
         );
 
         self.zoom_indicator_ticks = self.zoom_indicator_ticks.saturating_sub(1);
@@ -1891,7 +1901,7 @@ impl BrowserWindow {
             Color { r: 0.5, g: 0.5, b: 0.5, a: 1.0 } // gray
         };
 
-        self.framebuffer.draw_text(star_x, star_y, star_char, 16.0, color, None, None, None);
+        self.framebuffer.draw_text(star_x, star_y, star_char, 16.0, color, None, None, None, None);
     }
 
     /// Navigate to a new URL without closing the window.

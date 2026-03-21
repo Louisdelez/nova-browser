@@ -77,6 +77,8 @@ pub enum RenderOp {
         /// loaded (via `@font-face`), the renderer uses that font instead of
         /// the default DejaVu Sans.
         font_family: Option<String>,
+        /// CSS `letter-spacing` in pixels. `None` means normal spacing.
+        letter_spacing: Option<f32>,
     },
     /// Draw an image from a GPU texture.
     DrawTexture {
@@ -119,6 +121,18 @@ pub enum RenderOp {
         y: f32,
         width: f32,
         height: f32,
+    },
+    /// Push a rounded-corner clip rectangle (nested clips stack).
+    ///
+    /// Like `PushClip` but with rounded corners. `radius` contains the
+    /// corner radii in CSS order: `[top-left, top-right, bottom-right, bottom-left]`.
+    PushRoundedClip {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        /// Corner radii in pixels: [top-left, top-right, bottom-right, bottom-left].
+        radius: [f32; 4],
     },
     /// Pop the current clip rectangle.
     PopClip,

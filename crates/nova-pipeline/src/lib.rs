@@ -95,22 +95,6 @@ fn extract_noscript_redirect(node: &DomNode, base_url: &Option<Url>) -> Option<S
     }
 }
 
-/// Check if a DOM tree contains a visible `<input name="q">` (search box).
-fn has_search_input(node: &DomNode) -> bool {
-    match node {
-        DomNode::Element { tag, attributes, children, .. } => {
-            if tag == "input" {
-                if attributes.iter().any(|(k, v)| k == "name" && v == "q") {
-                    return true;
-                }
-            }
-            children.iter().any(|c| has_search_input(c))
-        }
-        DomNode::Document { children } => children.iter().any(|c| has_search_input(c)),
-        _ => false,
-    }
-}
-
 /// Check if a URL is a Google homepage (www.google.com, google.com, etc.).
 fn is_google_homepage(url: &str) -> bool {
     if let Ok(parsed) = Url::parse(url) {
@@ -127,46 +111,63 @@ fn is_google_homepage(url: &str) -> bool {
     false
 }
 
-/// Inject a Google search form into the DOM if no `<input name="q">` exists.
+/// Inject a visible Google search form into the DOM.
 ///
-/// This is a fallback for when Google's noscript content doesn't include a
-/// working search form. Inserts a simple search form into the `<body>`.
+/// Always injects the form regardless of whether Google's own `<input name="q">`
+/// exists, because Google's version is typically hidden inside `<noscript>` or a
+/// `display:none` container.  The injected form uses explicit inline styles so
+/// it is always visible.
 fn inject_google_search_form(node: &mut DomNode) {
     // Find <body> and append the form.
     match node {
         DomNode::Element { tag, children, .. } => {
             if tag == "body" {
-                // Build the search form as DOM nodes.
+                // Build the search form as DOM nodes with rounded, centered styling.
                 let form = DomNode::Element {
                     tag: "form".into(),
                     attributes: vec![
                         ("action".into(), "/search".into()),
                         ("method".into(), "GET".into()),
-                        ("style".into(), "text-align:center;margin:40px auto;max-width:600px".into()),
                     ],
                     children: vec![
                         DomNode::Element {
-                            tag: "input".into(),
-                            attributes: vec![
-                                ("name".into(), "q".into()),
-                                ("type".into(), "text".into()),
-                                ("style".into(), "width:100%;padding:12px 16px;font-size:16px;border:1px solid #dfe1e5;border-radius:24px;outline:none".into()),
-                                ("placeholder".into(), "Google Search".into()),
-                            ],
-                            children: vec![],
-                        },
-                        DomNode::Element {
                             tag: "div".into(),
                             attributes: vec![
-                                ("style".into(), "margin-top:16px;text-align:center".into()),
+                                ("style".into(), "text-align:center;margin:20px auto;max-width:584px".into()),
                             ],
                             children: vec![
                                 DomNode::Element {
                                     tag: "input".into(),
                                     attributes: vec![
+                                        ("name".into(), "q".into()),
+                                        ("type".into(), "text".into()),
+                                        ("style".into(), "width:100%;padding:12px 20px;font-size:16px;border:1px solid #dfe1e5;border-radius:24px;box-sizing:border-box".into()),
+                                        ("autocomplete".into(), "off".into()),
+                                        ("title".into(), "Search".into()),
+                                    ],
+                                    children: vec![],
+                                },
+                                DomNode::Element {
+                                    tag: "br".into(),
+                                    attributes: vec![],
+                                    children: vec![],
+                                },
+                                DomNode::Element {
+                                    tag: "input".into(),
+                                    attributes: vec![
                                         ("type".into(), "submit".into()),
                                         ("value".into(), "Google Search".into()),
-                                        ("style".into(), "padding:8px 16px;margin:4px;background:#f8f9fa;border:1px solid #dfe1e5;border-radius:4px;font-size:14px;cursor:pointer".into()),
+                                        ("style".into(), "margin-top:12px;padding:8px 20px;background-color:#f8f9fa;border:1px solid #f8f9fa;border-radius:4px;font-size:14px;color:#3c4043;margin-right:8px".into()),
+                                    ],
+                                    children: vec![],
+                                },
+                                DomNode::Element {
+                                    tag: "input".into(),
+                                    attributes: vec![
+                                        ("type".into(), "submit".into()),
+                                        ("value".into(), "I'm Feeling Lucky".into()),
+                                        ("name".into(), "btnI".into()),
+                                        ("style".into(), "padding:8px 20px;background-color:#f8f9fa;border:1px solid #f8f9fa;border-radius:4px;font-size:14px;color:#3c4043".into()),
                                     ],
                                     children: vec![],
                                 },
@@ -253,17 +254,16 @@ impl PipelineEngine {
             }
         }
 
-        // Step 2c: Google search form fallback.
-        // If this is a Google homepage and the DOM doesn't contain a search
-        // input (<input name="q">), inject a simple search form so users can
-        // search even when Google's JS-heavy page doesn't render properly.
+        // Step 2c: Inject Google search form.
+        // Always inject on Google homepages — Google's own search input is
+        // typically hidden inside a <noscript> or display:none container, so
+        // `has_search_input()` would find it and skip injection even though
+        // the input is invisible.  Our injected form has explicit inline
+        // styles and is always visible.
         if is_google_homepage(url) {
-            let needs_injection = matches!(&dom, TypedData::Dom(node) if !has_search_input(node));
-            if needs_injection {
-                info!("Pipeline: Google homepage has no search input, injecting search form");
-                if let TypedData::Dom(ref mut node) = dom {
-                    inject_google_search_form(node);
-                }
+            if let TypedData::Dom(ref mut node) = dom {
+                inject_google_search_form(node);
+                info!("Pipeline: injected Google search form");
             }
         }
 

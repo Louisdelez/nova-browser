@@ -403,6 +403,20 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         return;
     }
 
+    // empty-cells: hide — skip painting empty table cells.
+    // A cell is considered empty when it has no children or all children
+    // are zero-sized text nodes.
+    if is_empty_cells_hide(&layout_box.style) {
+        let all_empty = layout_box.children.is_empty()
+            || layout_box.children.iter().all(|child| {
+                matches!(&child.content, LayoutContent::Text(t) if t.trim().is_empty())
+                    || (child.width <= 0.0 && child.height <= 0.0)
+            });
+        if all_empty {
+            return;
+        }
+    }
+
     // visibility: hidden — element takes up space but is invisible.
     // We still recurse into children because a child may have visibility: visible.
     let is_hidden = is_visibility_hidden(&layout_box.style);
@@ -603,6 +617,7 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
             let font_weight = extract_font_weight(&layout_box.style);
             let font_style = extract_font_style(&layout_box.style);
             let font_family = extract_font_family(&layout_box.style);
+            let letter_spacing = extract_letter_spacing(&layout_box.style);
             let transformed_text = apply_text_transform(text, &layout_box.style);
 
             // Apply text-overflow: ellipsis when the text overflows a
@@ -622,6 +637,23 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
             } else {
                 transformed_text.clone()
             };
+
+            // Emit text-shadow before the main text (painter's order: shadow → text).
+            if let Some((sx, sy, blur, shadow_color)) = extract_text_shadow(&layout_box.style) {
+                let shadow_color = multiply_alpha(shadow_color, opacity);
+                ops.push(RenderOp::DrawText {
+                    x: layout_box.x + sx,
+                    y: layout_box.y + font_size + sy,
+                    text: final_text.clone(),
+                    font_size,
+                    color: shadow_color,
+                    font_weight,
+                    font_style: font_style.clone(),
+                    font_family: font_family.clone(),
+                    letter_spacing,
+                });
+            }
+
             ops.push(RenderOp::DrawText {
                 x: layout_box.x,
                 y: layout_box.y + font_size, // baseline offset
@@ -631,6 +663,7 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                 font_weight,
                 font_style,
                 font_family,
+                letter_spacing,
             });
 
             // Draw underline if text-decoration: underline is set.
@@ -663,7 +696,16 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                     img_width as f32, img_height as f32,
                 );
 
-                if needs_clip {
+                // Check for border-radius on images — clip with rounded rect.
+                let img_radius = extract_border_radius(&layout_box.style, layout_box.width, layout_box.height);
+                let has_img_radius = img_radius.iter().any(|&r| r > 0.0);
+                if has_img_radius {
+                    ops.push(RenderOp::PushRoundedClip {
+                        x: layout_box.x, y: layout_box.y,
+                        width: layout_box.width, height: layout_box.height,
+                        radius: img_radius,
+                    });
+                } else if needs_clip {
                     ops.push(RenderOp::PushClip {
                         x: layout_box.x, y: layout_box.y,
                         width: layout_box.width, height: layout_box.height,
@@ -676,7 +718,7 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                     img_width, img_height, pixels,
                 });
 
-                if needs_clip {
+                if has_img_radius || needs_clip {
                     ops.push(RenderOp::PopClip);
                 }
             }
@@ -694,7 +736,7 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                 color: Color::rgb(0.4, 0.4, 0.4),
                 font_weight: None,
                 font_style: None,
-                font_family: None,
+                font_family: None, letter_spacing: None,
             });
         }
     }
@@ -728,7 +770,7 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                 text: "[inline SVG]".to_string(),
                 font_size: 12.0,
                 color: Color::rgb(0.4, 0.4, 0.4),
-                font_weight: None, font_style: None, font_family: None,
+                font_weight: None, font_style: None, font_family: None, letter_spacing: None,
             });
         }
     }
@@ -769,7 +811,7 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
             x: layout_box.x + 4.0, y: layout_box.y + 14.0,
             text: label, font_size: 11.0,
             color: Color::rgb(0.4, 0.4, 0.4),
-            font_weight: None, font_style: Some("italic".to_string()), font_family: None,
+            font_weight: None, font_style: Some("italic".to_string()), font_family: None, letter_spacing: None,
         });
     }
 
@@ -1011,6 +1053,22 @@ fn is_visibility_hidden(style: &nova_mod_api::content::StyleMap) -> bool {
                 _ => continue,
             };
             return val_str == "hidden" || val_str == "collapse";
+        }
+    }
+    false
+}
+
+/// Check if `empty-cells: hide` is set on a style.
+///
+/// Used for table cells: when set, cells with no visible content are not painted.
+fn is_empty_cells_hide(style: &nova_mod_api::content::StyleMap) -> bool {
+    for (key, value) in &style.properties {
+        if key == "empty-cells" {
+            let val_str = match value {
+                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
+                _ => continue,
+            };
+            return val_str == "hide";
         }
     }
     false
@@ -1357,7 +1415,7 @@ fn paint_list_marker(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, opacity: f
         color: text_color,
         font_weight: None,
         font_style: None,
-        font_family: None,
+        font_family: None, letter_spacing: None,
     });
 }
 
@@ -1441,6 +1499,89 @@ fn parse_length_px(s: &str) -> Option<f32> {
     } else {
         s.parse::<f32>().ok()
     }
+}
+
+/// Extract the CSS `letter-spacing` value from a style map.
+///
+/// Returns `Some(px)` when letter-spacing is explicitly set, `None` otherwise.
+fn extract_letter_spacing(style: &nova_mod_api::content::StyleMap) -> Option<f32> {
+    for (key, value) in &style.properties {
+        if key == "letter-spacing" {
+            match value {
+                StyleValue::Px(px) => return Some(*px),
+                StyleValue::Str(s) | StyleValue::Keyword(s) => {
+                    let s = s.trim();
+                    if s == "normal" {
+                        return None;
+                    }
+                    if let Some(px) = parse_length_px(s) {
+                        return Some(px);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Extract the CSS `text-shadow` value from a style map.
+///
+/// Returns `Some((offset_x, offset_y, blur, color))` for the first shadow,
+/// or `None` if not set.
+fn extract_text_shadow(style: &nova_mod_api::content::StyleMap) -> Option<(f32, f32, f32, Color)> {
+    for (key, value) in &style.properties {
+        if key == "text-shadow" {
+            let s = match value {
+                StyleValue::Str(s) | StyleValue::Keyword(s) => s.as_str(),
+                _ => continue,
+            };
+            let s = s.trim();
+            if s == "none" || s.is_empty() {
+                return None;
+            }
+            // Parse: offset-x offset-y [blur-radius] [color]
+            // Color can come before or after the lengths.
+            // Try to detect color tokens vs length tokens.
+            let parts: Vec<&str> = s.split(',').next().unwrap_or(s).trim().split_whitespace().collect();
+            if parts.is_empty() {
+                return None;
+            }
+
+            let mut lengths: Vec<f32> = Vec::new();
+            let mut color_parts: Vec<&str> = Vec::new();
+
+            for part in &parts {
+                if let Some(px) = parse_length_px(part) {
+                    lengths.push(px);
+                } else {
+                    color_parts.push(part);
+                }
+            }
+            // Also check for rgb()/rgba() color that was split by spaces.
+            if color_parts.is_empty() && parts.len() > lengths.len() {
+                // Reconstruct potential color string from remaining parts.
+                let color_str = parts[lengths.len()..].join(" ");
+                if let Some(c) = parse_color_string(&color_str) {
+                    let ox = lengths.first().copied().unwrap_or(0.0);
+                    let oy = lengths.get(1).copied().unwrap_or(0.0);
+                    let blur = lengths.get(2).copied().unwrap_or(0.0);
+                    return Some((ox, oy, blur, c));
+                }
+            }
+            let color_str = color_parts.join(" ");
+            let color = if color_str.is_empty() {
+                Color::rgba(0.0, 0.0, 0.0, 0.5)
+            } else {
+                parse_color_string(&color_str).unwrap_or(Color::rgba(0.0, 0.0, 0.0, 0.5))
+            };
+            let ox = lengths.first().copied().unwrap_or(0.0);
+            let oy = lengths.get(1).copied().unwrap_or(0.0);
+            let blur = lengths.get(2).copied().unwrap_or(0.0);
+            return Some((ox, oy, blur, color));
+        }
+    }
+    None
 }
 
 /// Extract the CSS `border-radius` from a style map.
@@ -2021,7 +2162,7 @@ fn paint_form_field_visual(layout_box: &LayoutBox, info: &FormFieldInfo, ops: &m
                     color: Color::WHITE,
                     font_weight: Some(700),
                     font_style: None,
-                    font_family: None,
+                    font_family: None, letter_spacing: None,
                 });
             }
         }
@@ -2078,7 +2219,7 @@ fn paint_form_field_visual(layout_box: &LayoutBox, info: &FormFieldInfo, ops: &m
                 color: Color::BLACK,
                 font_weight: None,
                 font_style: None,
-                font_family: None,
+                font_family: None, letter_spacing: None,
             });
         }
 
@@ -2097,7 +2238,7 @@ fn paint_form_field_visual(layout_box: &LayoutBox, info: &FormFieldInfo, ops: &m
                 text: "Choose File".to_string(),
                 font_size,
                 color: Color::BLACK,
-                font_weight: None, font_style: None, font_family: None,
+                font_weight: None, font_style: None, font_family: None, letter_spacing: None,
             });
             let filename = if info.value.is_empty() { "No file chosen" } else { &info.value };
             ops.push(RenderOp::DrawText {
@@ -2105,7 +2246,7 @@ fn paint_form_field_visual(layout_box: &LayoutBox, info: &FormFieldInfo, ops: &m
                 text: filename.to_string(),
                 font_size,
                 color: Color::rgb(0.4, 0.4, 0.4),
-                font_weight: None, font_style: None, font_family: None,
+                font_weight: None, font_style: None, font_family: None, letter_spacing: None,
             });
         }
 
@@ -2127,7 +2268,7 @@ fn paint_form_field_visual(layout_box: &LayoutBox, info: &FormFieldInfo, ops: &m
                 text: "\u{25BC}".to_string(),
                 font_size: font_size * 0.6,
                 color: Color::rgb(0.3, 0.3, 0.3),
-                font_weight: None, font_style: None, font_family: None,
+                font_weight: None, font_style: None, font_family: None, letter_spacing: None,
             });
             let display_text = if !info.value.is_empty() {
                 &info.value
@@ -2141,7 +2282,7 @@ fn paint_form_field_visual(layout_box: &LayoutBox, info: &FormFieldInfo, ops: &m
                 text: display_text.to_string(),
                 font_size,
                 color: Color::BLACK,
-                font_weight: None, font_style: None, font_family: None,
+                font_weight: None, font_style: None, font_family: None, letter_spacing: None,
             });
         }
 
@@ -2170,7 +2311,7 @@ fn paint_form_field_visual(layout_box: &LayoutBox, info: &FormFieldInfo, ops: &m
                     text: display_text.to_string(),
                     font_size,
                     color: text_color,
-                    font_weight: None, font_style: None, font_family: None,
+                    font_weight: None, font_style: None, font_family: None, letter_spacing: None,
                 });
             }
         }
@@ -2234,7 +2375,7 @@ fn paint_text_input_visual(layout_box: &LayoutBox, info: &FormFieldInfo, ops: &m
             text: display_text,
             font_size,
             color: text_color,
-            font_weight: None, font_style: None, font_family: None,
+            font_weight: None, font_style: None, font_family: None, letter_spacing: None,
         });
     }
 }
@@ -3008,7 +3149,7 @@ fn paint_video(
         color: multiply_alpha(Color::WHITE, opacity),
         font_weight: None,
         font_style: None,
-        font_family: None,
+        font_family: None, letter_spacing: None,
     });
 
     // Controls bar at the bottom.
@@ -3073,7 +3214,7 @@ fn paint_media_controls(
         color: text_color,
         font_weight: None,
         font_style: None,
-        font_family: None,
+        font_family: None, letter_spacing: None,
     });
 
     // Time display.
@@ -3088,7 +3229,7 @@ fn paint_media_controls(
         color: text_color,
         font_weight: None,
         font_style: None,
-        font_family: None,
+        font_family: None, letter_spacing: None,
     });
 
     // Progress bar (empty track).
@@ -3115,7 +3256,7 @@ fn paint_media_controls(
         color: text_color,
         font_weight: None,
         font_style: None,
-        font_family: None,
+        font_family: None, letter_spacing: None,
     });
 }
 

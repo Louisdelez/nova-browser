@@ -37,6 +37,137 @@ struct CachedGlyph {
     metrics: fontdue::Metrics,
 }
 
+/// FreeType-based glyph rasterizer for high-quality anti-aliased text.
+///
+/// Uses FreeType2 (the same library as Chromium/Firefox on Linux) for
+/// glyph rasterization with proper hinting and anti-aliasing.
+struct FreeTypeRasterizer {
+    library: freetype::Library,
+    /// Regular face bytes (kept alive for FreeType).
+    regular_bytes: Vec<u8>,
+    bold_bytes: Option<Vec<u8>>,
+    italic_bytes: Option<Vec<u8>>,
+    /// Custom font bytes keyed by lowercased family name.
+    custom_bytes: HashMap<String, Vec<u8>>,
+    /// Glyph cache: (family_or_variant, char, font_size*10) → (bitmap, width, height, bearing_x, bearing_y, advance)
+    cache: HashMap<(String, char, u32), FtCachedGlyph>,
+}
+
+/// A cached FreeType glyph.
+struct FtCachedGlyph {
+    bitmap: Vec<u8>,
+    width: i32,
+    height: i32,
+    bearing_x: i32,
+    bearing_y: i32,
+    advance_x: f32,
+}
+
+impl FreeTypeRasterizer {
+    fn new(regular_bytes: Vec<u8>) -> Option<Self> {
+        let library = freetype::Library::init().ok()?;
+        // Validate the font data.
+        let face = library.new_memory_face(regular_bytes.clone(), 0).ok()?;
+        drop(face);
+        Some(Self {
+            library,
+            regular_bytes,
+            bold_bytes: None,
+            italic_bytes: None,
+            custom_bytes: HashMap::new(),
+            cache: HashMap::new(),
+        })
+    }
+
+    fn set_bold(&mut self, bytes: Vec<u8>) {
+        if self.library.new_memory_face(bytes.clone(), 0).is_ok() {
+            self.bold_bytes = Some(bytes);
+        }
+    }
+
+    fn set_italic(&mut self, bytes: Vec<u8>) {
+        if self.library.new_memory_face(bytes.clone(), 0).is_ok() {
+            self.italic_bytes = Some(bytes);
+        }
+    }
+
+    fn load_custom_font(&mut self, family: &str, bytes: Vec<u8>) {
+        let key = family.to_lowercase();
+        if self.custom_bytes.contains_key(&key) {
+            return;
+        }
+        if self.library.new_memory_face(bytes.clone(), 0).is_ok() {
+            self.custom_bytes.insert(key, bytes);
+        }
+    }
+
+    fn has_custom_font(&self, family: &str) -> bool {
+        self.custom_bytes.contains_key(&family.to_lowercase())
+    }
+
+    /// Get the font bytes for a given variant/family.
+    fn font_bytes_for(&self, variant_key: &str) -> &[u8] {
+        match variant_key {
+            "bold" => self.bold_bytes.as_deref().unwrap_or(&self.regular_bytes),
+            "italic" => self.italic_bytes.as_deref().unwrap_or(&self.regular_bytes),
+            "regular" => &self.regular_bytes,
+            other => self.custom_bytes.get(other).map(|b| b.as_slice()).unwrap_or(&self.regular_bytes),
+        }
+    }
+
+    /// Rasterize a character and return the cached glyph.
+    fn rasterize(&mut self, ch: char, font_size: f32, variant_key: &str) -> &FtCachedGlyph {
+        let cache_key = (variant_key.to_string(), ch, (font_size * 10.0).round() as u32);
+        if !self.cache.contains_key(&cache_key) {
+            let bytes = self.font_bytes_for(variant_key).to_vec();
+            let glyph = self.rasterize_uncached(ch, font_size, &bytes);
+            self.cache.insert(cache_key.clone(), glyph);
+        }
+        self.cache.get(&cache_key).unwrap()
+    }
+
+    fn rasterize_uncached(&self, ch: char, font_size: f32, font_bytes: &[u8]) -> FtCachedGlyph {
+        let empty = FtCachedGlyph { bitmap: vec![], width: 0, height: 0, bearing_x: 0, bearing_y: 0, advance_x: font_size * 0.5 };
+        let face = match self.library.new_memory_face(font_bytes.to_vec(), 0) {
+            Ok(f) => f,
+            Err(_) => return empty,
+        };
+
+        // Explicitly select Unicode charmap.
+        let _ = face.set_char_size((font_size * 64.0) as isize, 0, 72, 72);
+
+        // Load glyph by Unicode code point with anti-aliasing and light hinting.
+        let load_flags = freetype::face::LoadFlag::RENDER | freetype::face::LoadFlag::TARGET_LIGHT;
+        if face.load_char(ch as usize, load_flags).is_err() {
+            return empty;
+        }
+
+        let glyph = face.glyph();
+        let bmp = glyph.bitmap();
+        let width = bmp.width();
+        let height = bmp.rows();
+        let bearing_x = glyph.bitmap_left();
+        let bearing_y = glyph.bitmap_top();
+        let advance_x = glyph.advance().x as f32 / 64.0;
+
+        // Copy bitmap data.
+        let buffer = bmp.buffer();
+        let pitch = bmp.pitch().unsigned_abs() as usize;
+        let mut bitmap = Vec::with_capacity((width * height) as usize);
+        for row in 0..height as usize {
+            let start = row * pitch;
+            let end = start + width as usize;
+            if end <= buffer.len() {
+                bitmap.extend_from_slice(&buffer[start..end]);
+            } else {
+                bitmap.extend(std::iter::repeat(0).take(width as usize));
+            }
+        }
+
+        FtCachedGlyph { bitmap, width, height, bearing_x, bearing_y, advance_x }
+    }
+}
+
 /// Which font variant to use for rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum FontVariant {
@@ -86,22 +217,80 @@ struct FontRenderer {
     custom_cache: HashMap<(String, char, u32), CachedGlyph>,
     /// Optional rustybuzz text shaper for kerning, ligatures, and BiDi.
     text_shaper: Option<TextShaper>,
+    /// FreeType rasterizer for high-quality text rendering (like Chromium/Firefox).
+    ft_rasterizer: Option<FreeTypeRasterizer>,
 }
 
 impl FontRenderer {
+    /// Resolve a font family name to a TTF file path using fontconfig.
+    ///
+    /// Handles `system-ui`, `sans-serif`, `serif`, `monospace` generic
+    /// families, and arbitrary family names. Returns `None` if fontconfig
+    /// is not available or no matching font is found.
+    fn resolve_font_family(family: &str) -> Option<std::path::PathBuf> {
+        use std::sync::Mutex;
+        use std::collections::HashMap as StdHashMap;
+
+        // Cache fontconfig results to avoid re-initializing for every call.
+        static CACHE: std::sync::LazyLock<Mutex<StdHashMap<String, Option<std::path::PathBuf>>>> =
+            std::sync::LazyLock::new(|| Mutex::new(StdHashMap::new()));
+
+        // Map CSS generic families to fontconfig patterns.
+        let fc_family = match family.trim().trim_matches('"').trim_matches('\'') {
+            "system-ui" => "sans-serif",
+            "sans-serif" => "sans-serif",
+            "serif" => "serif",
+            "monospace" => "monospace",
+            "cursive" => "cursive",
+            "fantasy" => "fantasy",
+            other => other,
+        };
+
+        let key = fc_family.to_lowercase();
+        if let Ok(cache) = CACHE.lock() {
+            if let Some(cached) = cache.get(&key) {
+                return cached.clone();
+            }
+        }
+
+        let result = fontconfig::Fontconfig::new()
+            .and_then(|fc| fc.find(fc_family, None))
+            .map(|font| font.path);
+
+        if let Ok(mut cache) = CACHE.lock() {
+            cache.insert(key, result.clone());
+        }
+
+        result
+    }
+
     /// Try to create a `FontRenderer` from the bundled DejaVu Sans fonts.
     ///
     /// Loads the regular variant (required) plus bold, italic, and bold-italic
     /// variants if available. Returns `None` if the regular font is not found.
+    ///
+    /// On Linux, uses fontconfig to resolve `sans-serif` as the default font
+    /// if the bundled DejaVu Sans is not available.
     fn new() -> Option<Self> {
-        let regular_bytes = Self::find_font_bytes("DejaVuSans.ttf")?;
+        // Load the default font.
+        let regular_bytes = Self::find_font_bytes("DejaVuSans.ttf")
+            .or_else(|| {
+                let path = Self::resolve_font_family("sans-serif")?;
+                let bytes = std::fs::read(&path).ok()?;
+                tracing::info!("Loaded system sans-serif font from {}", path.display());
+                Some(bytes)
+            })?;
 
-        // Initialize the rustybuzz text shaper from the same font data.
+        // Initialize the FreeType rasterizer (same as Chromium/Firefox on Linux).
+        let mut ft_rasterizer = FreeTypeRasterizer::new(regular_bytes.clone());
+        if ft_rasterizer.is_some() {
+            tracing::info!("FreeType rasterizer initialized for high-quality text rendering");
+        }
+
+        // Initialize the rustybuzz text shaper.
         let mut text_shaper = TextShaper::new(&regular_bytes);
         if text_shaper.is_some() {
             tracing::info!("rustybuzz TextShaper initialized for text shaping");
-        } else {
-            tracing::warn!("rustybuzz TextShaper failed to initialize; falling back to fontdue-only");
         }
 
         let settings = fontdue::FontSettings::default();
@@ -114,6 +303,9 @@ impl FontRenderer {
         if let (Some(shaper), Some(bytes)) = (&mut text_shaper, &bold_bytes) {
             shaper.set_bold(bytes);
         }
+        if let (Some(ft), Some(bytes)) = (&mut ft_rasterizer, &bold_bytes) {
+            ft.set_bold(bytes.clone());
+        }
 
         let italic_bytes = Self::find_font_bytes("DejaVuSans-Oblique.ttf");
         let italic = italic_bytes
@@ -121,6 +313,9 @@ impl FontRenderer {
             .and_then(|b| fontdue::Font::from_bytes(b.clone(), fontdue::FontSettings::default()).ok());
         if let (Some(shaper), Some(bytes)) = (&mut text_shaper, &italic_bytes) {
             shaper.set_italic(bytes);
+        }
+        if let (Some(ft), Some(bytes)) = (&mut ft_rasterizer, &italic_bytes) {
+            ft.set_italic(bytes.clone());
         }
 
         let bold_italic = Self::find_font_bytes("DejaVuSans-BoldOblique.ttf")
@@ -131,7 +326,8 @@ impl FontRenderer {
             italic = italic.is_some(),
             bold_italic = bold_italic.is_some(),
             text_shaper = text_shaper.is_some(),
-            "Font renderer initialized with variants"
+            freetype = ft_rasterizer.is_some(),
+            "Font renderer initialized"
         );
 
         Some(Self {
@@ -143,6 +339,7 @@ impl FontRenderer {
             custom_fonts: HashMap::new(),
             custom_cache: HashMap::new(),
             text_shaper,
+            ft_rasterizer,
         })
     }
 
@@ -194,8 +391,17 @@ impl FontRenderer {
         if let Some(root) = workspace_root {
             let path = root.join("assets/fonts").join(filename);
             if let Ok(bytes) = std::fs::read(&path) {
-                tracing::info!("Loaded font from {}", path.display());
-                return Some(bytes);
+                // Validate TTF/OTF magic bytes to reject Git LFS placeholders.
+                if bytes.len() > 4
+                    && (bytes[0..4] == [0x00, 0x01, 0x00, 0x00]  // TrueType
+                        || bytes[0..4] == [0x4F, 0x54, 0x54, 0x4F]  // OpenType (OTTO)
+                        || bytes[0..4] == [0x74, 0x72, 0x75, 0x65]) // TrueType (true)
+                {
+                    tracing::info!("Loaded font from {}", path.display());
+                    return Some(bytes);
+                } else {
+                    tracing::warn!("Skipping invalid font file at {} (not a TTF/OTF)", path.display());
+                }
             }
         }
 
@@ -320,6 +526,9 @@ impl Framebuffer {
         if let Some(ref mut renderer) = self.font_renderer {
             for (family, data) in fonts {
                 renderer.load_custom_font(family, data.clone());
+                if let Some(ref mut ft) = renderer.ft_rasterizer {
+                    ft.load_custom_font(family, data.clone());
+                }
             }
         } else {
             tracing::warn!(
@@ -577,15 +786,39 @@ impl Framebuffer {
 
         let variant = FontVariant::from_css(font_weight, font_style);
 
-        // Check if we should use a custom @font-face font.
-        let custom_family_key = font_family
-            .map(|f| f.to_lowercase())
-            .filter(|key| {
-                self.font_renderer
+        // Check if we should use a custom @font-face font, or resolve
+        // the font-family via fontconfig if not already loaded.
+        let custom_family_key = font_family.and_then(|family_str| {
+            // Parse CSS font-family (comma-separated list) and try each.
+            for candidate in family_str.split(',') {
+                let candidate = candidate.trim().trim_matches('"').trim_matches('\'');
+                if candidate.is_empty() { continue; }
+                let key = candidate.to_lowercase();
+                let has_it = self.font_renderer
                     .as_ref()
-                    .map(|r| r.custom_fonts.contains_key(key))
-                    .unwrap_or(false)
-            });
+                    .map(|r| r.custom_fonts.contains_key(&key))
+                    .unwrap_or(false);
+                if has_it {
+                    return Some(key);
+                }
+                // Try fontconfig to load this system font on demand (first time only).
+                if let Some(path) = FontRenderer::resolve_font_family(candidate) {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        if let Some(ref mut renderer) = self.font_renderer {
+                            renderer.load_custom_font(candidate, bytes.clone());
+                            // Also load into FreeType rasterizer.
+                            if let Some(ref mut ft) = renderer.ft_rasterizer {
+                                ft.load_custom_font(candidate, bytes);
+                            }
+                            if renderer.custom_fonts.contains_key(&key) {
+                                return Some(key);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        });
 
         // We need to temporarily take the font renderer out of `self` so we can
         // mutably borrow both `self` (for pixel writes) and the renderer (for
@@ -599,6 +832,9 @@ impl Framebuffer {
         let line_height = (font_size * 1.2).round() as i32;
 
         // Try shaped rendering when the text shaper is available.
+        // Word merging in the layout IFC ensures words + spaces are combined
+        // into single DrawText calls, so kerning differences don't cause
+        // inter-word gaps.
         let use_shaper = renderer.text_shaper.is_some() && !text.contains('\n');
         if use_shaper {
             let is_bold = font_weight.unwrap_or(400) >= 700;
@@ -632,36 +868,49 @@ impl Framebuffer {
                     cy += line_height;
                 }
 
-                // Rasterize with fontdue (by character).
-                let (metrics, bitmap) = if let Some(ref family_key) = custom_family_key {
-                    if let Some(cached) = renderer.rasterize_custom(family_key, ch, font_size) {
-                        (cached.metrics, cached.bitmap.clone())
-                    } else {
-                        let cached = renderer.rasterize(ch, font_size, variant);
-                        (cached.metrics, cached.bitmap.clone())
-                    }
+                // Determine the FreeType variant key.
+                let ft_variant_key = if let Some(ref fk) = custom_family_key {
+                    fk.as_str()
+                } else if is_bold {
+                    "bold"
+                } else if is_italic {
+                    "italic"
                 } else {
-                    let cached = renderer.rasterize(ch, font_size, variant);
-                    (cached.metrics, cached.bitmap.clone())
+                    "regular"
                 };
 
-                // Position using shaped offsets.
+                // Rasterize with FreeType (high quality) or fontdue (fallback).
                 let draw_x = (cursor_x + glyph.x_offset).round() as i32;
                 let draw_y = cy;
-                let gx = draw_x + metrics.xmin;
-                let gy = draw_y - metrics.ymin + glyph.y_offset.round() as i32;
-                let bw = metrics.width;
-                let bh = metrics.height;
 
-                for row in 0..bh {
-                    for col in 0..bw {
-                        let coverage = bitmap[row * bw + col];
-                        self.blend_glyph_pixel(
-                            gx + col as i32,
-                            gy + row as i32,
-                            coverage,
-                            color,
-                        );
+                if let Some(ref mut ft) = renderer.ft_rasterizer {
+                    let ft_glyph = ft.rasterize(ch, font_size, ft_variant_key);
+                    let gx = draw_x + ft_glyph.bearing_x;
+                    let gy = draw_y - ft_glyph.bearing_y + glyph.y_offset.round() as i32;
+                    let bw = ft_glyph.width;
+                    let bh = ft_glyph.height;
+                    let bitmap = ft_glyph.bitmap.clone();
+
+                    for row in 0..bh {
+                        for col in 0..bw {
+                            let coverage = bitmap[(row * bw + col) as usize];
+                            self.blend_glyph_pixel(gx + col, gy + row, coverage, color);
+                        }
+                    }
+                } else {
+                    // Fallback: fontdue rasterization.
+                    let cached = renderer.rasterize(ch, font_size, variant);
+                    let metrics = cached.metrics;
+                    let bitmap = cached.bitmap.clone();
+                    let gx = draw_x + metrics.xmin;
+                    let gy = draw_y - metrics.ymin + glyph.y_offset.round() as i32;
+                    let bw = metrics.width;
+                    let bh = metrics.height;
+                    for row in 0..bh {
+                        for col in 0..bw {
+                            let coverage = bitmap[row * bw + col];
+                            self.blend_glyph_pixel(gx + col as i32, gy + row as i32, coverage, color);
+                        }
                     }
                 }
 
@@ -674,6 +923,17 @@ impl Framebuffer {
         }
 
         // Fallback: character-by-character rendering without shaping.
+        // Determine FreeType variant key for the fallback path.
+        let ft_fallback_key = if custom_family_key.is_some() {
+            custom_family_key.as_deref().unwrap_or("regular")
+        } else if font_weight.unwrap_or(400) >= 700 {
+            "bold"
+        } else if font_style.map(|s| s == "italic" || s == "oblique").unwrap_or(false) {
+            "italic"
+        } else {
+            "regular"
+        };
+
         for ch in text.chars() {
             if ch == '\n' {
                 cx = x.round() as i32;
@@ -681,46 +941,61 @@ impl Framebuffer {
                 continue;
             }
 
-            // Rasterize: use the custom font if available, otherwise the default.
-            let (metrics, bitmap) = if let Some(ref family_key) = custom_family_key {
-                if let Some(glyph) = renderer.rasterize_custom(family_key, ch, font_size) {
-                    (glyph.metrics, glyph.bitmap.clone())
+            // Use FreeType if available, otherwise fontdue.
+            if let Some(ref mut ft) = renderer.ft_rasterizer {
+                let ft_glyph = ft.rasterize(ch, font_size, ft_fallback_key);
+                let advance = ft_glyph.advance_x;
+
+                if cx + advance as i32 > fb_width && cx > x.round() as i32 {
+                    cx = x.round() as i32;
+                    cy += line_height;
+                }
+
+                let gx = cx + ft_glyph.bearing_x;
+                let gy = cy - ft_glyph.bearing_y;
+                let bw = ft_glyph.width;
+                let bh = ft_glyph.height;
+                let bitmap = ft_glyph.bitmap.clone();
+
+                for row in 0..bh {
+                    for col in 0..bw {
+                        let coverage = bitmap[(row * bw + col) as usize];
+                        self.blend_glyph_pixel(gx + col, gy + row, coverage, color);
+                    }
+                }
+                cx += advance.round() as i32;
+            } else {
+                // fontdue fallback.
+                let (metrics, bitmap) = if let Some(ref family_key) = custom_family_key {
+                    if let Some(glyph) = renderer.rasterize_custom(family_key, ch, font_size) {
+                        (glyph.metrics, glyph.bitmap.clone())
+                    } else {
+                        let glyph = renderer.rasterize(ch, font_size, variant);
+                        (glyph.metrics, glyph.bitmap.clone())
+                    }
                 } else {
-                    // Custom font didn't have this glyph — fall back to default.
                     let glyph = renderer.rasterize(ch, font_size, variant);
                     (glyph.metrics, glyph.bitmap.clone())
+                };
+
+                if cx + metrics.advance_width as i32 > fb_width && cx > x.round() as i32 {
+                    cx = x.round() as i32;
+                    cy += line_height;
                 }
-            } else {
-                let glyph = renderer.rasterize(ch, font_size, variant);
-                (glyph.metrics, glyph.bitmap.clone())
-            };
 
-            // Line wrapping: if this glyph would exceed the framebuffer width,
-            // wrap to the next line.
-            if cx + metrics.advance_width as i32 > fb_width && cx > x.round() as i32 {
-                cx = x.round() as i32;
-                cy += line_height;
-            }
+                let gx = cx + metrics.xmin;
+                let gy = cy - metrics.ymin;
+                let bw = metrics.width;
+                let bh = metrics.height;
 
-            // Blit the glyph bitmap.
-            let gx = cx + metrics.xmin;
-            let gy = cy - metrics.ymin; // fontdue ymin is distance from baseline up
-            let bw = metrics.width;
-            let bh = metrics.height;
-
-            for row in 0..bh {
-                for col in 0..bw {
-                    let coverage = bitmap[row * bw + col];
-                    self.blend_glyph_pixel(
-                        gx + col as i32,
-                        gy + row as i32,
-                        coverage,
-                        color,
-                    );
+                for row in 0..bh {
+                    for col in 0..bw {
+                        let coverage = bitmap[row * bw + col];
+                        self.blend_glyph_pixel(gx + col as i32, gy + row as i32, coverage, color);
+                    }
                 }
+                cx += metrics.advance_width as i32;
             }
-
-            cx += metrics.advance_width as i32;
         }
 
         // Put the renderer back.

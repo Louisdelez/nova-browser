@@ -403,6 +403,8 @@ fn parse_length_or_number(raw: &str) -> Option<StyleValue> {
             .map(StyleValue::Percent)
     } else if raw.ends_with("em") || raw.ends_with("rem") {
         // Convert em/rem to px using 16px base (approximate).
+        // The cascade will re-resolve `em` values contextually against the
+        // parent's computed font-size when available.
         let num_end = if raw.ends_with("rem") {
             raw.len() - 3
         } else {
@@ -430,6 +432,25 @@ fn parse_length_or_number(raw: &str) -> Option<StyleValue> {
     } else {
         // Try plain number.
         raw.parse::<f32>().ok().map(StyleValue::Number)
+    }
+}
+
+/// Resolve a CSS value string that may contain `em` units against a
+/// given parent font-size context.
+///
+/// Returns the resolved px value if the input is an `em` value, or `None`
+/// if the input is not an em value.
+pub fn resolve_em_value(raw: &str, parent_font_size: f32) -> Option<f32> {
+    let raw = raw.trim();
+    if raw.ends_with("em") && !raw.ends_with("rem") {
+        let num_end = raw.len() - 2;
+        raw[..num_end]
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|n| n * parent_font_size)
+    } else {
+        None
     }
 }
 

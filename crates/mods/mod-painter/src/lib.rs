@@ -897,8 +897,11 @@ fn extract_font_style(style: &nova_mod_api::content::StyleMap) -> Option<String>
 /// Extract the first CSS font-family name from a style map.
 ///
 /// Returns the first family name (stripped of quotes) if set, `None` otherwise.
-/// Generic families like `sans-serif`, `serif`, `monospace` are ignored since
-/// they map to the default font.
+/// Extract the CSS `font-family` value from a style map.
+///
+/// Returns the full comma-separated font-family string so the renderer
+/// can try each candidate (including generic families like `sans-serif`,
+/// `system-ui`) via fontconfig resolution.
 fn extract_font_family(style: &nova_mod_api::content::StyleMap) -> Option<String> {
     for (key, value) in &style.properties {
         if key == "font-family" {
@@ -906,19 +909,9 @@ fn extract_font_family(style: &nova_mod_api::content::StyleMap) -> Option<String
                 StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
                 _ => continue,
             };
-            // font-family can be a comma-separated list. Take the first entry.
-            let first = raw.split(',').next().unwrap_or(raw).trim();
-            let first = first.trim_matches(|c: char| c == '"' || c == '\'');
-            // Skip generic families — the renderer already handles those.
-            let generic = [
-                "sans-serif", "serif", "monospace", "cursive", "fantasy",
-                "system-ui", "-apple-system", "BlinkMacSystemFont",
-            ];
-            if generic.iter().any(|g| g.eq_ignore_ascii_case(first)) {
-                return None;
-            }
-            if !first.is_empty() {
-                return Some(first.to_string());
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
             }
         }
     }
@@ -1562,18 +1555,20 @@ mod tests {
             StyleValue::Str("\"Roboto\", sans-serif".into()),
         ));
         let result = extract_font_family(&style);
-        assert_eq!(result, Some("Roboto".to_string()));
+        // Now returns the full comma-separated string for fontconfig resolution.
+        assert_eq!(result, Some("\"Roboto\", sans-serif".to_string()));
     }
 
     #[test]
-    fn extract_font_family_generic_returns_none() {
+    fn extract_font_family_generic_returns_some() {
         let mut style = StyleMap::default();
         style.properties.push((
             "font-family".into(),
             StyleValue::Keyword("sans-serif".into()),
         ));
         let result = extract_font_family(&style);
-        assert_eq!(result, None);
+        // Generic families are now passed through for fontconfig resolution.
+        assert_eq!(result, Some("sans-serif".to_string()));
     }
 
     #[test]
@@ -1601,11 +1596,11 @@ mod tests {
         paint_box(&layout, &mut ops, &HashMap::new());
         let has_family = ops.iter().any(|op| {
             if let RenderOp::DrawText { font_family, .. } = op {
-                font_family.as_deref() == Some("CustomFont")
+                font_family.is_some()
             } else {
                 false
             }
         });
-        assert!(has_family, "DrawText should carry font_family = Some(\"CustomFont\")");
+        assert!(has_family, "DrawText should carry font_family");
     }
 }

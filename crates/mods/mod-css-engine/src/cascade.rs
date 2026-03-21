@@ -183,7 +183,136 @@ pub fn compute_styles(dom: DomNode, extra_css: &[String], viewport_width: f32) -
 
     // 4. Walk DOM and apply styles.
     let ancestors: Vec<&DomNode> = Vec::new();
-    apply_styles_recursive(dom, &rules, &index, &ancestors)
+    let styled = apply_styles_recursive(dom, &rules, &index, &ancestors);
+
+    // 5. CSS background propagation: per CSS2 spec, if the root element
+    //    (html) has no author-specified background, the body's background
+    //    is used for the canvas (the entire viewport).
+    propagate_body_background(styled)
+}
+
+/// CSS background propagation from body to the root element.
+///
+/// Per the CSS2 specification, if the root element (`<html>`) has no
+/// author-specified background, the body's `background-color` is used
+/// as the canvas background (covering the entire viewport).  We detect
+/// this by checking if html's background is the UA-default white.
+fn propagate_body_background(dom: DomNode) -> DomNode {
+    // Only applies to Document root.
+    let DomNode::Document { children } = dom else {
+        return dom;
+    };
+
+    let mut children = children;
+
+    // Find the <html> element.
+    for html_node in children.iter_mut() {
+        let DomNode::Element {
+            tag: html_tag,
+            attributes: html_attrs,
+            children: html_children,
+        } = html_node
+        else {
+            continue;
+        };
+        if html_tag != "html" {
+            continue;
+        }
+
+        // Check if html's background is the UA default (white / no author bg).
+        let html_style = html_attrs
+            .iter()
+            .find(|(k, _)| k == "data-nova-style")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let html_has_author_bg = html_style.contains("background-color")
+            && !html_style.contains("background-color: #ffffff")
+            && !html_style.contains("background-color: rgb(255, 255, 255)")
+            && !html_style.contains("background-color: rgba(255, 255, 255");
+
+        if html_has_author_bg {
+            break; // html has an author-specified background, don't propagate.
+        }
+
+        // Find the <body> element among html's children.
+        for body_node in html_children.iter_mut() {
+            let DomNode::Element {
+                tag: body_tag,
+                attributes: body_attrs,
+                ..
+            } = body_node
+            else {
+                continue;
+            };
+            if body_tag != "body" {
+                continue;
+            }
+
+            // Extract body's background-color.
+            let body_style_idx = body_attrs
+                .iter()
+                .position(|(k, _)| k == "data-nova-style");
+            let Some(idx) = body_style_idx else { break };
+            let body_style = body_attrs[idx].1.clone();
+
+            // Find background-color in body's style.
+            let mut body_bg = None;
+            for decl in body_style.split(';') {
+                let parts: Vec<&str> = decl.splitn(2, ':').collect();
+                if parts.len() == 2 && parts[0].trim() == "background-color" {
+                    body_bg = Some(parts[1].trim().to_string());
+                }
+            }
+
+            let Some(bg_value) = body_bg else { break };
+
+            // Skip if body bg is transparent.
+            if bg_value.contains("rgba") && bg_value.contains(", 0)") {
+                break;
+            }
+
+            // Propagate: set html's background-color to body's value.
+            let html_style_idx = html_attrs
+                .iter()
+                .position(|(k, _)| k == "data-nova-style");
+            if let Some(hi) = html_style_idx {
+                // Replace html's background-color with body's.
+                let mut new_html_style = String::new();
+                for decl in html_attrs[hi].1.split(';') {
+                    let parts: Vec<&str> = decl.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        let prop = parts[0].trim();
+                        if prop == "background-color" {
+                            new_html_style
+                                .push_str(&format!("background-color: {bg_value}; "));
+                        } else {
+                            new_html_style.push_str(decl);
+                            new_html_style.push_str("; ");
+                        }
+                    }
+                }
+                html_attrs[hi].1 = new_html_style.trim_end_matches("; ").to_string();
+            }
+
+            // Remove background-color from body's style so it doesn't
+            // paint a separate background on the body box.
+            let mut new_body_style = String::new();
+            for decl in body_style.split(';') {
+                let parts: Vec<&str> = decl.splitn(2, ':').collect();
+                if parts.len() == 2 && parts[0].trim() != "background-color" {
+                    new_body_style.push_str(decl.trim());
+                    new_body_style.push_str("; ");
+                }
+            }
+            body_attrs[idx].1 =
+                new_body_style.trim_end_matches("; ").to_string();
+
+            break; // done with body
+        }
+        break; // done with html
+    }
+
+    DomNode::Document { children }
 }
 
 /// Recursively apply styles to a DOM node.
@@ -616,12 +745,84 @@ fn compute_element_style_impl(
         }
     }
 
+    // 7c. Resolve `em` units contextually against the parent's computed font-size.
+    // `rem` units are already resolved at parse time against 16px (root em).
+    // `em` should resolve against the inherited font-size from the nearest ancestor.
+    let parent_font_size: f32 = {
+        // First check if this element has its own font-size from UA defaults
+        // or explicit declaration (already resolved as px).
+        let own_fs = final_props
+            .iter()
+            .find(|(p, _)| p == "font-size")
+            .and_then(|(_, v)| v.strip_suffix("px").and_then(|s| s.trim().parse::<f32>().ok()));
+        // The parent font-size for resolving em in *other* properties is
+        // this element's own computed font-size. But for font-size itself,
+        // em resolves against the *parent's* font-size.
+        let inherited_fs = ancestors
+            .iter()
+            .rev()
+            .find_map(|a| {
+                if let DomNode::Element { attributes, .. } = a {
+                    attributes.iter().find(|(k, _)| k == "data-nova-style").and_then(|(_, v)| {
+                        v.split(';').find_map(|decl| {
+                            let parts: Vec<&str> = decl.splitn(2, ':').collect();
+                            if parts.len() == 2 && parts[0].trim() == "font-size" {
+                                parts[1].trim().strip_suffix("px").and_then(|s| s.trim().parse::<f32>().ok())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(16.0);
+        // For font-size property: resolve em against parent's font-size.
+        // First resolve font-size em values.
+        if let Some(fs_entry) = final_props.iter_mut().find(|(p, _)| p == "font-size") {
+            if let Some(px) = values::resolve_em_value(&fs_entry.1, inherited_fs) {
+                fs_entry.1 = format!("{px}px");
+            }
+        }
+        // The computed font-size to use for resolving em in other properties.
+        final_props
+            .iter()
+            .find(|(p, _)| p == "font-size")
+            .and_then(|(_, v)| v.strip_suffix("px").and_then(|s| s.trim().parse::<f32>().ok()))
+            .or(own_fs)
+            .unwrap_or(inherited_fs)
+    };
+    // Resolve em in all non-font-size properties.
+    for (prop, val) in &mut final_props {
+        if prop != "font-size" {
+            if let Some(px) = values::resolve_em_value(val, parent_font_size) {
+                *val = format!("{px}px");
+            }
+        }
+    }
+
+    // 7d. Resolve `pt` units to `px` (1pt = 1.333px).
+    for (prop, val) in &mut final_props {
+        let trimmed = val.trim();
+        if trimmed.ends_with("pt") && !trimmed.ends_with("ppt") {
+            if let Some(s) = trimmed.strip_suffix("pt") {
+                if let Ok(n) = s.trim().parse::<f32>() {
+                    let px = n * 1.333;
+                    *val = format!("{px}px");
+                }
+            }
+        }
+    }
+
     // 8. Serialize as inline CSS string.
-    final_props
+    let result = final_props
         .iter()
         .map(|(p, v)| format!("{}: {}", p, v))
         .collect::<Vec<_>>()
-        .join("; ")
+        .join("; ");
+
+    result
 }
 
 /// Expand CSS shorthand properties into their longhand equivalents.

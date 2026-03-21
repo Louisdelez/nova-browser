@@ -13,4 +13,6 @@ async-trait = { workspace = true }
 semver = { workspace = true }
 taffy = { workspace = true }
 fontdue = "0.9"
+rustybuzz = "0.20"
+ttf-parser = "0.24"
 mod-css-engine = { workspace = true }

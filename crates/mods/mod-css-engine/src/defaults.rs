@@ -249,6 +249,12 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
             props.push(("padding-left".into(), StyleValue::Px(4.0)));
             props.push(("background-color".into(), StyleValue::Color(CssColor { r: 255, g: 255, b: 255, a: 1.0 })));
         }
+        // <center> — legacy centering element.
+        "center" => {
+            props.push(("text-align".into(), StyleValue::Keyword("center".into())));
+            props.push(("margin-left".into(), StyleValue::Keyword("auto".into())));
+            props.push(("margin-right".into(), StyleValue::Keyword("auto".into())));
+        }
         _ => {}
     }
 
@@ -277,7 +283,7 @@ pub fn display_for_tag(tag: &str) -> &'static str {
     match tag {
         "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "body" | "html" | "section"
         | "article" | "header" | "footer" | "nav" | "main" | "ul" | "ol" | "li"
-        | "blockquote" | "pre" | "form" | "hr" | "figure" | "figcaption"
+        | "blockquote" | "pre" | "form" | "hr" | "figure" | "figcaption" | "center"
         | "details" | "summary" | "dialog" | "address" | "fieldset" | "dd" | "dt" | "dl"
         | "hgroup" | "search" => "block",
         // Table elements
@@ -289,7 +295,7 @@ pub fn display_for_tag(tag: &str) -> &'static str {
         | "cite" | "dfn" | "kbd" | "mark" | "q" | "s" | "samp" | "time" | "var" | "wbr" => {
             "inline"
         }
-        "head" | "title" | "meta" | "link" | "style" | "script" | "template" => "none",
+        "head" | "title" | "meta" | "link" | "style" | "script" | "noscript" | "template" => "none",
         _ => "block",
     }
 }

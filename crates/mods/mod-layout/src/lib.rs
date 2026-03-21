@@ -33,14 +33,15 @@ use semver::Version;
 use taffy::prelude::*;
 use tracing::{debug, info};
 
-// ── Font measurement ──────────────────────────────────────────────────
+// ── Font measurement (rustybuzz-based, kerning-aware) ────────────────
 
-/// Thread-local fontdue font for real text measurement in layout.
+/// Thread-local font data for rustybuzz text shaping in layout.
 ///
-/// Falls back to character-width estimation if no font file is found.
+/// Uses the same shaping engine as the renderer so that measured widths
+/// match rendered glyph positions exactly (kerning + ligatures included).
+/// Falls back to fontdue per-character measurement, then to estimation.
 thread_local! {
-    static LAYOUT_FONT: Option<fontdue::Font> = {
-        // Try workspace assets first, then system paths.
+    static LAYOUT_FONT_DATA: Option<Vec<u8>> = {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let workspace_root = std::path::Path::new(manifest_dir)
             .parent()  // crates/mods/
@@ -55,34 +56,67 @@ thread_local! {
             std::path::PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
             std::path::PathBuf::from("/usr/share/fonts/TTF/DejaVuSans.ttf"),
             std::path::PathBuf::from("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+            std::path::PathBuf::from("/usr/share/fonts/noto/NotoSans-Regular.ttf"),
+            std::path::PathBuf::from("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
         ]);
 
         for path in &paths {
             if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(font) = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
-                    return Some(font);
+                // Validate that rustybuzz can parse the font.
+                if rustybuzz::Face::from_slice(&bytes, 0).is_some() {
+                    return Some(bytes);
                 }
             }
         }
         None
     };
+
+    static LAYOUT_FONT: Option<fontdue::Font> = {
+        LAYOUT_FONT_DATA.with(|data| {
+            data.as_ref().and_then(|bytes| {
+                fontdue::Font::from_bytes(bytes.clone(), fontdue::FontSettings::default()).ok()
+            })
+        })
+    };
 }
 
-/// Measure the width of a string using fontdue, or fall back to estimation.
+/// Measure the width of a string using rustybuzz shaping (kerning-aware).
+///
+/// This matches the renderer's text shaping pipeline, ensuring layout
+/// measurements are consistent with rendered glyph positions.
+/// Falls back to fontdue per-character measurement if rustybuzz fails.
 fn measure_text_width(text: &str, font_size: f32) -> f32 {
-    LAYOUT_FONT.with(|font| {
-        if let Some(font) = font {
-            let mut width: f32 = 0.0;
-            for ch in text.chars() {
-                let (metrics, _) = font.rasterize(ch, font_size);
-                width += metrics.advance_width;
+    LAYOUT_FONT_DATA.with(|data| {
+        if let Some(bytes) = data {
+            if let Some(face) = rustybuzz::Face::from_slice(bytes, 0) {
+                let upem = face.units_per_em() as f32;
+                let scale = if upem > 0.0 { font_size / upem } else { 1.0 };
+
+                let mut buffer = rustybuzz::UnicodeBuffer::new();
+                buffer.push_str(text);
+                buffer.set_direction(rustybuzz::Direction::LeftToRight);
+
+                let output = rustybuzz::shape(&face, &[], buffer);
+                let positions = output.glyph_positions();
+
+                let width: f32 = positions.iter().map(|p| p.x_advance as f32 * scale).sum();
+                return width;
             }
-            width
-        } else {
-            // Fallback: character-width estimation.
-            let scale = font_size / 16.0;
-            text.len() as f32 * CHAR_WIDTH_AT_16PX * scale
         }
+        // Fallback: fontdue per-character measurement.
+        LAYOUT_FONT.with(|font| {
+            if let Some(font) = font {
+                let mut width: f32 = 0.0;
+                for ch in text.chars() {
+                    let (metrics, _) = font.rasterize(ch, font_size);
+                    width += metrics.advance_width;
+                }
+                width
+            } else {
+                let scale = font_size / 16.0;
+                text.len() as f32 * CHAR_WIDTH_AT_16PX * scale
+            }
+        })
     })
 }
 
@@ -107,8 +141,51 @@ const DEFAULT_FONT_SIZE: f32 = 16.0;
 /// Used to estimate text leaf node dimensions.
 const CHAR_WIDTH_AT_16PX: f32 = 7.0;
 
-/// Line-height multiplier relative to font size.
+/// Default line-height multiplier relative to font size (`normal`).
 const LINE_HEIGHT_FACTOR: f32 = 1.2;
+
+/// Resolve the line-height from style properties and font-size.
+///
+/// Supports:
+/// - `normal` → `font_size * LINE_HEIGHT_FACTOR`
+/// - `<number>` (e.g. `1.5`) → `font_size * number`
+/// - `<length>px` (e.g. `24px`) → `24.0`
+/// - `<percent>%` (e.g. `150%`) → `font_size * 1.5`
+///
+/// Falls back to `font_size * LINE_HEIGHT_FACTOR` if not specified.
+fn resolve_line_height(style_props: &[(String, StyleValue)], font_size: f32) -> f32 {
+    if let Some((_, val)) = style_props.iter().find(|(k, _)| k == "line-height") {
+        match val {
+            StyleValue::Px(px) => return *px,
+            StyleValue::Number(n) => return font_size * n,
+            StyleValue::Percent(pct) => return font_size * pct / 100.0,
+            StyleValue::Keyword(k) | StyleValue::Str(k) => {
+                let k = k.trim();
+                if k == "normal" {
+                    return font_size * LINE_HEIGHT_FACTOR;
+                }
+                // Try parsing as "<n>px".
+                if let Some(px_str) = k.strip_suffix("px") {
+                    if let Ok(px) = px_str.trim().parse::<f32>() {
+                        return px;
+                    }
+                }
+                // Try parsing as "<n>%".
+                if let Some(pct_str) = k.strip_suffix('%') {
+                    if let Ok(pct) = pct_str.trim().parse::<f32>() {
+                        return font_size * pct / 100.0;
+                    }
+                }
+                // Try parsing as a bare number (unitless multiplier).
+                if let Ok(n) = k.parse::<f32>() {
+                    return font_size * n;
+                }
+            }
+            _ => {}
+        }
+    }
+    font_size * LINE_HEIGHT_FACTOR
+}
 
 // ── Mod definition ─────────────────────────────────────────────────────
 
@@ -206,7 +283,7 @@ fn compute_layout(dom: &DomNode, viewport: &Viewport) -> Result<LayoutBox, NovaE
     let mut taffy = TaffyTree::<NodeContext>::new();
 
     // Build the Taffy tree, returning the root node id.
-    let root_id = add_node(&mut taffy, dom, viewport.width, DEFAULT_FONT_SIZE, &[])?;
+    let root_id = add_node(&mut taffy, dom, viewport.width, DEFAULT_FONT_SIZE, &[], viewport)?;
 
     // Compute layout at the viewport size.
     taffy
@@ -238,6 +315,44 @@ struct NodeContext {
 
 // ── Building the Taffy tree ────────────────────────────────────────────
 
+/// Compute the effective available width for children of a block element.
+///
+/// Takes the parent's `available_width` and narrows it based on the element's
+/// own `width`, `max-width`, and horizontal `padding`. This ensures children
+/// (especially text nodes) wrap at the correct container edge rather than the
+/// viewport edge.
+fn compute_child_available_width(available_width: f32, lp: &LayoutProps) -> f32 {
+    let mut w = available_width;
+    // Use explicit width if set.
+    if let Some(dim) = &lp.width {
+        match dim {
+            Dimension::Length(px) => w = *px,
+            Dimension::Percent(pct) => w = available_width * pct,
+            _ => {}
+        }
+    }
+    // Clamp by max-width.
+    if let Some(dim) = &lp.max_width {
+        match dim {
+            Dimension::Length(px) => w = w.min(*px),
+            Dimension::Percent(pct) => w = w.min(available_width * pct),
+            _ => {}
+        }
+    }
+    // Subtract horizontal padding.
+    let pad_left = match &lp.padding_left {
+        Some(LengthPercentage::Length(px)) => *px,
+        Some(LengthPercentage::Percent(pct)) => available_width * pct,
+        _ => 0.0,
+    };
+    let pad_right = match &lp.padding_right {
+        Some(LengthPercentage::Length(px)) => *px,
+        Some(LengthPercentage::Percent(pct)) => available_width * pct,
+        _ => 0.0,
+    };
+    (w - pad_left - pad_right).max(0.0)
+}
+
 /// Recursively convert a `DomNode` into a Taffy node, returning its `NodeId`.
 /// `parent_font_size` is inherited from the parent element for text nodes.
 /// `parent_style_props` carries inheritable style properties (color,
@@ -249,13 +364,14 @@ fn add_node(
     available_width: f32,
     parent_font_size: f32,
     parent_style_props: &[(String, StyleValue)],
+    viewport: &Viewport,
 ) -> Result<NodeId, NovaError> {
     match node {
         DomNode::Document { children } => {
             // The document root is a block container spanning the full width.
             let child_ids = children
                 .iter()
-                .map(|c| add_node(taffy, c, available_width, DEFAULT_FONT_SIZE, &[]))
+                .map(|c| add_node(taffy, c, available_width, DEFAULT_FONT_SIZE, &[], viewport))
                 .collect::<Result<Vec<_>, _>>()?;
 
             let style = Style {
@@ -264,6 +380,13 @@ fn add_node(
                 size: Size {
                     width: Dimension::Percent(1.0),
                     height: Dimension::Auto,
+                },
+                // Ensure the document root covers at least the viewport
+                // so children with percentage min-height resolve correctly
+                // and background-color paints the full canvas.
+                min_size: Size {
+                    width: Dimension::Auto,
+                    height: Dimension::Length(viewport.height),
                 },
                 ..Style::DEFAULT
             };
@@ -292,7 +415,7 @@ fn add_node(
                 let font_size = resolve_font_size(tag, attributes, parent_font_size);
                 let line_height = font_size * LINE_HEIGHT_FACTOR;
                 let display = resolve_display(tag, attributes);
-                let lp = parse_layout_props(attributes);
+                let lp = parse_layout_props(attributes, viewport);
 
                 // Determine the label text for the form element.
                 let label = match tag.as_str() {
@@ -392,7 +515,7 @@ fn add_node(
                     }
                 }
 
-                let taffy_style = build_taffy_style(&display, tag, attributes);
+                let taffy_style = build_taffy_style(&display, tag, attributes, viewport);
 
                 // Create a text child for the label if non-empty.
                 let mut child_ids = Vec::new();
@@ -478,7 +601,18 @@ fn add_node(
                     .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
             }
 
-            let display = resolve_display(tag, attributes);
+            // Force certain tags to always be hidden regardless of CSS.
+            // Browsers never render script/style/noscript/template content.
+            let force_hidden = matches!(
+                tag.as_str(),
+                "script" | "style" | "noscript" | "template" | "head" | "meta" | "link" | "title"
+            );
+
+            let display = if force_hidden {
+                "none".to_string()
+            } else {
+                resolve_display(tag, attributes)
+            };
 
             // display: none produces an invisible zero-size node.
             if display == "none" {
@@ -550,20 +684,34 @@ fn add_node(
                 }
             }
 
+            // ── Compute child available width ─────────────────────
+            // The effective width for children accounts for explicit
+            // width / max-width / padding on this element.
+            let lp = parse_layout_props(attributes, viewport);
+            let child_available = compute_child_available_width(available_width, &lp);
+
+            // ── Table layout ─────────────────────────────────────
+            // Use dedicated table algorithm for proper column distribution.
+            if tag == "table" || display == "table" {
+                return layout_table(
+                    taffy, tag, attributes, children, available_width,
+                    font_size, &props, viewport,
+                );
+            }
+
             // ── Inline Formatting Context ──────────────────────────
-            // For block containers, group consecutive inline children
-            // into inline formatting contexts so they flow together,
-            // wrap across lines, and share baselines.
-            // Only apply IFC for block containers (not flex, grid, or table).
-            let child_ids = if display == "block" {
-                build_children_with_ifc(taffy, children, available_width, font_size, &props)?
+            // For block containers and table cells, group consecutive
+            // inline children into inline formatting contexts so they
+            // flow together, wrap across lines, and share baselines.
+            let child_ids = if display == "block" || display == "table-cell" {
+                build_children_with_ifc(taffy, children, child_available, font_size, &props, viewport)?
             } else {
                 children
                     .iter()
-                    .map(|c| add_node(taffy, c, available_width, font_size, &props))
+                    .map(|c| add_node(taffy, c, child_available, font_size, &props, viewport))
                     .collect::<Result<Vec<_>, _>>()?
             };
-            let taffy_style = build_taffy_style(&display, tag, attributes);
+            let taffy_style = build_taffy_style(&display, tag, attributes, viewport);
 
             let content_type = match display.as_str() {
                 "inline" | "table-cell" | "table-row" => LayoutContent::Inline,
@@ -607,7 +755,7 @@ fn add_node(
                 }
             }
 
-            let line_height = font_size * LINE_HEIGHT_FACTOR;
+            let line_height = resolve_line_height(&text_props, font_size);
             // Measure space width from the actual font glyph so it matches
             // what the renderer will produce. Fall back to 0.3em if the font
             // measurement returns zero (e.g. no font loaded).
@@ -768,6 +916,28 @@ fn add_node(
 //
 // This is the core of correct text layout in a browser.
 
+/// Check if two inline style property lists are visually equivalent for
+/// text merging. We compare color and href (the properties that affect how
+/// the painter draws text) rather than the full list.
+fn inline_styles_match(a: &[(String, StyleValue)], b: &[(String, StyleValue)]) -> bool {
+    fn get_str<'s>(props: &'s [(String, StyleValue)], key: &str) -> Option<&'s str> {
+        props.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
+            StyleValue::Str(s) | StyleValue::Keyword(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
+    fn get_px(props: &[(String, StyleValue)], key: &str) -> Option<f32> {
+        props.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
+            StyleValue::Px(px) => Some(*px),
+            _ => None,
+        })
+    }
+    get_str(a, "color") == get_str(b, "color")
+        && get_str(a, "href") == get_str(b, "href")
+        && get_str(a, "text-decoration") == get_str(b, "text-decoration")
+        && get_px(a, "font-size") == get_px(b, "font-size")
+}
+
 /// An item in the flattened inline sequence.
 #[derive(Debug, Clone)]
 enum InlineItem {
@@ -808,6 +978,7 @@ fn build_children_with_ifc(
     available_width: f32,
     parent_font_size: f32,
     parent_style_props: &[(String, StyleValue)],
+    viewport: &Viewport,
 ) -> Result<Vec<NodeId>, NovaError> {
     let mut result = Vec::new();
 
@@ -828,7 +999,7 @@ fn build_children_with_ifc(
             result.extend(line_ids);
         } else {
             // Block child — process normally, with margin collapsing.
-            let node_id = add_node(taffy, &children[i], available_width, parent_font_size, parent_style_props)?;
+            let node_id = add_node(taffy, &children[i], available_width, parent_font_size, parent_style_props, viewport)?;
 
             // Margin collapsing: if the previous child was also a block,
             // reduce the current child's top margin to simulate CSS margin collapse.
@@ -1048,6 +1219,15 @@ fn flatten_node_recursive(
             }
         }
         DomNode::Element { tag, children, attributes, .. } => {
+            // Skip elements that should never produce inline content.
+            if matches!(tag.as_str(), "script" | "style" | "noscript" | "template") {
+                return;
+            }
+            // Check for display: none.
+            let disp = resolve_display(tag, attributes);
+            if disp == "none" {
+                return;
+            }
             if tag == "br" {
                 // Line break: insert a special zero-width "word" that forces a break.
                 // We'll handle this during line-breaking.
@@ -1136,7 +1316,7 @@ fn layout_inline_run(
         return Ok(Vec::new());
     }
 
-    let line_height = parent_font_size * LINE_HEIGHT_FACTOR;
+    let line_height = resolve_line_height(parent_style_props, parent_font_size);
 
     // 2. Break items into lines.
     let mut lines: Vec<Vec<&InlineItem>> = Vec::new();
@@ -1186,23 +1366,56 @@ fn layout_inline_run(
     }
 
     // 3. Create Taffy nodes for each line box.
+    //
+    // To avoid inter-word gaps caused by drawing each word as a separate
+    // DrawText call, merge consecutive same-style Word+Space+Word sequences
+    // into single text runs. This ensures spaces are rendered within the
+    // same DrawText call as adjacent words, eliminating side-bearing gaps.
     let mut line_box_ids = Vec::new();
     for line in &lines {
         let mut item_ids = Vec::new();
         let mut max_height = line_height;
 
-        for &item in line {
-            match item {
+        let mut idx = 0;
+        while idx < line.len() {
+            match line[idx] {
                 InlineItem::Word { text, width, style } => {
                     let fs = style.iter()
                         .find(|(k, _)| k == "font-size")
                         .and_then(|(_, v)| if let StyleValue::Px(px) = v { Some(*px) } else { None })
                         .unwrap_or(parent_font_size);
-                    let lh = fs * LINE_HEIGHT_FACTOR;
+                    let lh = resolve_line_height(style, fs);
                     max_height = max_height.max(lh);
 
+                    // Merge with following Space+Word items if same style.
+                    let mut merged_text = text.clone();
+                    let mut merged_width = *width;
+                    while idx + 1 < line.len() {
+                        if let InlineItem::Space { width: sw, style: ss } = &line[idx + 1] {
+                            if inline_styles_match(ss, style) {
+                                merged_text.push(' ');
+                                merged_width += sw;
+                                idx += 1; // consume space
+                                // Try to also consume the next word if same style.
+                                if idx + 1 < line.len() {
+                                    if let InlineItem::Word { text: wt, width: ww, style: ws } = &line[idx + 1] {
+                                        if inline_styles_match(ws, style) {
+                                            merged_text.push_str(wt);
+                                            merged_width += ww;
+                                            idx += 1; // consume word
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            break;
+                        } else {
+                            break;
+                        }
+                    }
+
                     let ctx = NodeContext {
-                        content: LayoutContent::Text(text.clone()),
+                        content: LayoutContent::Text(merged_text),
                         style: StyleMap { properties: style.clone() },
                     };
                     let id = taffy
@@ -1210,7 +1423,7 @@ fn layout_inline_run(
                             Style {
                                 display: Display::Flex,
                                 size: Size {
-                                    width: Dimension::Length(*width),
+                                    width: Dimension::Length(merged_width),
                                     height: Dimension::Length(lh),
                                 },
                                 ..Style::DEFAULT
@@ -1221,6 +1434,7 @@ fn layout_inline_run(
                     item_ids.push(id);
                 }
                 InlineItem::Space { width, style } => {
+                    // Standalone space (style differs from neighbors).
                     let ctx = NodeContext {
                         content: LayoutContent::Text(" ".to_string()),
                         style: StyleMap { properties: style.clone() },
@@ -1262,6 +1476,7 @@ fn layout_inline_run(
                     item_ids.push(id);
                 }
             }
+            idx += 1;
         }
 
         // Create the line box container (flex-row, items aligned to baseline).
@@ -1307,6 +1522,539 @@ fn layout_inline_run(
     }
 
     Ok(line_box_ids)
+}
+
+// ── Table layout ────────────────────────────────────────────────────────
+
+/// Estimate the minimum content width of a table cell (min-content).
+///
+/// This is the width of the longest individual word (or image) — the
+/// smallest width the cell can shrink to without overflow.
+fn estimate_cell_min_width(children: &[DomNode], font_size: f32) -> f32 {
+    let mut max_word_w: f32 = 0.0;
+    for child in children {
+        match child {
+            DomNode::Text(text) => {
+                // Measure each word individually — the min-content width
+                // is the width of the longest single word.
+                for word in text.split_whitespace() {
+                    let w = measure_text_width(word, font_size);
+                    max_word_w = max_word_w.max(w);
+                }
+            }
+            DomNode::Element {
+                tag,
+                children: cc,
+                attributes,
+                ..
+            } => {
+                if tag == "img" {
+                    let img_w: f32 = attributes
+                        .iter()
+                        .find(|(k, _)| k == "width")
+                        .and_then(|(_, v)| v.parse().ok())
+                        .unwrap_or(10.0);
+                    max_word_w = max_word_w.max(img_w);
+                } else {
+                    let child_w = estimate_cell_min_width(cc, font_size);
+                    max_word_w = max_word_w.max(child_w);
+                }
+            }
+            _ => {}
+        }
+    }
+    max_word_w
+}
+
+/// Estimate the maximum content width of a table cell (max-content).
+///
+/// This is the width of all content laid out on a single line without
+/// line-breaks — the preferred width of the cell.
+fn estimate_cell_content_width(children: &[DomNode], font_size: f32) -> f32 {
+    let mut max_w: f32 = 0.0;
+    for child in children {
+        match child {
+            DomNode::Text(text) => {
+                // Total text width (no line-breaks) = max-content.
+                let w = measure_text_width(text.trim(), font_size);
+                max_w = max_w.max(w);
+            }
+            DomNode::Element {
+                tag,
+                children: cc,
+                attributes,
+                ..
+            } => {
+                if tag == "img" {
+                    let img_w: f32 = attributes
+                        .iter()
+                        .find(|(k, _)| k == "width")
+                        .and_then(|(_, v)| v.parse().ok())
+                        .unwrap_or(10.0);
+                    max_w = max_w.max(img_w);
+                } else {
+                    let child_w = estimate_cell_content_width(cc, font_size);
+                    max_w = max_w.max(child_w);
+                }
+            }
+            _ => {}
+        }
+    }
+    max_w
+}
+
+/// Collect all `<tr>` rows from a table's children, traversing through
+/// `<thead>`, `<tbody>`, `<tfoot>` wrappers.
+fn collect_table_rows<'a>(children: &'a [DomNode], rows: &mut Vec<Vec<&'a DomNode>>) {
+    for child in children {
+        if let DomNode::Element { tag, children: cc, .. } = child {
+            match tag.as_str() {
+                "tr" => {
+                    let cells: Vec<&DomNode> = cc
+                        .iter()
+                        .filter(|c| {
+                            matches!(c, DomNode::Element { tag, .. } if tag == "td" || tag == "th")
+                        })
+                        .collect();
+                    if !cells.is_empty() {
+                        rows.push(cells);
+                    }
+                }
+                "thead" | "tbody" | "tfoot" => {
+                    collect_table_rows(cc, rows);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Layout a `<table>` element with proper column width distribution.
+///
+/// Algorithm:
+/// 1. Collect all rows (traversing thead/tbody/tfoot).
+/// 2. Determine column count and collect explicit widths.
+/// 3. Distribute remaining space to auto-width columns.
+/// 4. Create Taffy nodes: row → flex-row, cell → flex-column with fixed width.
+fn layout_table(
+    taffy: &mut TaffyTree<NodeContext>,
+    table_tag: &str,
+    table_attrs: &[(String, String)],
+    children: &[DomNode],
+    available_width: f32,
+    parent_font_size: f32,
+    parent_style_props: &[(String, StyleValue)],
+    viewport: &Viewport,
+) -> Result<NodeId, NovaError> {
+    let cellpadding: f32 = table_attrs
+        .iter()
+        .find(|(k, _)| k == "cellpadding")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(1.0);
+    let cellspacing: f32 = table_attrs
+        .iter()
+        .find(|(k, _)| k == "cellspacing")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(2.0);
+    let border: f32 = table_attrs
+        .iter()
+        .find(|(k, _)| k == "border")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(0.0);
+
+    let table_lp = parse_layout_props(table_attrs, viewport);
+    let table_width = match table_lp.width {
+        Some(Dimension::Length(px)) => px.min(available_width),
+        Some(Dimension::Percent(pct)) => (available_width * pct).min(available_width),
+        _ => available_width,
+    };
+
+    // Phase 1: Collect all rows.
+    let mut all_rows: Vec<Vec<&DomNode>> = Vec::new();
+    collect_table_rows(children, &mut all_rows);
+
+    if all_rows.is_empty() {
+        // No rows — return an empty block node.
+        let ctx = NodeContext {
+            content: LayoutContent::Block,
+            style: StyleMap::default(),
+        };
+        return taffy
+            .new_leaf_with_context(
+                Style {
+                    display: Display::Flex,
+                    ..Style::DEFAULT
+                },
+                ctx,
+            )
+            .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+    }
+
+    // Phase 2: Determine column count and collect explicit widths.
+    let num_cols = all_rows
+        .iter()
+        .map(|r| {
+            r.iter()
+                .map(|cell| {
+                    if let DomNode::Element { attributes, .. } = cell {
+                        attributes
+                            .iter()
+                            .find(|(k, _)| k == "colspan")
+                            .and_then(|(_, v)| v.parse::<usize>().ok())
+                            .unwrap_or(1)
+                    } else {
+                        1
+                    }
+                })
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(1);
+
+    let mut col_widths: Vec<Option<f32>> = vec![None; num_cols];
+    for row in &all_rows {
+        let mut col_idx = 0;
+        for cell in row {
+            if col_idx >= num_cols {
+                break;
+            }
+            if let DomNode::Element { attributes, .. } = cell {
+                let colspan: usize = attributes
+                    .iter()
+                    .find(|(k, _)| k == "colspan")
+                    .and_then(|(_, v)| v.parse().ok())
+                    .unwrap_or(1);
+
+                // Check HTML width attribute.
+                let html_w: Option<f32> = attributes
+                    .iter()
+                    .find(|(k, _)| k == "width")
+                    .and_then(|(_, v)| {
+                        if let Some(pct) = v.strip_suffix('%') {
+                            pct.parse::<f32>().ok().map(|p| table_width * p / 100.0)
+                        } else {
+                            v.parse::<f32>().ok()
+                        }
+                    });
+
+                // Check CSS width.
+                let css_w = {
+                    let cell_lp = parse_layout_props(attributes, viewport);
+                    match cell_lp.width {
+                        Some(Dimension::Length(px)) => Some(px),
+                        Some(Dimension::Percent(pct)) => Some(table_width * pct),
+                        _ => None,
+                    }
+                };
+
+                let w = css_w.or(html_w);
+                if colspan == 1 {
+                    if let Some(px) = w {
+                        if col_widths[col_idx].map_or(true, |prev| prev < px) {
+                            col_widths[col_idx] = Some(px);
+                        }
+                    }
+                }
+                col_idx += colspan;
+            }
+        }
+    }
+
+    // Phase 3: Two-pass min/max column distribution (like Gecko BasicTableLayoutStrategy).
+    let usable = table_width - cellspacing * (num_cols as f32 + 1.0) - border * 2.0;
+    let fixed_total: f32 = col_widths.iter().filter_map(|w| *w).sum();
+
+    // Pass 1: Compute min-content and max-content widths for each auto column.
+    let mut col_min_widths: Vec<f32> = vec![0.0_f32; num_cols];
+    let mut col_max_widths: Vec<f32> = vec![0.0_f32; num_cols];
+    for row in &all_rows {
+        let mut col_idx = 0;
+        for cell in row {
+            if col_idx >= num_cols {
+                break;
+            }
+            if let DomNode::Element {
+                attributes,
+                children: cell_children,
+                ..
+            } = cell
+            {
+                let colspan: usize = attributes
+                    .iter()
+                    .find(|(k, _)| k == "colspan")
+                    .and_then(|(_, v)| v.parse().ok())
+                    .unwrap_or(1);
+                if colspan == 1 && col_widths[col_idx].is_none() {
+                    let min_w = estimate_cell_min_width(cell_children, parent_font_size) + cellpadding * 2.0;
+                    let max_w = estimate_cell_content_width(cell_children, parent_font_size) + cellpadding * 2.0;
+                    col_min_widths[col_idx] = col_min_widths[col_idx].max(min_w);
+                    col_max_widths[col_idx] = col_max_widths[col_idx].max(max_w);
+                }
+                col_idx += colspan;
+            }
+        }
+    }
+
+    // Pass 2: Distribute remaining space using min/max constraints.
+    let remaining = (usable - fixed_total).max(0.0);
+    let sum_min: f32 = col_widths.iter().enumerate()
+        .filter(|(_, w)| w.is_none())
+        .map(|(i, _)| col_min_widths[i])
+        .sum();
+    let sum_max: f32 = col_widths.iter().enumerate()
+        .filter(|(_, w)| w.is_none())
+        .map(|(i, _)| col_max_widths[i])
+        .sum();
+
+    let final_widths: Vec<f32> = col_widths
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            if let Some(px) = w {
+                *px
+            } else if remaining >= sum_max && sum_max > 0.0 {
+                // Enough space: give each column its max-content width,
+                // distribute surplus proportionally.
+                let surplus = remaining - sum_max;
+                let auto_count = col_widths.iter().filter(|w| w.is_none()).count() as f32;
+                col_max_widths[i] + if auto_count > 0.0 { surplus / auto_count } else { 0.0 }
+            } else if remaining >= sum_min && sum_max > sum_min {
+                // Between min and max: distribute proportionally between
+                // min and max for each auto column.
+                let range = sum_max - sum_min;
+                let avail_range = remaining - sum_min;
+                let fraction = avail_range / range;
+                let col_range = col_max_widths[i] - col_min_widths[i];
+                (col_min_widths[i] + col_range * fraction).max(10.0)
+            } else if sum_min > 0.0 {
+                // Not enough space: give min-content width (may overflow).
+                col_min_widths[i].max(10.0)
+            } else {
+                // Fallback: equal distribution.
+                let auto_count = col_widths.iter().filter(|w| w.is_none()).count();
+                if auto_count > 0 { remaining / auto_count as f32 } else { 0.0 }
+            }
+        })
+        .collect();
+
+    // Phase 4: Create Taffy nodes.
+    let font_size = resolve_font_size(table_tag, table_attrs, parent_font_size);
+
+    // Build table style props.
+    let mut table_props: Vec<(String, StyleValue)> = parent_style_props.to_vec();
+    if let Some(nova_style) = table_attrs.iter().find(|(k, _)| k == "data-nova-style") {
+        for decl in nova_style.1.split(';') {
+            let parts: Vec<&str> = decl.splitn(2, ':').collect();
+            if parts.len() == 2 {
+                let prop = parts[0].trim().to_string();
+                let val = parts[1].trim();
+                let sv = if let Some(px) =
+                    val.strip_suffix("px").and_then(|s| s.parse::<f32>().ok())
+                {
+                    StyleValue::Px(px)
+                } else if val.starts_with("rgb") || val.starts_with('#') {
+                    StyleValue::Str(val.to_string())
+                } else {
+                    StyleValue::Keyword(val.to_string())
+                };
+                if let Some(existing) = table_props.iter_mut().find(|(k, _)| *k == prop) {
+                    existing.1 = sv;
+                } else {
+                    table_props.push((prop, sv));
+                }
+            }
+        }
+    }
+
+    let mut row_ids = Vec::new();
+    for row_cells in &all_rows {
+        let mut cell_ids = Vec::new();
+        let mut col_idx = 0;
+
+        for cell in row_cells {
+            if let DomNode::Element {
+                tag,
+                attributes,
+                children: cell_children,
+            } = cell
+            {
+                let colspan: usize = attributes
+                    .iter()
+                    .find(|(k, _)| k == "colspan")
+                    .and_then(|(_, v)| v.parse().ok())
+                    .unwrap_or(1);
+
+                // Compute cell width (sum of spanned columns + inter-column spacing).
+                let cell_w: f32 = (col_idx..col_idx + colspan)
+                    .filter_map(|i| final_widths.get(i))
+                    .sum::<f32>()
+                    + cellspacing * colspan.saturating_sub(1) as f32;
+
+                let cell_avail = (cell_w - cellpadding * 2.0).max(0.0);
+
+                // Build cell style props.
+                let mut cell_props: Vec<(String, StyleValue)> = table_props.clone();
+                if let Some(nova_style) =
+                    attributes.iter().find(|(k, _)| k == "data-nova-style")
+                {
+                    for decl in nova_style.1.split(';') {
+                        let parts: Vec<&str> = decl.splitn(2, ':').collect();
+                        if parts.len() == 2 {
+                            let prop = parts[0].trim().to_string();
+                            let val = parts[1].trim();
+                            let sv = if let Some(px) =
+                                val.strip_suffix("px").and_then(|s| s.parse::<f32>().ok())
+                            {
+                                StyleValue::Px(px)
+                            } else if val.starts_with("rgb") || val.starts_with('#') {
+                                StyleValue::Str(val.to_string())
+                            } else {
+                                StyleValue::Keyword(val.to_string())
+                            };
+                            if let Some(existing) =
+                                cell_props.iter_mut().find(|(k, _)| *k == prop)
+                            {
+                                existing.1 = sv;
+                            } else {
+                                cell_props.push((prop, sv));
+                            }
+                        }
+                    }
+                }
+
+                // Handle vertical alignment from HTML valign attribute.
+                let _valign = attributes
+                    .iter()
+                    .find(|(k, _)| k == "valign")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("middle");
+
+                // Build cell content using IFC for proper inline formatting.
+                let content_ids = build_children_with_ifc(
+                    taffy,
+                    cell_children,
+                    cell_avail,
+                    font_size,
+                    &cell_props,
+                    viewport,
+                )?;
+
+                let cell_style = Style {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Column,
+                    size: Size {
+                        width: Dimension::Length(cell_w),
+                        height: Dimension::Auto,
+                    },
+                    padding: Rect {
+                        top: LengthPercentage::Length(cellpadding),
+                        right: LengthPercentage::Length(cellpadding),
+                        bottom: LengthPercentage::Length(cellpadding),
+                        left: LengthPercentage::Length(cellpadding),
+                    },
+                    ..Style::DEFAULT
+                };
+
+                let cell_ctx = NodeContext {
+                    content: LayoutContent::Block,
+                    style: StyleMap {
+                        properties: cell_props,
+                    },
+                };
+
+                let cell_id = taffy
+                    .new_with_children(cell_style, &content_ids)
+                    .map(|id| {
+                        taffy.set_node_context(id, Some(cell_ctx)).ok();
+                        id
+                    })
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
+
+                cell_ids.push(cell_id);
+                col_idx += colspan;
+            }
+        }
+
+        // Row container.
+        let row_style = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            gap: Size {
+                width: LengthPercentage::Length(cellspacing),
+                height: LengthPercentage::Length(0.0),
+            },
+            size: Size {
+                width: Dimension::Auto,
+                height: Dimension::Auto,
+            },
+            ..Style::DEFAULT
+        };
+
+        let row_ctx = NodeContext {
+            content: LayoutContent::Block,
+            style: StyleMap::default(),
+        };
+
+        let row_id = taffy
+            .new_with_children(row_style, &cell_ids)
+            .map(|id| {
+                taffy.set_node_context(id, Some(row_ctx)).ok();
+                id
+            })
+            .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
+
+        row_ids.push(row_id);
+    }
+
+    // Table container.
+    let table_style = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        gap: Size {
+            width: LengthPercentage::Length(0.0),
+            height: LengthPercentage::Length(cellspacing),
+        },
+        size: Size {
+            width: Dimension::Length(table_width),
+            height: Dimension::Auto,
+        },
+        margin: Rect {
+            top: table_lp
+                .margin_top
+                .unwrap_or(LengthPercentageAuto::Length(0.0)),
+            right: table_lp
+                .margin_right
+                .unwrap_or(LengthPercentageAuto::Length(0.0)),
+            bottom: table_lp
+                .margin_bottom
+                .unwrap_or(LengthPercentageAuto::Length(0.0)),
+            left: table_lp
+                .margin_left
+                .unwrap_or(LengthPercentageAuto::Length(0.0)),
+        },
+        padding: Rect {
+            top: LengthPercentage::Length(cellspacing + border),
+            right: LengthPercentage::Length(cellspacing + border),
+            bottom: LengthPercentage::Length(cellspacing + border),
+            left: LengthPercentage::Length(cellspacing + border),
+        },
+        ..Style::DEFAULT
+    };
+
+    let table_ctx = NodeContext {
+        content: LayoutContent::Block,
+        style: StyleMap {
+            properties: table_props,
+        },
+    };
+
+    taffy
+        .new_with_children(table_style, &row_ids)
+        .map(|id| {
+            taffy.set_node_context(id, Some(table_ctx)).ok();
+            id
+        })
+        .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))
 }
 
 // ── Box model helpers ──────────────────────────────────────────────────
@@ -1697,13 +2445,31 @@ fn parse_grid_line_span(val: &str) -> Option<(i16, i16)> {
     }
 }
 
+/// Pre-resolve viewport units (`vw`, `vh`) in a CSS value string to absolute
+/// `px` values. Each whitespace-separated token is checked independently so
+/// shorthand properties like `margin: 15vh auto` are handled correctly.
+fn resolve_viewport_in_value(val: &str, viewport: &Viewport) -> String {
+    val.split_whitespace()
+        .map(|token| {
+            if let Some(v) = token.strip_suffix("vw").and_then(|s| s.parse::<f32>().ok()) {
+                format!("{}px", viewport.width * v / 100.0)
+            } else if let Some(v) = token.strip_suffix("vh").and_then(|s| s.parse::<f32>().ok()) {
+                format!("{}px", viewport.height * v / 100.0)
+            } else {
+                token.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Extract all layout-relevant CSS properties from element attributes.
 ///
 /// Scans both `data-nova-style` (computed styles from the CSS engine) and
 /// the inline `style` attribute. `data-nova-style` is processed second so
 /// it overrides the inline `style` when both are present (the CSS cascade
 /// result should win).
-fn parse_layout_props(attributes: &[(String, String)]) -> LayoutProps {
+fn parse_layout_props(attributes: &[(String, String)], viewport: &Viewport) -> LayoutProps {
     let mut props = LayoutProps::default();
 
     // Process `style` first, then `data-nova-style` so cascade wins.
@@ -1719,7 +2485,17 @@ fn parse_layout_props(attributes: &[(String, String)]) -> LayoutProps {
                 continue;
             }
             let prop = parts[0].trim();
-            let val = parts[1].trim();
+            let raw_val = parts[1].trim();
+
+            // Pre-resolve viewport units (vw, vh) to absolute px values
+            // so downstream parse functions produce Length instead of Percent.
+            let resolved_val;
+            let val = if raw_val.contains("vw") || raw_val.contains("vh") {
+                resolved_val = resolve_viewport_in_value(raw_val, viewport);
+                resolved_val.as_str()
+            } else {
+                raw_val
+            };
 
             match prop {
                 // Shorthand `margin` — supports 1-4 value syntax.
@@ -1906,7 +2682,7 @@ fn resolve_display(tag: &str, attributes: &[(String, String)]) -> String {
 }
 
 /// Resolve font-size from data-nova-style, tag defaults, or parent inheritance.
-fn resolve_font_size(tag: &str, attributes: &[(String, String)], _parent_font_size: f32) -> f32 {
+fn resolve_font_size(tag: &str, attributes: &[(String, String)], parent_font_size: f32) -> f32 {
     // Check data-nova-style first.
     for attr_name in &["data-nova-style", "style"] {
         if let Some(style_attr) = attributes.iter().find(|(k, _)| k == *attr_name) {
@@ -1914,7 +2690,7 @@ fn resolve_font_size(tag: &str, attributes: &[(String, String)], _parent_font_si
                 let parts: Vec<&str> = decl.splitn(2, ':').collect();
                 if parts.len() == 2 && parts[0].trim() == "font-size" {
                     let val = parts[1].trim();
-                    if let Some(px) = val.strip_suffix("px").and_then(|s| s.parse::<f32>().ok()) {
+                    if let Some(px) = parse_css_length(val, parent_font_size) {
                         return px;
                     }
                 }
@@ -1925,6 +2701,43 @@ fn resolve_font_size(tag: &str, attributes: &[(String, String)], _parent_font_si
     font_size_for_tag(tag)
 }
 
+/// Parse a CSS length value into pixels.
+///
+/// Supports `px`, `pt`, `em`, `rem`, `%` (relative to `context`), and
+/// CSS keyword sizes (`small`, `medium`, `large`, etc.).
+fn parse_css_length(val: &str, context: f32) -> Option<f32> {
+    let val = val.trim();
+    if let Some(s) = val.strip_suffix("px") {
+        return s.trim().parse::<f32>().ok();
+    }
+    if let Some(s) = val.strip_suffix("pt") {
+        return s.trim().parse::<f32>().ok().map(|n| n * 1.333);
+    }
+    if val.ends_with("rem") {
+        let s = &val[..val.len() - 3];
+        return s.trim().parse::<f32>().ok().map(|n| n * 16.0);
+    }
+    if let Some(s) = val.strip_suffix("em") {
+        return s.trim().parse::<f32>().ok().map(|n| n * context);
+    }
+    if let Some(s) = val.strip_suffix('%') {
+        return s.trim().parse::<f32>().ok().map(|n| context * n / 100.0);
+    }
+    // CSS keyword sizes.
+    match val {
+        "xx-small" => Some(9.0),
+        "x-small" => Some(10.0),
+        "small" => Some(13.0),
+        "medium" => Some(16.0),
+        "large" => Some(18.0),
+        "x-large" => Some(24.0),
+        "xx-large" => Some(32.0),
+        "smaller" => Some(context * 0.833),
+        "larger" => Some(context * 1.2),
+        _ => val.parse::<f32>().ok(),
+    }
+}
+
 /// Build a `taffy::Style` from the resolved display mode, tag, and attributes.
 ///
 /// Parses margins, padding, width, and max-width from `data-nova-style` and
@@ -1933,8 +2746,9 @@ fn build_taffy_style(
     display: &str,
     tag: &str,
     attributes: &[(String, String)],
+    viewport: &Viewport,
 ) -> Style {
-    let lp = parse_layout_props(attributes);
+    let lp = parse_layout_props(attributes, viewport);
 
     // Build margin rect, defaulting unset sides to zero.
     let margin = Rect {
@@ -2234,7 +3048,7 @@ fn build_taffy_style(
                 min_size: Size {
                     width: lp.min_width.unwrap_or(Dimension::Auto),
                     height: lp.min_height.unwrap_or(
-                        if is_root_element { Dimension::Percent(1.0) } else { Dimension::Auto }
+                        if is_root_element { Dimension::Length(viewport.height) } else { Dimension::Auto }
                     ),
                 },
                 max_size: Size {
@@ -2342,14 +3156,14 @@ fn display_for_tag(tag: &str) -> &'static str {
     match tag {
         "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "body" | "html" | "section"
         | "article" | "header" | "footer" | "nav" | "main" | "ul" | "ol" | "li"
-        | "blockquote" | "pre" | "form" | "hr" => "block",
+        | "blockquote" | "pre" | "form" | "hr" | "center" => "block",
         // Table elements get special display modes for proper layout.
         "table" | "thead" | "tbody" | "tfoot" => "block",
         "tr" => "table-row",
         "td" | "th" => "table-cell",
         "span" | "a" | "em" | "strong" | "b" | "i" | "u" | "code" | "small" | "br" | "img"
         | "input" | "label" | "select" | "button" | "textarea" => "inline",
-        "head" | "title" | "meta" | "link" | "style" | "script" => "none",
+        "head" | "title" | "meta" | "link" | "style" | "script" | "noscript" => "none",
         _ => "block",
     }
 }
@@ -2717,7 +3531,7 @@ mod tests {
             "data-nova-style".into(),
             "margin: 10px 20px 30px 40px".into(),
         )];
-        let lp = parse_layout_props(&attrs);
+        let lp = parse_layout_props(&attrs, &Viewport { width: 800.0, height: 600.0, scale_factor: 1.0 });
         assert!(matches!(lp.margin_top, Some(LengthPercentageAuto::Length(v)) if (v - 10.0).abs() < 0.01));
         assert!(matches!(lp.margin_right, Some(LengthPercentageAuto::Length(v)) if (v - 20.0).abs() < 0.01));
         assert!(matches!(lp.margin_bottom, Some(LengthPercentageAuto::Length(v)) if (v - 30.0).abs() < 0.01));
@@ -2727,7 +3541,7 @@ mod tests {
     #[test]
     fn parse_layout_props_shorthand_padding_two_values() {
         let attrs = vec![("style".into(), "padding: 10px 20px".into())];
-        let lp = parse_layout_props(&attrs);
+        let lp = parse_layout_props(&attrs, &Viewport { width: 800.0, height: 600.0, scale_factor: 1.0 });
         assert!(matches!(lp.padding_top, Some(LengthPercentage::Length(v)) if (v - 10.0).abs() < 0.01));
         assert!(matches!(lp.padding_right, Some(LengthPercentage::Length(v)) if (v - 20.0).abs() < 0.01));
         assert!(matches!(lp.padding_bottom, Some(LengthPercentage::Length(v)) if (v - 10.0).abs() < 0.01));
@@ -2869,7 +3683,7 @@ mod tests {
             "data-nova-style".into(),
             "display: grid; gap: 10px 20px".into(),
         )];
-        let lp = parse_layout_props(&attrs);
+        let lp = parse_layout_props(&attrs, &Viewport { width: 800.0, height: 600.0, scale_factor: 1.0 });
         assert!(
             matches!(lp.gap, Some((row, col)) if (row - 10.0).abs() < 0.01 && (col - 20.0).abs() < 0.01),
             "gap should be (10px row, 20px col), got {:?}",
@@ -2906,12 +3720,13 @@ mod phase4_tests {
             !body.children.is_empty(),
             "body should have children for the text"
         );
-        // The text wrapper should have multiple children (word nodes + space nodes).
-        let text_wrapper = &body.children[0];
+        // With same-style word merging, all words in the line are merged
+        // into a single text run. The line box should have >=1 child.
+        let line_box = &body.children[0];
         assert!(
-            text_wrapper.children.len() >= 3,
-            "text wrapper should have >=3 children (words + spaces), got {}",
-            text_wrapper.children.len()
+            !line_box.children.is_empty(),
+            "line box should have >=1 children (merged text run), got {}",
+            line_box.children.len()
         );
     }
 
@@ -2945,7 +3760,7 @@ mod phase4_tests {
         let attrs = vec![
             ("data-nova-style".into(), "float: left; width: 200px".into()),
         ];
-        let lp = parse_layout_props(&attrs);
+        let lp = parse_layout_props(&attrs, &Viewport { width: 800.0, height: 600.0, scale_factor: 1.0 });
         assert_eq!(lp.float.as_deref(), Some("left"));
         assert!(lp.width.is_some());
     }
@@ -2955,7 +3770,7 @@ mod phase4_tests {
         let attrs = vec![
             ("data-nova-style".into(), "float: right".into()),
         ];
-        let lp = parse_layout_props(&attrs);
+        let lp = parse_layout_props(&attrs, &Viewport { width: 800.0, height: 600.0, scale_factor: 1.0 });
         assert_eq!(lp.float.as_deref(), Some("right"));
     }
 

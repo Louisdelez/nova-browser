@@ -371,11 +371,13 @@ mod tests {
         assert!(style.contains("color: #333"), "h1 style should contain color: #333, got: {style}");
         assert!(style.contains("font-size: 32px"), "h1 style should contain font-size");
 
-        let body = find_element(&result, "body").expect("should find body");
-        let body_style = body.attr("data-nova-style").expect("body must have data-nova-style");
+        // CSS background propagation: when html has no author background,
+        // body's background-color is propagated to html (canvas).
+        let html = find_element(&result, "html").expect("should find html");
+        let html_style = html.attr("data-nova-style").expect("html must have data-nova-style");
         assert!(
-            body_style.contains("background-color: #f0f0f2"),
-            "body style should contain background-color, got: {body_style}"
+            html_style.contains("background-color: #f0f0f2"),
+            "html style should contain propagated background-color, got: {html_style}"
         );
     }
 

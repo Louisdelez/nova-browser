@@ -89,7 +89,15 @@ impl NovaMod for HtmlParserMod {
                     )));
                 }
 
-                let html = String::from_utf8_lossy(&data).into_owned();
+                // Try UTF-8 first, then fall back to ISO-8859-1/Latin-1 decoding.
+                let html = match std::str::from_utf8(&data) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => {
+                        // Not valid UTF-8 — decode as ISO-8859-1 (Latin-1).
+                        // Each byte maps directly to the same Unicode code point.
+                        data.iter().map(|&b| b as char).collect::<String>()
+                    }
+                };
 
                 debug!(len = html.len(), "parsing HTML document");
 

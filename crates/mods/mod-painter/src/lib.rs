@@ -234,6 +234,10 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
 
     // Determine opacity factor for this box (1.0 = fully opaque).
     let opacity = extract_opacity(&layout_box.style);
+    let has_opacity = opacity < 1.0;
+    if has_opacity {
+        ops.push(RenderOp::PushOpacity { opacity });
+    }
 
     // Emit box-shadow before the background (painter's order: shadow → bg → content).
     if let Some((shadow_color, offset_x, offset_y, blur)) = extract_box_shadow(&layout_box.style) {
@@ -447,6 +451,10 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
 
     if clips_overflow {
         ops.push(RenderOp::PopClip);
+    }
+
+    if has_opacity {
+        ops.push(RenderOp::PopOpacity);
     }
 
     if is_sticky {

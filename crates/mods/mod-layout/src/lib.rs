@@ -31,6 +31,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use semver::Version;
 use taffy::prelude::*;
+use taffy::geometry::Point;
+use taffy::style::Overflow;
 use tracing::{debug, info};
 
 // ── Font measurement (rustybuzz-based, kerning-aware) ────────────────
@@ -1942,6 +1944,8 @@ fn layout_table(
                 let cell_style = Style {
                     display: Display::Flex,
                     flex_direction: FlexDirection::Column,
+                    align_items: Some(AlignItems::FlexStart),
+                    justify_content: Some(JustifyContent::FlexStart),
                     size: Size {
                         width: Dimension::Length(cell_w),
                         height: Dimension::Auto,
@@ -2175,6 +2179,10 @@ struct LayoutProps {
     z_index: Option<i32>,
     /// CSS `float` property: "left" | "right" | "none".
     float: Option<String>,
+    /// CSS `overflow-x` property: "visible" | "hidden" | "scroll" | "auto".
+    overflow_x: Option<String>,
+    /// CSS `overflow-y` property: "visible" | "hidden" | "scroll" | "auto".
+    overflow_y: Option<String>,
     // ── CSS Grid properties ────────────────────────────────────────────
     /// Parsed `grid-template-columns` track list.
     grid_template_columns: Option<Vec<TrackSizingFunction>>,
@@ -2605,6 +2613,33 @@ fn parse_layout_props(attributes: &[(String, String)], viewport: &Viewport) -> L
                     }
                 }
 
+                // ── Overflow properties ────────────────────────────────
+                "overflow" => {
+                    match val {
+                        "visible" | "hidden" | "scroll" | "auto" | "clip" => {
+                            props.overflow_x = Some(val.to_string());
+                            props.overflow_y = Some(val.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                "overflow-x" => {
+                    match val {
+                        "visible" | "hidden" | "scroll" | "auto" | "clip" => {
+                            props.overflow_x = Some(val.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                "overflow-y" => {
+                    match val {
+                        "visible" | "hidden" | "scroll" | "auto" | "clip" => {
+                            props.overflow_y = Some(val.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+
                 // ── Grid properties ────────────────────────────────────
                 "grid-template-columns" => {
                     props.grid_template_columns = parse_track_list(val);
@@ -2812,6 +2847,25 @@ fn build_taffy_style(
         lp.margin_left.unwrap_or(LengthPercentageAuto::Length(0.0))
     };
 
+    // Map CSS `overflow-x` / `overflow-y` to Taffy `Overflow`.
+    let map_overflow = |val: Option<&str>| -> Overflow {
+        match val {
+            Some("hidden") | Some("clip") => Overflow::Hidden,
+            Some("scroll") | Some("auto") => Overflow::Scroll,
+            _ => Overflow::Visible,
+        }
+    };
+    let overflow = Point {
+        x: map_overflow(lp.overflow_x.as_deref()),
+        y: map_overflow(lp.overflow_y.as_deref()),
+    };
+
+    // Map CSS `box-sizing` to Taffy `BoxSizing`.
+    let box_sizing = match lp.box_sizing.as_deref() {
+        Some("border-box") => BoxSizing::BorderBox,
+        _ => BoxSizing::ContentBox,
+    };
+
     match display {
         "none" => Style {
             display: Display::None,
@@ -2866,6 +2920,8 @@ fn build_taffy_style(
                 } else {
                     None
                 },
+                overflow,
+                box_sizing,
                 ..Style::DEFAULT
             }
         }
@@ -2892,6 +2948,8 @@ fn build_taffy_style(
                 } else {
                     None
                 },
+                overflow,
+                box_sizing,
                 ..Style::DEFAULT
             }
         }
@@ -2908,6 +2966,8 @@ fn build_taffy_style(
             },
             margin,
             padding,
+            overflow,
+            box_sizing,
             ..Style::DEFAULT
         },
 
@@ -2931,6 +2991,8 @@ fn build_taffy_style(
                 },
                 margin,
                 padding,
+                overflow,
+                box_sizing,
                 ..Style::DEFAULT
             }
         },
@@ -2952,6 +3014,8 @@ fn build_taffy_style(
             margin,
             padding,
             flex_shrink: 0.0,
+            overflow,
+            box_sizing,
             ..Style::DEFAULT
         },
 
@@ -2993,6 +3057,8 @@ fn build_taffy_style(
             } else {
                 None
             },
+            overflow,
+            box_sizing,
             ..Style::DEFAULT
         },
 
@@ -3079,6 +3145,8 @@ fn build_taffy_style(
                 } else {
                     None
                 },
+                overflow,
+                box_sizing,
                 ..Style::DEFAULT
             }
         }

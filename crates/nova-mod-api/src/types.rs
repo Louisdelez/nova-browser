@@ -199,6 +199,13 @@ pub enum RenderOp {
         offset_y: f32,
         blur: f32,
     },
+    /// Push an opacity layer. All subsequent render ops until the matching
+    /// `PopOpacity` should have their alpha multiplied by this value.
+    PushOpacity {
+        opacity: f32,
+    },
+    /// Pop the current opacity layer, restoring the previous opacity.
+    PopOpacity,
 }
 
 /// RGBA color.

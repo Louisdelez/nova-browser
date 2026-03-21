@@ -126,6 +126,60 @@ impl FreeTypeRasterizer {
         self.cache.get(&cache_key).unwrap()
     }
 
+    /// Rasterize a glyph by its glyph ID (from rustybuzz shaping) and return
+    /// the cached glyph. Uses `load_glyph` instead of `load_char` for correct
+    /// rendering of shaped text (ligatures, alternate forms, etc.).
+    fn rasterize_glyph_id(&mut self, glyph_id: u32, font_size: f32, variant_key: &str) -> &FtCachedGlyph {
+        // Use a separate cache key space: char '\0' with the glyph_id encoded in the size slot
+        // would collide, so we use a distinct key format: variant + '\0' char + glyph_id.
+        let cache_key = (variant_key.to_string(), '\0', glyph_id * 1000 + (font_size * 10.0).round() as u32);
+        if !self.cache.contains_key(&cache_key) {
+            let bytes = self.font_bytes_for(variant_key).to_vec();
+            let glyph = self.rasterize_glyph_id_uncached(glyph_id, font_size, &bytes);
+            self.cache.insert(cache_key.clone(), glyph);
+        }
+        self.cache.get(&cache_key).unwrap()
+    }
+
+    /// Rasterize a glyph by glyph ID (uncached).
+    fn rasterize_glyph_id_uncached(&self, glyph_id: u32, font_size: f32, font_bytes: &[u8]) -> FtCachedGlyph {
+        let empty = FtCachedGlyph { bitmap: vec![], width: 0, height: 0, bearing_x: 0, bearing_y: 0, advance_x: font_size * 0.5 };
+        let face = match self.library.new_memory_face(font_bytes.to_vec(), 0) {
+            Ok(f) => f,
+            Err(_) => return empty,
+        };
+
+        let _ = face.set_char_size((font_size * 64.0) as isize, 0, 72, 72);
+
+        let load_flags = freetype::face::LoadFlag::RENDER | freetype::face::LoadFlag::TARGET_LIGHT;
+        if face.load_glyph(glyph_id, load_flags).is_err() {
+            return empty;
+        }
+
+        let glyph = face.glyph();
+        let bmp = glyph.bitmap();
+        let width = bmp.width();
+        let height = bmp.rows();
+        let bearing_x = glyph.bitmap_left();
+        let bearing_y = glyph.bitmap_top();
+        let advance_x = glyph.advance().x as f32 / 64.0;
+
+        let buffer = bmp.buffer();
+        let pitch = bmp.pitch().unsigned_abs() as usize;
+        let mut bitmap = Vec::with_capacity((width * height) as usize);
+        for row in 0..height as usize {
+            let start = row * pitch;
+            let end = start + width as usize;
+            if end <= buffer.len() {
+                bitmap.extend_from_slice(&buffer[start..end]);
+            } else {
+                bitmap.extend(std::iter::repeat(0).take(width as usize));
+            }
+        }
+
+        FtCachedGlyph { bitmap, width, height, bearing_x, bearing_y, advance_x }
+    }
+
     fn rasterize_uncached(&self, ch: char, font_size: f32, font_bytes: &[u8]) -> FtCachedGlyph {
         let empty = FtCachedGlyph { bitmap: vec![], width: 0, height: 0, bearing_x: 0, bearing_y: 0, advance_x: font_size * 0.5 };
         let face = match self.library.new_memory_face(font_bytes.to_vec(), 0) {
@@ -490,6 +544,8 @@ pub struct Framebuffer {
     clip_stack: Vec<ClipRect>,
     /// Extra y-offset applied by sticky positioning (reset each frame).
     translate_y_offset: f32,
+    /// Stack of opacity values for nested PushOpacity/PopOpacity.
+    opacity_stack: Vec<f32>,
 }
 
 impl Framebuffer {
@@ -504,6 +560,7 @@ impl Framebuffer {
             font_renderer,
             clip_stack: Vec::new(),
             translate_y_offset: 0.0,
+            opacity_stack: Vec::new(),
         }
     }
 
@@ -559,6 +616,23 @@ impl Framebuffer {
             // Fallback: monospace estimate
             let scale = font_size / 16.0;
             text.len() as f32 * 8.0 * scale
+        }
+    }
+
+    /// Compute the current effective opacity from the opacity stack.
+    ///
+    /// Returns the product of all active opacity values (1.0 if the stack is empty).
+    fn effective_opacity(&self) -> f32 {
+        self.opacity_stack.iter().copied().fold(1.0_f32, |acc, o| acc * o)
+    }
+
+    /// Apply the current opacity to a color by multiplying its alpha.
+    fn apply_opacity(&self, color: Color) -> Color {
+        let opacity = self.effective_opacity();
+        if opacity >= 1.0 {
+            color
+        } else {
+            Color { r: color.r, g: color.g, b: color.b, a: color.a * opacity }
         }
     }
 
@@ -884,7 +958,7 @@ impl Framebuffer {
                 let draw_y = cy;
 
                 if let Some(ref mut ft) = renderer.ft_rasterizer {
-                    let ft_glyph = ft.rasterize(ch, font_size, ft_variant_key);
+                    let ft_glyph = ft.rasterize_glyph_id(glyph.glyph_id as u32, font_size, ft_variant_key);
                     let gx = draw_x + ft_glyph.bearing_x;
                     let gy = draw_y - ft_glyph.bearing_y + glyph.y_offset.round() as i32;
                     let bw = ft_glyph.width;
@@ -1085,6 +1159,7 @@ impl Framebuffer {
     ) {
         self.clear(Color::WHITE);
         self.clip_stack.clear();
+        self.opacity_stack.clear();
         self.translate_y_offset = 0.0;
 
         // Load any custom @font-face fonts that haven't been loaded yet.
@@ -1098,16 +1173,19 @@ impl Framebuffer {
             let sy_extra = self.translate_y_offset;
             match op {
                 RenderOp::FillRect { x, y, width, height, color } => {
-                    self.fill_rect(*x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, *color);
+                    let c = self.apply_opacity(*color);
+                    self.fill_rect(*x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, c);
                 }
                 RenderOp::DrawText { x, y, text, font_size, color, font_weight, font_style, font_family } => {
+                    let c = self.apply_opacity(*color);
                     self.draw_text(
-                        *x - sx, *y + y_offset - scroll_y + sy_extra, text, *font_size, *color,
+                        *x - sx, *y + y_offset - scroll_y + sy_extra, text, *font_size, c,
                         *font_weight, font_style.as_deref(), font_family.as_deref(),
                     );
                 }
                 RenderOp::StrokeRect { x, y, width, height, color, width_px } => {
-                    self.stroke_rect(*x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, *color, *width_px);
+                    let c = self.apply_opacity(*color);
+                    self.stroke_rect(*x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, c, *width_px);
                 }
                 RenderOp::DrawImage {
                     x, y, width, height,
@@ -1130,20 +1208,28 @@ impl Framebuffer {
                     self.clip_stack.pop();
                 }
                 RenderOp::FillRoundedRect { x, y, width, height, color, radius } => {
+                    let c = self.apply_opacity(*color);
                     self.fill_rounded_rect(
-                        *x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, *color, *radius,
+                        *x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, c, *radius,
                     );
                 }
                 RenderOp::BoxShadow {
                     x, y, width, height, color, offset_x, offset_y, blur: _,
                 } => {
+                    let c = self.apply_opacity(*color);
                     self.fill_rect(
                         *x + *offset_x - sx,
                         *y + *offset_y + y_offset - scroll_y + sy_extra,
                         *width,
                         *height,
-                        *color,
+                        c,
                     );
+                }
+                RenderOp::PushOpacity { opacity } => {
+                    self.opacity_stack.push(*opacity);
+                }
+                RenderOp::PopOpacity => {
+                    self.opacity_stack.pop();
                 }
                 // Sticky positioning: adjust the y-offset for subsequent ops
                 // so the element sticks to the viewport during scroll.

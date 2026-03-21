@@ -39,12 +39,14 @@ use nova_mod_api::{
 };
 
 pub mod animation;
+pub mod animation_manager;
 pub mod cascade;
 pub mod defaults;
 pub mod media;
 pub mod parallel;
 pub mod parser;
 pub mod selector;
+pub mod transitions;
 pub mod values;
 
 /// A discovered `@font-face` font URL with its family name.

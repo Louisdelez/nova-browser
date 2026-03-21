@@ -39,8 +39,291 @@ use tracing::{debug, warn};
 use nova_mod_api::content::{DomNode, JsValue};
 use nova_mod_api::CoreApi;
 
-use crate::fetch_api;
-use crate::shadow_dom::{CustomElementRegistry, ShadowRoot, ShadowRootMode};
+use crate::canvas::CanvasContext2D;
+use crate::shadow_dom::{self, CustomElementRegistry, Slot, ShadowRoot, ShadowRootMode};
+
+// ── CSS Selector Engine ───────────────────────────────────────────────────────
+
+/// A parsed CSS selector, supporting complex combinators.
+#[derive(Debug, Clone)]
+enum SelectorPart {
+    /// A simple selector (tag, #id, .class, [attr], :pseudo).
+    Simple(SimpleSelector),
+    /// Descendant combinator: `A B` (B is descendant of A).
+    Descendant,
+    /// Child combinator: `A > B` (B is direct child of A).
+    Child,
+    /// Adjacent sibling: `A + B` (B immediately follows A).
+    Adjacent,
+    /// General sibling: `A ~ B` (B follows A, same parent).
+    General,
+}
+
+/// A single simple selector with multiple conditions that must all match.
+#[derive(Debug, Clone, Default)]
+struct SimpleSelector {
+    tag: Option<String>,
+    id: Option<String>,
+    classes: Vec<String>,
+    attrs: Vec<AttrSelector>,
+    pseudos: Vec<PseudoSelector>,
+    not: Option<Box<SimpleSelector>>,
+}
+
+/// Attribute selector with operator.
+#[derive(Debug, Clone)]
+struct AttrSelector {
+    name: String,
+    op: AttrOp,
+    value: Option<String>,
+}
+
+/// Attribute selector operator.
+#[derive(Debug, Clone)]
+enum AttrOp {
+    /// `[name]` - attribute exists.
+    Exists,
+    /// `[name="value"]` - exact match.
+    Equals,
+    /// `[name^="value"]` - starts with.
+    StartsWith,
+    /// `[name$="value"]` - ends with.
+    EndsWith,
+    /// `[name*="value"]` - contains.
+    Contains,
+}
+
+/// Pseudo-class selector.
+#[derive(Debug, Clone)]
+enum PseudoSelector {
+    FirstChild,
+    LastChild,
+    NthChild(i32),
+}
+
+/// A complete parsed selector (a sequence of simple selectors and combinators).
+#[derive(Debug, Clone)]
+struct Selector {
+    parts: Vec<SelectorPart>,
+}
+
+/// Parse a comma-separated selector list.
+fn parse_selector_list(input: &str) -> Vec<Selector> {
+    input.split(',')
+        .map(|s| parse_single_selector(s.trim()))
+        .collect()
+}
+
+/// Parse a single selector (no commas).
+fn parse_single_selector(input: &str) -> Selector {
+    let input = input.trim();
+    let mut parts: Vec<SelectorPart> = Vec::new();
+    let mut chars = input.chars().peekable();
+    let mut current = String::new();
+
+    while chars.peek().is_some() {
+        // Skip whitespace and detect combinators.
+        let mut had_space = false;
+        while chars.peek() == Some(&' ') {
+            chars.next();
+            had_space = true;
+        }
+
+        match chars.peek() {
+            Some(&'>') => {
+                if !current.is_empty() {
+                    parts.push(SelectorPart::Simple(parse_simple_selector(&current)));
+                    current.clear();
+                }
+                parts.push(SelectorPart::Child);
+                chars.next();
+                // skip trailing space
+                while chars.peek() == Some(&' ') { chars.next(); }
+                continue;
+            }
+            Some(&'+') => {
+                if !current.is_empty() {
+                    parts.push(SelectorPart::Simple(parse_simple_selector(&current)));
+                    current.clear();
+                }
+                parts.push(SelectorPart::Adjacent);
+                chars.next();
+                while chars.peek() == Some(&' ') { chars.next(); }
+                continue;
+            }
+            Some(&'~') => {
+                if !current.is_empty() {
+                    parts.push(SelectorPart::Simple(parse_simple_selector(&current)));
+                    current.clear();
+                }
+                parts.push(SelectorPart::General);
+                chars.next();
+                while chars.peek() == Some(&' ') { chars.next(); }
+                continue;
+            }
+            _ => {
+                if had_space && !current.is_empty() {
+                    parts.push(SelectorPart::Simple(parse_simple_selector(&current)));
+                    current.clear();
+                    parts.push(SelectorPart::Descendant);
+                }
+            }
+        }
+
+        if let Some(&c) = chars.peek() {
+            if c == '[' {
+                // Consume until matching ']'.
+                current.push(c);
+                chars.next();
+                while let Some(&inner) = chars.peek() {
+                    current.push(inner);
+                    chars.next();
+                    if inner == ']' { break; }
+                }
+            } else if c == ':' {
+                // Consume pseudo-class including parenthesized argument.
+                current.push(c);
+                chars.next();
+                // Consume the name.
+                while let Some(&pc) = chars.peek() {
+                    if pc == '(' {
+                        current.push(pc);
+                        chars.next();
+                        let mut depth = 1;
+                        while let Some(&inner) = chars.peek() {
+                            current.push(inner);
+                            chars.next();
+                            if inner == '(' { depth += 1; }
+                            if inner == ')' { depth -= 1; if depth == 0 { break; } }
+                        }
+                        break;
+                    } else if pc.is_alphanumeric() || pc == '-' || pc == '_' {
+                        current.push(pc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                current.push(c);
+                chars.next();
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        parts.push(SelectorPart::Simple(parse_simple_selector(&current)));
+    }
+
+    Selector { parts }
+}
+
+/// Parse a simple selector string like `div.foo#bar[attr="val"]:first-child`.
+fn parse_simple_selector(input: &str) -> SimpleSelector {
+    let mut sel = SimpleSelector::default();
+    let mut chars = input.chars().peekable();
+    let mut buf = String::new();
+    let mut mode = 't'; // t=tag, i=id, c=class
+
+    let flush = |mode: char, buf: &mut String, sel: &mut SimpleSelector| {
+        if buf.is_empty() { return; }
+        match mode {
+            't' => sel.tag = Some(buf.drain(..).collect::<String>().to_lowercase()),
+            'i' => sel.id = Some(buf.drain(..).collect()),
+            'c' => sel.classes.push(buf.drain(..).collect()),
+            _ => { buf.clear(); }
+        }
+    };
+
+    while let Some(&c) = chars.peek() {
+        match c {
+            '#' => {
+                flush(mode, &mut buf, &mut sel);
+                mode = 'i';
+                chars.next();
+            }
+            '.' => {
+                flush(mode, &mut buf, &mut sel);
+                mode = 'c';
+                chars.next();
+            }
+            '[' => {
+                flush(mode, &mut buf, &mut sel);
+                chars.next();
+                // Parse attribute selector.
+                let mut attr_str = String::new();
+                while let Some(&ac) = chars.peek() {
+                    if ac == ']' { chars.next(); break; }
+                    attr_str.push(ac);
+                    chars.next();
+                }
+                sel.attrs.push(parse_attr_selector(&attr_str));
+                mode = 't';
+            }
+            ':' => {
+                flush(mode, &mut buf, &mut sel);
+                chars.next();
+                // Read pseudo name.
+                let mut pseudo_name = String::new();
+                while let Some(&pc) = chars.peek() {
+                    if pc == '(' || !pc.is_alphanumeric() && pc != '-' && pc != '_' {
+                        break;
+                    }
+                    pseudo_name.push(pc);
+                    chars.next();
+                }
+                // Check for parenthesized argument.
+                let mut arg = String::new();
+                if chars.peek() == Some(&'(') {
+                    chars.next();
+                    let mut depth = 1;
+                    while let Some(&ac) = chars.peek() {
+                        chars.next();
+                        if ac == '(' { depth += 1; }
+                        if ac == ')' { depth -= 1; if depth == 0 { break; } }
+                        arg.push(ac);
+                    }
+                }
+                match pseudo_name.as_str() {
+                    "first-child" => sel.pseudos.push(PseudoSelector::FirstChild),
+                    "last-child" => sel.pseudos.push(PseudoSelector::LastChild),
+                    "nth-child" => {
+                        if let Ok(n) = arg.trim().parse::<i32>() {
+                            sel.pseudos.push(PseudoSelector::NthChild(n));
+                        }
+                    }
+                    "not" => {
+                        let inner = parse_simple_selector(arg.trim());
+                        sel.not = Some(Box::new(inner));
+                    }
+                    _ => {} // Unknown pseudo -- ignore.
+                }
+                mode = 't';
+            }
+            _ => {
+                buf.push(c);
+                chars.next();
+            }
+        }
+    }
+    flush(mode, &mut buf, &mut sel);
+    sel
+}
+
+/// Parse an attribute selector like `name="value"` or `name^="val"`.
+fn parse_attr_selector(s: &str) -> AttrSelector {
+    let s = s.trim();
+    // Try operators: ^=, $=, *=, =
+    for (op_str, op) in &[("^=", AttrOp::StartsWith), ("$=", AttrOp::EndsWith), ("*=", AttrOp::Contains), ("=", AttrOp::Equals)] {
+        if let Some(pos) = s.find(op_str) {
+            let name = s[..pos].trim().to_string();
+            let val_raw = s[pos + op_str.len()..].trim();
+            let value = val_raw.trim_matches('"').trim_matches('\'').to_string();
+            return AttrSelector { name, op: op.clone(), value: Some(value) };
+        }
+    }
+    AttrSelector { name: s.to_string(), op: AttrOp::Exists, value: None }
+}
 
 // ── Handle allocation ────────────────────────────────────────────────────────
 
@@ -133,7 +416,7 @@ pub struct EventCallback {
 /// script that runs in that page's context.
 pub struct JsDomTree {
     /// All nodes indexed by handle.
-    nodes: HashMap<ElementHandle, JsElement>,
+    pub(crate) nodes: HashMap<ElementHandle, JsElement>,
     /// The root document handle (always 0).
     root: ElementHandle,
     /// Next handle to allocate.
@@ -146,6 +429,12 @@ pub struct JsDomTree {
     pub shadow_roots: HashMap<ElementHandle, ShadowRoot>,
     /// Custom element registry (equivalent to `window.customElements`).
     pub custom_elements: CustomElementRegistry,
+    /// Canvas 2D rendering contexts keyed by the `<canvas>` element handle.
+    pub canvas_contexts: HashMap<ElementHandle, CanvasContext2D>,
+    /// Form element values (input, textarea, select) keyed by handle.
+    values: HashMap<ElementHandle, String>,
+    /// Checkbox/radio checked state keyed by handle.
+    checked: HashMap<ElementHandle, bool>,
 }
 
 impl JsDomTree {
@@ -159,6 +448,9 @@ impl JsDomTree {
             pending_events: Vec::new(),
             shadow_roots: HashMap::new(),
             custom_elements: CustomElementRegistry::new(),
+            canvas_contexts: HashMap::new(),
+            values: HashMap::new(),
+            checked: HashMap::new(),
         };
 
         // Reserve handle 0 for the document root.
@@ -286,16 +578,176 @@ impl JsDomTree {
                         attributes.push(("style".into(), style_str));
                     }
                 }
-                let children = elem
+
+                // ── Shadow DOM export ──────────────────────────────────
+                // If this element has a shadow root, export the shadow tree
+                // children (with slot distribution) instead of light DOM
+                // children. The shadow root's stylesheets are serialized as
+                // a `data-nova-shadow-styles` attribute so the cascade can
+                // scope them correctly.
+                if let Some(shadow) = self.shadow_roots.get(&handle) {
+                    // Mark element as shadow host.
+                    attributes.push(("data-nova-shadow-host".into(), "true".into()));
+
+                    // Serialize shadow stylesheets.
+                    if !shadow.stylesheets.is_empty() {
+                        let combined = shadow.stylesheets.join("\n");
+                        attributes.push(("data-nova-shadow-styles".into(), combined));
+                    }
+
+                    // Build the shadow tree children with slot distribution.
+                    let children = self.export_shadow_children(handle, &shadow.children.clone());
+                    DomNode::Element {
+                        tag: tag.to_owned(),
+                        attributes,
+                        children,
+                    }
+                } else {
+                    let children = elem
+                        .children
+                        .iter()
+                        .map(|&h| self.export_node(h))
+                        .collect();
+                    DomNode::Element {
+                        tag: tag.to_owned(),
+                        attributes,
+                        children,
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Shadow DOM export helpers ──────────────────────────────────────────────
+
+    /// Export shadow tree children, distributing light DOM children into slots.
+    ///
+    /// Walks the shadow tree children; when a `<slot>` element is encountered,
+    /// it is replaced by the matching light DOM children from the host element.
+    fn export_shadow_children(
+        &self,
+        host_handle: ElementHandle,
+        shadow_child_handles: &[ElementHandle],
+    ) -> Vec<DomNode> {
+        // Gather host's light DOM children with their `slot` attribute values.
+        let host_children: Vec<(ElementHandle, Option<String>)> = self
+            .nodes
+            .get(&host_handle)
+            .map(|e| {
+                e.children
+                    .iter()
+                    .map(|&h| {
+                        let slot_attr = self
+                            .nodes
+                            .get(&h)
+                            .and_then(|child_elem| {
+                                child_elem
+                                    .attributes
+                                    .iter()
+                                    .find(|(k, _)| k == "slot")
+                                    .map(|(_, v)| v.clone())
+                            });
+                        (h, slot_attr)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Collect slot definitions from the shadow tree.
+        let slots = self.collect_slots(shadow_child_handles);
+
+        // Assign light DOM children to slots.
+        let assignments = shadow_dom::assign_slots(&host_children, &slots);
+
+        // Now export shadow children, replacing <slot> elements with assigned nodes.
+        shadow_child_handles
+            .iter()
+            .flat_map(|&h| self.export_shadow_node(h, &assignments))
+            .collect()
+    }
+
+    /// Collect all `<slot>` elements from the shadow tree children.
+    fn collect_slots(&self, handles: &[ElementHandle]) -> Vec<Slot> {
+        let mut slots = Vec::new();
+        for &h in handles {
+            self.collect_slots_recursive(h, &mut slots);
+        }
+        slots
+    }
+
+    /// Recursively find `<slot>` elements in the shadow tree.
+    fn collect_slots_recursive(&self, handle: ElementHandle, slots: &mut Vec<Slot>) {
+        let Some(elem) = self.nodes.get(&handle) else { return };
+        if elem.tag == "slot" {
+            let name = elem
+                .attributes
+                .iter()
+                .find(|(k, _)| k == "name")
+                .map(|(_, v)| v.clone());
+            slots.push(Slot::new(name));
+        }
+        for &child in &elem.children {
+            self.collect_slots_recursive(child, slots);
+        }
+    }
+
+    /// Export a single shadow node, replacing `<slot>` elements with their
+    /// assigned light DOM children.
+    fn export_shadow_node(
+        &self,
+        handle: ElementHandle,
+        assignments: &std::collections::HashMap<Option<String>, Vec<ElementHandle>>,
+    ) -> Vec<DomNode> {
+        let Some(elem) = self.nodes.get(&handle) else {
+            return vec![DomNode::Text(String::new())];
+        };
+
+        if elem.tag == "slot" {
+            // Replace the slot with its assigned light DOM children.
+            let slot_name = elem
+                .attributes
+                .iter()
+                .find(|(k, _)| k == "name")
+                .map(|(_, v)| v.clone());
+            if let Some(assigned) = assignments.get(&slot_name) {
+                if !assigned.is_empty() {
+                    return assigned.iter().map(|&h| self.export_node(h)).collect();
+                }
+            }
+            // No assigned nodes — render the slot's fallback content (its children).
+            return elem.children.iter().map(|&h| self.export_node(h)).collect();
+        }
+
+        // For non-slot elements, recursively export but continue checking for
+        // nested slots.
+        match elem.tag.as_str() {
+            "#text" => vec![DomNode::Text(elem.text.clone().unwrap_or_default())],
+            "#comment" => vec![DomNode::Comment(elem.text.clone().unwrap_or_default())],
+            tag => {
+                let mut attributes = elem.attributes.clone();
+                if !elem.inline_styles.is_empty() {
+                    let style_str: String = elem
+                        .inline_styles
+                        .iter()
+                        .map(|(k, v)| format!("{k}:{v}"))
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    if let Some(pos) = attributes.iter().position(|(k, _)| k == "style") {
+                        attributes[pos].1 = style_str;
+                    } else {
+                        attributes.push(("style".into(), style_str));
+                    }
+                }
+                let children: Vec<DomNode> = elem
                     .children
                     .iter()
-                    .map(|&h| self.export_node(h))
+                    .flat_map(|&h| self.export_shadow_node(h, assignments))
                     .collect();
-                DomNode::Element {
+                vec![DomNode::Element {
                     tag: tag.to_owned(),
                     attributes,
                     children,
-                }
+                }]
             }
         }
     }
@@ -307,17 +759,16 @@ impl JsDomTree {
         self.find_by_attr("id", id, self.root)
     }
 
-    /// `document.querySelector(selector)` — very simple CSS-selector subset:
-    /// supports `#id`, `.class`, and `tag` selectors.
+    /// `document.querySelector(selector)` — supports complex CSS selectors
+    /// including combinators, attribute selectors, and pseudo-classes.
     pub fn query_selector(&self, selector: &str) -> Option<ElementHandle> {
-        let selector = selector.trim();
-        if selector.starts_with('#') {
-            self.find_by_attr("id", &selector[1..], self.root)
-        } else if selector.starts_with('.') {
-            self.find_by_class(&selector[1..], self.root)
-        } else {
-            self.find_by_tag(selector, self.root)
+        let selectors = parse_selector_list(selector.trim());
+        for sel in &selectors {
+            if let Some(h) = self.find_first_matching(sel, self.root) {
+                return Some(h);
+            }
         }
+        None
     }
 
     /// Recursive depth-first search by attribute.
@@ -335,6 +786,7 @@ impl JsDomTree {
     }
 
     /// Recursive depth-first search by class membership.
+    #[allow(dead_code)]
     fn find_by_class(&self, class: &str, handle: ElementHandle) -> Option<ElementHandle> {
         let elem = self.nodes.get(&handle)?;
         let classes = elem.class_attr();
@@ -488,7 +940,7 @@ impl JsDomTree {
     }
 
     /// Minimal HTML fragment parser (handles tags and text runs only).
-    fn parse_html_fragment(&mut self, html: &str) -> Vec<ElementHandle> {
+    pub(crate) fn parse_html_fragment(&mut self, html: &str) -> Vec<ElementHandle> {
         let mut handles = Vec::new();
         let mut remaining = html;
 
@@ -696,19 +1148,232 @@ impl JsDomTree {
 
     /// `document.querySelectorAll(selector)` — returns all matching elements.
     pub fn query_selector_all(&self, selector: &str) -> Vec<ElementHandle> {
-        let selector = selector.trim();
+        let selectors = parse_selector_list(selector.trim());
         let mut results = Vec::new();
-        if selector.starts_with('#') {
-            self.collect_by_attr("id", &selector[1..], self.root, &mut results);
-        } else if selector.starts_with('.') {
-            self.collect_by_class(&selector[1..], self.root, &mut results);
-        } else {
-            self.collect_by_tag(selector, self.root, &mut results);
-        }
+        self.collect_all_matching(&selectors, self.root, &mut results);
         results
     }
 
+    /// Find the first element matching a complex selector (DFS).
+    fn find_first_matching(&self, selector: &Selector, scope: ElementHandle) -> Option<ElementHandle> {
+        // Collect all candidates in DFS order, then test each.
+        let mut candidates = Vec::new();
+        self.collect_all_descendants(scope, &mut candidates);
+        for &handle in &candidates {
+            if self.matches_complex_selector(handle, &selector.parts) {
+                return Some(handle);
+            }
+        }
+        None
+    }
+
+    /// Collect all matching elements for a selector list.
+    fn collect_all_matching(&self, selectors: &[Selector], scope: ElementHandle, out: &mut Vec<ElementHandle>) {
+        let mut candidates = Vec::new();
+        self.collect_all_descendants(scope, &mut candidates);
+        for &handle in &candidates {
+            for sel in selectors {
+                if self.matches_complex_selector(handle, &sel.parts) {
+                    out.push(handle);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Collect all descendants in DFS order (excluding the root itself).
+    fn collect_all_descendants(&self, handle: ElementHandle, out: &mut Vec<ElementHandle>) {
+        let Some(elem) = self.nodes.get(&handle) else { return };
+        for &child in &elem.children {
+            if self.nodes.get(&child).map(|e| e.tag != "#text" && e.tag != "#comment").unwrap_or(false) {
+                out.push(child);
+            }
+            self.collect_all_descendants(child, out);
+        }
+    }
+
+    /// Test if a handle matches a complex selector (sequence of parts with combinators).
+    fn matches_complex_selector(&self, handle: ElementHandle, parts: &[SelectorPart]) -> bool {
+        if parts.is_empty() {
+            return true;
+        }
+
+        // Walk parts right-to-left. The rightmost simple selector must match the target.
+        let mut idx = parts.len();
+        let mut current = handle;
+
+        // Find the rightmost simple selector.
+        loop {
+            if idx == 0 { return false; }
+            idx -= 1;
+            if let SelectorPart::Simple(ref s) = parts[idx] {
+                if !self.element_matches_simple(current, s) {
+                    return false;
+                }
+                break;
+            }
+        }
+
+        // Now walk leftward through combinator + selector pairs.
+        while idx > 0 {
+            idx -= 1;
+            let combinator = &parts[idx];
+            if idx == 0 { return false; } // combinator without preceding selector
+            idx -= 1;
+            let SelectorPart::Simple(ref prev_sel) = parts[idx] else {
+                return false;
+            };
+
+            match combinator {
+                SelectorPart::Descendant => {
+                    // Find any ancestor matching.
+                    let mut ancestor = self.parent_node(current);
+                    let mut found = false;
+                    while let Some(anc) = ancestor {
+                        if self.element_matches_simple(anc, prev_sel) {
+                            current = anc;
+                            found = true;
+                            break;
+                        }
+                        ancestor = self.parent_node(anc);
+                    }
+                    if !found { return false; }
+                }
+                SelectorPart::Child => {
+                    let Some(parent) = self.parent_node(current) else { return false };
+                    if !self.element_matches_simple(parent, prev_sel) { return false; }
+                    current = parent;
+                }
+                SelectorPart::Adjacent => {
+                    let Some(prev_sib) = self.previous_element_sibling(current) else { return false };
+                    if !self.element_matches_simple(prev_sib, prev_sel) { return false; }
+                    current = prev_sib;
+                }
+                SelectorPart::General => {
+                    let Some(parent) = self.parent_node(current) else { return false };
+                    let siblings = self.children(parent);
+                    let my_pos = siblings.iter().position(|&h| h == current).unwrap_or(0);
+                    let mut found = false;
+                    for &sib in &siblings[..my_pos] {
+                        if self.element_matches_simple(sib, prev_sel) {
+                            current = sib;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found { return false; }
+                }
+                _ => return false,
+            }
+        }
+
+        true
+    }
+
+    /// Test if a single element matches a simple selector (no combinators).
+    fn element_matches_simple(&self, handle: ElementHandle, sel: &SimpleSelector) -> bool {
+        let Some(elem) = self.nodes.get(&handle) else { return false };
+        if elem.tag == "#text" || elem.tag == "#comment" || elem.tag == "#document" {
+            return false;
+        }
+
+        // Tag check.
+        if let Some(ref tag) = sel.tag {
+            if tag != "*" && elem.tag != *tag {
+                return false;
+            }
+        }
+
+        // ID check.
+        if let Some(ref id) = sel.id {
+            let has_id = elem.attributes.iter().any(|(k, v)| k == "id" && v == id);
+            if !has_id { return false; }
+        }
+
+        // Class checks.
+        for cls in &sel.classes {
+            let class_attr = elem.class_attr();
+            if !class_attr.split_whitespace().any(|c| c == cls.as_str()) {
+                return false;
+            }
+        }
+
+        // Attribute checks.
+        for attr in &sel.attrs {
+            let attr_val = elem.attributes.iter().find(|(k, _)| *k == attr.name).map(|(_, v)| v.as_str());
+            match attr.op {
+                AttrOp::Exists => {
+                    if attr_val.is_none() { return false; }
+                }
+                AttrOp::Equals => {
+                    if attr_val != attr.value.as_deref() { return false; }
+                }
+                AttrOp::StartsWith => {
+                    match (attr_val, attr.value.as_deref()) {
+                        (Some(val), Some(expected)) => { if !val.starts_with(expected) { return false; } }
+                        _ => { return false; }
+                    }
+                }
+                AttrOp::EndsWith => {
+                    match (attr_val, attr.value.as_deref()) {
+                        (Some(val), Some(expected)) => { if !val.ends_with(expected) { return false; } }
+                        _ => { return false; }
+                    }
+                }
+                AttrOp::Contains => {
+                    match (attr_val, attr.value.as_deref()) {
+                        (Some(val), Some(expected)) => { if !val.contains(expected) { return false; } }
+                        _ => { return false; }
+                    }
+                }
+            }
+        }
+
+        // Pseudo-class checks.
+        for pseudo in &sel.pseudos {
+            match pseudo {
+                PseudoSelector::FirstChild => {
+                    if let Some(parent) = self.parent_node(handle) {
+                        let siblings = self.children(parent);
+                        if siblings.first() != Some(&handle) { return false; }
+                    }
+                }
+                PseudoSelector::LastChild => {
+                    if let Some(parent) = self.parent_node(handle) {
+                        let siblings = self.children(parent);
+                        if siblings.last() != Some(&handle) { return false; }
+                    }
+                }
+                PseudoSelector::NthChild(n) => {
+                    if let Some(parent) = self.parent_node(handle) {
+                        let siblings = self.children(parent);
+                        let pos = siblings.iter().position(|&h| h == handle);
+                        if pos != Some((*n as usize).wrapping_sub(1)) { return false; }
+                    }
+                }
+            }
+        }
+
+        // :not() check.
+        if let Some(ref not_sel) = sel.not {
+            if self.element_matches_simple(handle, not_sel) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Get the previous element sibling (skipping text/comment nodes).
+    fn previous_element_sibling(&self, handle: ElementHandle) -> Option<ElementHandle> {
+        let parent = self.parent_node(handle)?;
+        let siblings = self.children(parent);
+        let pos = siblings.iter().position(|&h| h == handle)?;
+        if pos > 0 { Some(siblings[pos - 1]) } else { None }
+    }
+
     /// Recursive collect by attribute.
+    #[allow(dead_code)]
     fn collect_by_attr(
         &self,
         attr: &str,
@@ -903,23 +1568,15 @@ impl JsDomTree {
             .collect()
     }
 
-    /// Check if an element matches a simple CSS selector.
+    /// Check if an element matches a CSS selector.
     pub fn matches(&self, handle: ElementHandle, selector: &str) -> bool {
-        let selector = selector.trim();
-        let Some(elem) = self.nodes.get(&handle) else {
-            return false;
-        };
-        if selector.starts_with('#') {
-            elem.attributes
-                .iter()
-                .any(|(k, v)| k == "id" && v == &selector[1..])
-        } else if selector.starts_with('.') {
-            elem.class_attr()
-                .split_whitespace()
-                .any(|c| c == &selector[1..])
-        } else {
-            elem.tag == selector.to_lowercase()
+        let selectors = parse_selector_list(selector.trim());
+        for sel in &selectors {
+            if self.matches_complex_selector(handle, &sel.parts) {
+                return true;
+            }
         }
+        false
     }
 
     /// `document.createTextNode(text)` — creates an unattached text node.
@@ -973,6 +1630,26 @@ impl JsDomTree {
             self.class_list_add(handle, cls);
             true
         }
+    }
+
+    /// Replace a class in classList. Returns true if `old_cls` was found and replaced.
+    pub fn class_list_replace(&mut self, handle: ElementHandle, old_cls: &str, new_cls: &str) -> bool {
+        let Some(elem) = self.nodes.get_mut(&handle) else {
+            warn!(handle, old_cls, new_cls, "classList.replace: handle not found");
+            return false;
+        };
+        let classes = elem.class_attr();
+        if !classes.split_whitespace().any(|c| c == old_cls) {
+            return false;
+        }
+        let new_classes: String = classes
+            .split_whitespace()
+            .map(|c| if c == old_cls { new_cls } else { c })
+            .collect::<Vec<_>>()
+            .join(" ");
+        elem.set_class_attr(new_classes);
+        debug!(handle, old_cls, new_cls, "classList.replace");
+        true
     }
 
     /// Get the `className` (class attribute value) for an element.
@@ -1029,20 +1706,97 @@ impl JsDomTree {
         }
     }
 
+    /// Find the `<html>` document element handle.
+    pub fn document_element(&self) -> Option<ElementHandle> {
+        self.find_by_tag("html", self.root)
+    }
+
+    /// Get the CSS text for inline styles (e.g. "color: red; display: none;").
+    pub fn style_css_text(&self, handle: ElementHandle) -> String {
+        let Some(elem) = self.nodes.get(&handle) else {
+            return String::new();
+        };
+        elem.inline_styles
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Get the outer HTML of an element (includes the element itself).
+    pub fn get_outer_html(&self, handle: ElementHandle) -> String {
+        self.serialise_node(handle)
+    }
+
+    /// `element.insertAdjacentHTML(position, html)` — insert parsed HTML at a position
+    /// relative to the element.
+    ///
+    /// `position` is one of: `"beforebegin"`, `"afterbegin"`, `"beforeend"`, `"afterend"`.
+    pub fn insert_adjacent_html(&mut self, handle: ElementHandle, position: &str, html: &str) {
+        let new_children = self.parse_html_fragment(html);
+        match position {
+            "beforebegin" => {
+                // Insert before this element in its parent's children list.
+                if let Some(parent_handle) = self.parent_node(handle) {
+                    if let Some(parent) = self.nodes.get_mut(&parent_handle) {
+                        if let Some(pos) = parent.children.iter().position(|&h| h == handle) {
+                            for (i, child) in new_children.into_iter().enumerate() {
+                                parent.children.insert(pos + i, child);
+                            }
+                        }
+                    }
+                }
+            }
+            "afterbegin" => {
+                // Insert as first children of this element.
+                if let Some(elem) = self.nodes.get_mut(&handle) {
+                    for (i, child) in new_children.into_iter().enumerate() {
+                        elem.children.insert(i, child);
+                    }
+                }
+            }
+            "beforeend" => {
+                // Append to this element's children.
+                if let Some(elem) = self.nodes.get_mut(&handle) {
+                    elem.children.extend(new_children);
+                }
+            }
+            "afterend" => {
+                // Insert after this element in its parent's children list.
+                if let Some(parent_handle) = self.parent_node(handle) {
+                    if let Some(parent) = self.nodes.get_mut(&parent_handle) {
+                        if let Some(pos) = parent.children.iter().position(|&h| h == handle) {
+                            for (i, child) in new_children.into_iter().enumerate() {
+                                parent.children.insert(pos + 1 + i, child);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                warn!(handle, position, "insertAdjacentHTML: invalid position");
+            }
+        }
+        debug!(handle, position, "insertAdjacentHTML");
+    }
+
     /// Query selector scoped to a specific element.
     pub fn query_selector_within(
         &self,
         handle: ElementHandle,
         selector: &str,
     ) -> Option<ElementHandle> {
-        let selector = selector.trim();
-        if selector.starts_with('#') {
-            self.find_by_attr("id", &selector[1..], handle)
-        } else if selector.starts_with('.') {
-            self.find_by_class(&selector[1..], handle)
-        } else {
-            self.find_by_tag(selector, handle)
+        let selectors = parse_selector_list(selector.trim());
+        let mut candidates = Vec::new();
+        self.collect_all_descendants(handle, &mut candidates);
+        for &cand in &candidates {
+            for sel in &selectors {
+                if self.matches_complex_selector(cand, &sel.parts) {
+                    return Some(cand);
+                }
+            }
         }
+        None
     }
 
     // ── Shadow DOM API ─────────────────────────────────────────────────────────
@@ -1087,6 +1841,68 @@ impl JsDomTree {
         }
     }
 
+    // ── Custom Elements helpers ────────────────────────────────────────────────
+
+    /// Find all elements in the tree whose tag name matches a registered
+    /// custom element. Returns `(handle, tag_name)` pairs.
+    ///
+    /// This is used to trigger `connectedCallback` after the DOM is imported.
+    pub fn find_custom_elements(&self) -> Vec<(ElementHandle, String)> {
+        let mut result = Vec::new();
+        for (&handle, elem) in &self.nodes {
+            if self.custom_elements.is_defined(&elem.tag) {
+                result.push((handle, elem.tag.clone()));
+            }
+        }
+        result
+    }
+
+    // ── Canvas API ─────────────────────────────────────────────────────────────
+
+    /// Get or create a `CanvasRenderingContext2D` for a `<canvas>` element.
+    ///
+    /// Returns `None` if the handle does not refer to a `<canvas>` element.
+    /// On first call, creates a pixel buffer using the element's width/height
+    /// attributes (defaulting to 300x150 per the HTML5 spec).
+    pub fn get_canvas_context(&mut self, handle: ElementHandle) -> Option<&mut CanvasContext2D> {
+        let elem = self.nodes.get(&handle)?;
+        if elem.tag != "canvas" {
+            return None;
+        }
+        if !self.canvas_contexts.contains_key(&handle) {
+            let width: u32 = self.get_attribute(handle, "width")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300);
+            let height: u32 = self.get_attribute(handle, "height")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(150);
+            let ctx = CanvasContext2D::new(width, height);
+            self.canvas_contexts.insert(handle, ctx);
+            debug!(handle, width, height, "created canvas 2D context");
+        }
+        self.canvas_contexts.get_mut(&handle)
+    }
+
+    /// Get an immutable reference to a canvas context if it exists.
+    pub fn get_canvas_context_ref(&self, handle: ElementHandle) -> Option<&CanvasContext2D> {
+        self.canvas_contexts.get(&handle)
+    }
+
+    /// Collect all canvas pixel buffers for the painter.
+    ///
+    /// Returns a vec of `(element_id, width, height, rgba_pixels)` for each
+    /// canvas that has been drawn to.
+    pub fn collect_canvas_pixels(&self) -> Vec<(String, u32, u32, Vec<u8>)> {
+        let mut result = Vec::new();
+        for (&handle, ctx) in &self.canvas_contexts {
+            // Use the element's id attribute or handle as key.
+            let id = self.get_attribute(handle, "id")
+                .unwrap_or_else(|| format!("__canvas_{handle}"));
+            result.push((id, ctx.width, ctx.height, ctx.pixels.clone()));
+        }
+        result
+    }
+
     // ── Event system helpers ──────────────────────────────────────────────────
 
     /// Build the path from the target element up to the document root.
@@ -1125,17 +1941,430 @@ impl JsDomTree {
         handle: ElementHandle,
         selector: &str,
     ) -> Vec<ElementHandle> {
-        let selector = selector.trim();
+        let selectors = parse_selector_list(selector.trim());
         let mut results = Vec::new();
-        if selector.starts_with('#') {
-            self.collect_by_attr("id", &selector[1..], handle, &mut results);
-        } else if selector.starts_with('.') {
-            self.collect_by_class(&selector[1..], handle, &mut results);
-        } else {
-            self.collect_by_tag(selector, handle, &mut results);
-        }
+        self.collect_all_matching(&selectors, handle, &mut results);
         results
     }
+
+    // ── Form element properties ──────────────────────────────────────────────
+
+    /// Get `el.value` for form elements (input, textarea, select).
+    pub fn get_value(&self, handle: ElementHandle) -> String {
+        if let Some(v) = self.values.get(&handle) {
+            return v.clone();
+        }
+        // Fall back to "value" attribute if present.
+        self.get_attribute(handle, "value").unwrap_or_default()
+    }
+
+    /// Set `el.value` for form elements.
+    pub fn set_value(&mut self, handle: ElementHandle, value: &str) {
+        self.values.insert(handle, value.to_owned());
+        debug!(handle, value, "set value");
+    }
+
+    /// Get `el.checked` for checkbox/radio inputs.
+    pub fn get_checked(&self, handle: ElementHandle) -> bool {
+        if let Some(&v) = self.checked.get(&handle) {
+            return v;
+        }
+        // Fall back to presence of "checked" attribute.
+        self.has_attribute(handle, "checked")
+    }
+
+    /// Set `el.checked` for checkbox/radio inputs.
+    pub fn set_checked(&mut self, handle: ElementHandle, value: bool) {
+        self.checked.insert(handle, value);
+        debug!(handle, value, "set checked");
+    }
+
+    /// Get `el.disabled`.
+    pub fn get_disabled(&self, handle: ElementHandle) -> bool {
+        self.has_attribute(handle, "disabled")
+    }
+
+    /// Set `el.disabled`.
+    pub fn set_disabled(&mut self, handle: ElementHandle, value: bool) {
+        if value {
+            self.set_attribute(handle, "disabled", "");
+        } else {
+            self.remove_attribute(handle, "disabled");
+        }
+    }
+
+    // ── Element dimension stubs ──────────────────────────────────────────────
+
+    /// Get `el.offsetWidth` (reads from `data-nova-width` attribute or 0).
+    pub fn get_offset_width(&self, handle: ElementHandle) -> f64 {
+        self.get_attribute(handle, "data-nova-width")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Get `el.offsetHeight` (reads from `data-nova-height` attribute or 0).
+    pub fn get_offset_height(&self, handle: ElementHandle) -> f64 {
+        self.get_attribute(handle, "data-nova-height")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    // ── getComputedStyle helper ──────────────────────────────────────────────
+
+    /// Parse computed style from `data-nova-style` attribute and inline styles.
+    ///
+    /// Returns a map of CSS property name → value. Both kebab-case and
+    /// camelCase keys are inserted so that `style.fontSize` and
+    /// `style["font-size"]` both resolve.
+    pub fn get_computed_style(&self, handle: ElementHandle) -> HashMap<String, String> {
+        let mut styles = HashMap::new();
+
+        // Parse data-nova-style attribute.
+        if let Some(style_str) = self.get_attribute(handle, "data-nova-style") {
+            parse_style_string(&style_str, &mut styles);
+        }
+
+        // Overlay inline style attribute.
+        if let Some(style_str) = self.get_attribute(handle, "style") {
+            parse_style_string(&style_str, &mut styles);
+        }
+
+        // Overlay programmatic inline styles.
+        if let Some(elem) = self.nodes.get(&handle) {
+            for (k, v) in &elem.inline_styles {
+                insert_style_both_cases(&mut styles, k, v);
+            }
+        }
+
+        styles
+    }
+
+    // ── Additional mutation convenience methods ──────────────────────────────
+
+    /// `el.remove()` — remove this element from its parent.
+    pub fn remove_element(&mut self, handle: ElementHandle) -> bool {
+        if let Some(parent) = self.parent_node(handle) {
+            self.remove_child(parent, handle)
+        } else {
+            false
+        }
+    }
+
+    /// `el.replaceWith(new_el)` — replace this element with another in its parent.
+    pub fn replace_with(&mut self, handle: ElementHandle, new_handle: ElementHandle) -> bool {
+        let Some(parent) = self.parent_node(handle) else {
+            return false;
+        };
+        let Some(parent_elem) = self.nodes.get_mut(&parent) else {
+            return false;
+        };
+        if let Some(pos) = parent_elem.children.iter().position(|&h| h == handle) {
+            parent_elem.children[pos] = new_handle;
+            debug!(handle, new_handle, "replaceWith");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `el.after(new_el)` — insert new_el after this element in parent.
+    pub fn insert_after(&mut self, handle: ElementHandle, new_handle: ElementHandle) -> bool {
+        let Some(parent) = self.parent_node(handle) else {
+            return false;
+        };
+        let Some(parent_elem) = self.nodes.get_mut(&parent) else {
+            return false;
+        };
+        if let Some(pos) = parent_elem.children.iter().position(|&h| h == handle) {
+            parent_elem.children.insert(pos + 1, new_handle);
+            debug!(handle, new_handle, "after");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `el.before(new_el)` — insert new_el before this element in parent.
+    pub fn insert_before_self(&mut self, handle: ElementHandle, new_handle: ElementHandle) -> bool {
+        let Some(parent) = self.parent_node(handle) else {
+            return false;
+        };
+        let Some(parent_elem) = self.nodes.get_mut(&parent) else {
+            return false;
+        };
+        if let Some(pos) = parent_elem.children.iter().position(|&h| h == handle) {
+            parent_elem.children.insert(pos, new_handle);
+            debug!(handle, new_handle, "before");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `el.append(...nodes)` — append multiple children.
+    pub fn append_multiple(&mut self, parent: ElementHandle, children: &[ElementHandle]) {
+        for &child in children {
+            self.append_child(parent, child);
+        }
+    }
+
+    /// `el.prepend(...nodes)` — prepend multiple children.
+    pub fn prepend_multiple(&mut self, parent: ElementHandle, children: &[ElementHandle]) {
+        if let Some(parent_elem) = self.nodes.get_mut(&parent) {
+            let mut new_children: Vec<ElementHandle> = children.to_vec();
+            new_children.extend(parent_elem.children.iter().copied());
+            parent_elem.children = new_children;
+            debug!(parent, "prepend");
+        }
+    }
+
+    // ── Missing DOM APIs (Sprint 2c) ─────────────────────────────────────────
+
+    /// `document.createDocumentFragment()` — create a virtual container node.
+    pub fn create_document_fragment(&mut self) -> ElementHandle {
+        let handle = self.alloc_handle();
+        let elem = JsElement {
+            handle,
+            tag: "#document-fragment".into(),
+            attributes: Vec::new(),
+            children: Vec::new(),
+            text: None,
+            inline_styles: Vec::new(),
+        };
+        self.nodes.insert(handle, elem);
+        debug!(handle, "createDocumentFragment");
+        handle
+    }
+
+    /// `el.closest(selector)` — walk up parents finding first match.
+    pub fn closest(&self, handle: ElementHandle, selector: &str) -> Option<ElementHandle> {
+        let mut current = Some(handle);
+        while let Some(h) = current {
+            if self.matches(h, selector) {
+                return Some(h);
+            }
+            current = self.parent_node(h);
+        }
+        None
+    }
+
+    /// `document.getElementsByClassName(name)` — collect all elements with class.
+    pub fn get_elements_by_class_name(&self, class: &str) -> Vec<ElementHandle> {
+        let mut results = Vec::new();
+        self.collect_by_class(class, self.root, &mut results);
+        results
+    }
+
+    /// `document.getElementsByTagName(tag)` — collect all elements with tag.
+    pub fn get_elements_by_tag_name(&self, tag: &str) -> Vec<ElementHandle> {
+        let mut results = Vec::new();
+        self.collect_by_tag(tag, self.root, &mut results);
+        results
+    }
+
+    /// Get a dataset value (data-* attribute).
+    pub fn get_dataset(&self, handle: ElementHandle, key: &str) -> Option<String> {
+        let attr_name = format!("data-{}", camel_to_kebab(key));
+        self.get_attribute(handle, &attr_name)
+    }
+
+    /// Set a dataset value (data-* attribute).
+    pub fn set_dataset(&mut self, handle: ElementHandle, key: &str, value: &str) {
+        let attr_name = format!("data-{}", camel_to_kebab(key));
+        self.set_attribute(handle, &attr_name, value);
+    }
+
+    /// Get all dataset entries (data-* attributes as camelCase keys).
+    pub fn get_dataset_all(&self, handle: ElementHandle) -> HashMap<String, String> {
+        let Some(elem) = self.nodes.get(&handle) else { return HashMap::new() };
+        let mut map = HashMap::new();
+        for (k, v) in &elem.attributes {
+            if let Some(suffix) = k.strip_prefix("data-") {
+                let camel = kebab_to_camel(suffix);
+                map.insert(camel, v.clone());
+            }
+        }
+        map
+    }
+
+    /// `el.outerHTML` setter — replace this element with parsed HTML.
+    pub fn set_outer_html(&mut self, handle: ElementHandle, html: &str) {
+        let new_children = self.parse_html_fragment(html);
+        if let Some(parent) = self.parent_node(handle) {
+            if let Some(parent_elem) = self.nodes.get_mut(&parent) {
+                if let Some(pos) = parent_elem.children.iter().position(|&h| h == handle) {
+                    parent_elem.children.splice(pos..=pos, new_children);
+                    debug!(handle, "set outerHTML");
+                }
+            }
+        }
+    }
+
+    /// `el.replaceChild(newChild, oldChild)` — replace a child in parent.
+    pub fn replace_child(
+        &mut self,
+        parent: ElementHandle,
+        new_child: ElementHandle,
+        old_child: ElementHandle,
+    ) -> bool {
+        let Some(parent_elem) = self.nodes.get_mut(&parent) else {
+            warn!(parent, "replaceChild: parent not found");
+            return false;
+        };
+        if let Some(pos) = parent_elem.children.iter().position(|&h| h == old_child) {
+            parent_elem.children[pos] = new_child;
+            debug!(parent, new_child, old_child, "replaceChild");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get the head element handle.
+    pub fn head(&self) -> Option<ElementHandle> {
+        self.find_by_tag("head", self.root)
+    }
+
+    // ── Dimension stubs (extended) ───────────────────────────────────────────
+
+    /// Get `el.offsetTop` (reads from `data-nova-top` or 0).
+    pub fn get_offset_top(&self, handle: ElementHandle) -> f64 {
+        self.get_attribute(handle, "data-nova-top")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Get `el.offsetLeft` (reads from `data-nova-left` or 0).
+    pub fn get_offset_left(&self, handle: ElementHandle) -> f64 {
+        self.get_attribute(handle, "data-nova-left")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Get `el.clientWidth` (reads from `data-nova-client-width` or `data-nova-width` or 0).
+    pub fn get_client_width(&self, handle: ElementHandle) -> f64 {
+        self.get_attribute(handle, "data-nova-client-width")
+            .or_else(|| self.get_attribute(handle, "data-nova-width"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Get `el.clientHeight`.
+    pub fn get_client_height(&self, handle: ElementHandle) -> f64 {
+        self.get_attribute(handle, "data-nova-client-height")
+            .or_else(|| self.get_attribute(handle, "data-nova-height"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Get `el.scrollWidth`.
+    pub fn get_scroll_width(&self, handle: ElementHandle) -> f64 {
+        self.get_attribute(handle, "data-nova-scroll-width")
+            .or_else(|| self.get_attribute(handle, "data-nova-width"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Get `el.scrollHeight`.
+    pub fn get_scroll_height(&self, handle: ElementHandle) -> f64 {
+        self.get_attribute(handle, "data-nova-scroll-height")
+            .or_else(|| self.get_attribute(handle, "data-nova-height"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Get `el.nodeType`.
+    pub fn node_type(&self, handle: ElementHandle) -> u32 {
+        let Some(elem) = self.nodes.get(&handle) else { return 0 };
+        match elem.tag.as_str() {
+            "#text" => 3,
+            "#comment" => 8,
+            "#document" => 9,
+            "#document-fragment" => 11,
+            _ => 1, // ELEMENT_NODE
+        }
+    }
+
+    /// Get `el.nodeName`.
+    pub fn node_name(&self, handle: ElementHandle) -> String {
+        let Some(elem) = self.nodes.get(&handle) else { return String::new() };
+        match elem.tag.as_str() {
+            "#text" => "#text".to_string(),
+            "#comment" => "#comment".to_string(),
+            "#document" => "#document".to_string(),
+            "#document-fragment" => "#document-fragment".to_string(),
+            tag => tag.to_uppercase(),
+        }
+    }
+}
+
+// ── Style parsing helpers ─────────────────────────────────────────────────────
+
+/// Convert a kebab-case CSS property name to camelCase.
+///
+/// E.g. `"font-size"` → `"fontSize"`, `"background-color"` → `"backgroundColor"`.
+fn kebab_to_camel(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut capitalize_next = false;
+    for c in s.chars() {
+        if c == '-' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            result.push(c.to_ascii_uppercase());
+            capitalize_next = false;
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Convert a camelCase CSS property name to kebab-case.
+///
+/// E.g. `"fontSize"` → `"font-size"`.
+fn camel_to_kebab(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        if c.is_ascii_uppercase() {
+            result.push('-');
+            result.push(c.to_ascii_lowercase());
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Parse a semicolon-separated style string into a map, inserting both
+/// kebab-case and camelCase variants for each property.
+fn parse_style_string(style_str: &str, out: &mut HashMap<String, String>) {
+    for pair in style_str.split(';') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = pair.split_once(':') {
+            let key = key.trim();
+            let value = value.trim();
+            insert_style_both_cases(out, key, value);
+        }
+    }
+}
+
+/// Insert a CSS property into the map under both kebab-case and camelCase keys.
+fn insert_style_both_cases(map: &mut HashMap<String, String>, key: &str, value: &str) {
+    let kebab = if key.contains('-') {
+        key.to_owned()
+    } else {
+        camel_to_kebab(key)
+    };
+    let camel = if key.contains('-') {
+        kebab_to_camel(key)
+    } else {
+        key.to_owned()
+    };
+    map.insert(kebab, value.to_owned());
+    map.insert(camel, value.to_owned());
 }
 
 // ── Attribute parser helper ───────────────────────────────────────────────────
@@ -1305,7 +2534,7 @@ fn eval_statement(
     line: &str,
     env: &mut HashMap<String, ElementHandle>,
     tree: Arc<Mutex<JsDomTree>>,
-    core: Option<&Arc<dyn CoreApi>>,
+    _core: Option<&Arc<dyn CoreApi>>,
 ) -> JsValue {
     let line = line.trim_end_matches(';').trim();
 
@@ -1316,9 +2545,15 @@ fn eval_statement(
         if let Some((var_name, expr)) = rest.split_once('=') {
             let var_name = var_name.trim().to_owned();
             let expr = expr.trim();
+            // Try DOM expression first (returns element handle).
             if let Some(handle) = eval_dom_expr(expr, env, Arc::clone(&tree)) {
                 env.insert(var_name, handle);
                 return JsValue::Number(handle as f64);
+            }
+            // Try property read (returns JsValue directly).
+            let val = eval_property_read(expr, env, Arc::clone(&tree));
+            if !matches!(val, JsValue::Undefined) {
+                return val;
             }
         }
     }
@@ -1350,6 +2585,36 @@ fn eval_statement(
                     if let Some(&handle) = env.get(var) {
                         let value = unquote(rhs);
                         tree.lock().unwrap().set_inner_html(handle, &value);
+                        return JsValue::String(value);
+                    }
+                }
+                "value" => {
+                    if let Some(&handle) = env.get(var) {
+                        let value = unquote(rhs);
+                        tree.lock().unwrap().set_value(handle, &value);
+                        return JsValue::String(value);
+                    }
+                }
+                "checked" => {
+                    if let Some(&handle) = env.get(var) {
+                        let rhs_trimmed = rhs.trim();
+                        let value = rhs_trimmed == "true" || rhs_trimmed == "1";
+                        tree.lock().unwrap().set_checked(handle, value);
+                        return JsValue::Boolean(value);
+                    }
+                }
+                "disabled" => {
+                    if let Some(&handle) = env.get(var) {
+                        let rhs_trimmed = rhs.trim();
+                        let value = rhs_trimmed == "true" || rhs_trimmed == "1";
+                        tree.lock().unwrap().set_disabled(handle, value);
+                        return JsValue::Boolean(value);
+                    }
+                }
+                "placeholder" => {
+                    if let Some(&handle) = env.get(var) {
+                        let value = unquote(rhs);
+                        tree.lock().unwrap().set_attribute(handle, "placeholder", &value);
                         return JsValue::String(value);
                     }
                 }
@@ -1442,6 +2707,108 @@ fn eval_statement(
         return JsValue::Undefined;
     }
 
+    // ── el.remove() ────────────────────────────────────────────────────────────
+
+    if let Some((obj, _rest)) = split_method_call(line, "remove") {
+        // Make sure it's `el.remove()` not `el.removeChild(…)` etc.
+        let rest_trimmed = _rest.trim();
+        if rest_trimmed == "remove()" || rest_trimmed == "remove( )" {
+            if let Some(&handle) = env.get(obj.trim()) {
+                tree.lock().unwrap().remove_element(handle);
+            }
+            return JsValue::Undefined;
+        }
+    }
+
+    // `el.replaceWith(newEl)`
+    if let Some((obj, rest)) = split_method_call(line, "replaceWith") {
+        if let Some(&handle) = env.get(obj.trim()) {
+            let arg = extract_parens_inner(&rest).trim();
+            if let Some(&new_handle) = env.get(arg) {
+                tree.lock().unwrap().replace_with(handle, new_handle);
+            }
+        }
+        return JsValue::Undefined;
+    }
+
+    // `el.after(newEl)`
+    if let Some((obj, rest)) = split_method_call(line, "after") {
+        if let Some(&handle) = env.get(obj.trim()) {
+            let arg = extract_parens_inner(&rest).trim();
+            if let Some(&new_handle) = env.get(arg) {
+                tree.lock().unwrap().insert_after(handle, new_handle);
+            }
+        }
+        return JsValue::Undefined;
+    }
+
+    // `el.before(newEl)`
+    if let Some((obj, rest)) = split_method_call(line, "before") {
+        if let Some(&handle) = env.get(obj.trim()) {
+            let arg = extract_parens_inner(&rest).trim();
+            if let Some(&new_handle) = env.get(arg) {
+                tree.lock().unwrap().insert_before_self(handle, new_handle);
+            }
+        }
+        return JsValue::Undefined;
+    }
+
+    // `el.append(child1, child2, …)`
+    if let Some((obj, rest)) = split_method_call(line, "append") {
+        // Avoid matching `appendChild`
+        let rest_trimmed = rest.trim();
+        if rest_trimmed.starts_with("append(") && !rest_trimmed.starts_with("appendChild(") {
+            if let Some(&parent_handle) = env.get(obj.trim()) {
+                let inner = extract_parens_inner(&rest);
+                let child_handles: Vec<ElementHandle> = inner
+                    .split(',')
+                    .filter_map(|arg| env.get(arg.trim()).copied())
+                    .collect();
+                tree.lock().unwrap().append_multiple(parent_handle, &child_handles);
+            }
+            return JsValue::Undefined;
+        }
+    }
+
+    // `el.prepend(child1, child2, …)`
+    if let Some((obj, rest)) = split_method_call(line, "prepend") {
+        if let Some(&parent_handle) = env.get(obj.trim()) {
+            let inner = extract_parens_inner(&rest);
+            let child_handles: Vec<ElementHandle> = inner
+                .split(',')
+                .filter_map(|arg| env.get(arg.trim()).copied())
+                .collect();
+            tree.lock().unwrap().prepend_multiple(parent_handle, &child_handles);
+        }
+        return JsValue::Undefined;
+    }
+
+    // ── No-op stubs: focus(), blur(), submit() ────────────────────────────────
+
+    if let Some((obj, _rest)) = split_method_call(line, "focus") {
+        if env.contains_key(obj.trim()) {
+            debug!(obj = obj.trim(), "focus() stub — no-op");
+        }
+        return JsValue::Undefined;
+    }
+
+    if let Some((obj, _rest)) = split_method_call(line, "blur") {
+        if env.contains_key(obj.trim()) {
+            debug!(obj = obj.trim(), "blur() stub — no-op");
+        }
+        return JsValue::Undefined;
+    }
+
+    if let Some((obj, _rest)) = split_method_call(line, "submit") {
+        if env.contains_key(obj.trim()) {
+            warn!(obj = obj.trim(), "form.submit() called — no-op stub");
+        }
+        return JsValue::Undefined;
+    }
+
+    // ── window.getComputedStyle(el) in var assignment ──────────────────────────
+    // Handled in eval_dom_expr for var declarations; property reads handled below.
+
     // Unrecognised — return undefined.
     JsValue::Undefined
 }
@@ -1476,12 +2843,91 @@ fn eval_dom_expr(
         return Some(handle);
     }
 
+    // `window.getComputedStyle(el)` — we store the result as a special handle
+    // that refers to the same element (computed style reads delegate to the element).
+    if expr.starts_with("window.getComputedStyle(") || expr.starts_with("getComputedStyle(") {
+        let fn_name = if expr.starts_with("window.") {
+            "window.getComputedStyle"
+        } else {
+            "getComputedStyle"
+        };
+        let arg = extract_call_args(expr, fn_name).trim();
+        if let Some(&handle) = env.get(arg) {
+            // Return the element handle — computed style property reads will
+            // resolve through `get_computed_style` on the tree.
+            return Some(handle);
+        }
+    }
+
     // Variable reference.
     if let Some(&handle) = env.get(expr) {
         return Some(handle);
     }
 
     None
+}
+
+/// Evaluate a property-read expression that returns a [`JsValue`] rather than
+/// an element handle.
+///
+/// Handles patterns like `el.value`, `el.checked`, `el.type`, `el.name`,
+/// `el.placeholder`, `el.disabled`, `el.offsetWidth`, `el.offsetHeight`,
+/// `el.offsetLeft`, `el.offsetTop`, `el.scrollWidth`, `el.scrollHeight`,
+/// `el.scrollLeft`, `el.scrollTop`, `el.clientWidth`, `el.clientHeight`.
+fn eval_property_read(
+    expr: &str,
+    env: &HashMap<String, ElementHandle>,
+    tree: Arc<Mutex<JsDomTree>>,
+) -> JsValue {
+    let expr = expr.trim();
+
+    // `obj.prop` pattern.
+    if let Some((obj, prop)) = expr.rsplit_once('.') {
+        let obj = obj.trim();
+        let prop = prop.trim();
+
+        if let Some(&handle) = env.get(obj) {
+            let t = tree.lock().unwrap();
+            match prop {
+                "value" => return JsValue::String(t.get_value(handle)),
+                "checked" => return JsValue::Boolean(t.get_checked(handle)),
+                "disabled" => return JsValue::Boolean(t.get_disabled(handle)),
+                "type" => {
+                    return JsValue::String(
+                        t.get_attribute(handle, "type").unwrap_or_default(),
+                    );
+                }
+                "name" => {
+                    return JsValue::String(
+                        t.get_attribute(handle, "name").unwrap_or_default(),
+                    );
+                }
+                "placeholder" => {
+                    return JsValue::String(
+                        t.get_attribute(handle, "placeholder").unwrap_or_default(),
+                    );
+                }
+                "offsetWidth" | "clientWidth" | "scrollWidth" => {
+                    return JsValue::Number(t.get_offset_width(handle));
+                }
+                "offsetHeight" | "clientHeight" | "scrollHeight" => {
+                    return JsValue::Number(t.get_offset_height(handle));
+                }
+                "offsetLeft" | "offsetTop" | "scrollLeft" | "scrollTop" => {
+                    return JsValue::Number(0.0);
+                }
+                "textContent" => {
+                    return JsValue::String(t.get_text_content(handle));
+                }
+                "innerHTML" => {
+                    return JsValue::String(t.get_inner_html(handle));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    JsValue::Undefined
 }
 
 // ── Parsing helpers ───────────────────────────────────────────────────────────

@@ -108,6 +108,7 @@ fn capability_for_request(req: &ContentRequest) -> nova_mod_api::CapabilityType 
         ContentRequest::ComputeStyles { .. } => CapabilityType::ComputeStyles,
         ContentRequest::Layout { .. } => CapabilityType::Layout,
         ContentRequest::Paint { .. } => CapabilityType::Paint,
+        ContentRequest::GetConsoleOutput { .. } => CapabilityType::ExecJavaScript,
         ContentRequest::Custom { capability, .. } => capability.clone(),
     }
 }

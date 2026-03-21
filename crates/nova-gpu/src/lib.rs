@@ -114,6 +114,26 @@ impl GpuCompositor {
         &self.vello_backend
     }
 
+    /// Get a mutable reference to the Vello backend.
+    pub fn vello_backend_mut(&mut self) -> &mut VelloBackend {
+        &mut self.vello_backend
+    }
+
+    /// Render a set of `RenderOp`s to an RGBA pixel buffer using the Vello GPU backend.
+    ///
+    /// This is the primary entry point for GPU-accelerated rendering. It delegates
+    /// to `VelloBackend::render_to_texture`, which will use the GPU if available
+    /// and fall back to software rendering otherwise.
+    pub fn render_to_pixels(
+        &mut self,
+        commands: &RenderCommands,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        self.vello_backend
+            .render_to_texture(&commands.ops, width, height)
+    }
+
     /// Render a frame from collected render commands.
     /// This is called by the pipeline after all mods have produced their commands.
     pub fn render_frame(&self, commands: &RenderCommands) -> Result<(), NovaError> {

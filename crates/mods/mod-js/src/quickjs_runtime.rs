@@ -22,6 +22,7 @@ use nova_mod_api::content::JsValue;
 
 use crate::dom_api::JsDomTree;
 use crate::dom_bridge::{self, ConsoleLog};
+use crate::xhr;
 
 /// Errors specific to the QuickJS runtime.
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +93,22 @@ impl QuickJsRuntime {
             // Install the JS DOM shim (creates document, Element, etc.)
             ctx.eval::<(), _>(dom_bridge::JS_DOM_SHIM)
                 .map_err(|e| QuickJsError::RuntimeCreation(format!("shim: {e}")))?;
+
+            // Install XMLHttpRequest class.
+            ctx.eval::<(), _>(xhr::JS_XHR_SHIM)
+                .map_err(|e| QuickJsError::RuntimeCreation(format!("xhr: {e}")))?;
+
+            // Install the WebSocket API shim.
+            ctx.eval::<(), _>(crate::websocket::JS_WEBSOCKET_SHIM)
+                .map_err(|e| QuickJsError::RuntimeCreation(format!("websocket shim: {e}")))?;
+
+            // Install Service Worker stubs.
+            ctx.eval::<(), _>(crate::service_worker::JS_SERVICE_WORKER_SHIM)
+                .map_err(|e| QuickJsError::RuntimeCreation(format!("service worker shim: {e}")))?;
+
+            // Install Web API stubs (IntersectionObserver, MutationObserver, etc.).
+            ctx.eval::<(), _>(crate::web_apis::JS_WEB_APIS_SHIM)
+                .map_err(|e| QuickJsError::RuntimeCreation(format!("web apis shim: {e}")))?;
 
             Ok(())
         })?;
@@ -472,5 +489,209 @@ mod tests {
         let handle = t.get_element_by_id("main").unwrap();
         let content = t.get_text_content(handle);
         assert!(content.contains("New text"), "expected 'New text' in '{content}'");
+    }
+
+    // ── Canvas 2D API tests ───────────────────────────────────────────────
+
+    fn make_canvas_dom() -> DomNode {
+        DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "html".into(),
+                attributes: vec![],
+                children: vec![DomNode::Element {
+                    tag: "body".into(),
+                    attributes: vec![],
+                    children: vec![DomNode::Element {
+                        tag: "canvas".into(),
+                        attributes: vec![
+                            ("id".into(), "c".into()),
+                            ("width".into(), "100".into()),
+                            ("height".into(), "100".into()),
+                        ],
+                        children: vec![],
+                    }],
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn canvas_get_context_2d() {
+        let tree = JsDomTree::from_dom(&make_canvas_dom());
+        let rt = QuickJsRuntime::new(tree.clone()).unwrap();
+        let result = rt.eval_with_dom(r#"
+            var c = document.getElementById("c");
+            var ctx = c.getContext("2d");
+            ctx !== null ? "ok" : "fail";
+        "#);
+        assert_eq!(result, JsValue::String("ok".into()));
+    }
+
+    #[test]
+    fn canvas_fill_rect_modifies_pixels() {
+        let tree = JsDomTree::from_dom(&make_canvas_dom());
+        let rt = QuickJsRuntime::new(tree.clone()).unwrap();
+        rt.eval_with_dom(r#"
+            var c = document.getElementById("c");
+            var ctx = c.getContext("2d");
+            ctx.fillStyle = "red";
+            ctx.fillRect(0, 0, 50, 50);
+        "#);
+
+        let t = tree.lock().unwrap();
+        let handle = t.get_element_by_id("c").unwrap();
+        let canvas_ctx = t.get_canvas_context_ref(handle).unwrap();
+        // First pixel should be red (255, 0, 0, 255).
+        assert_eq!(canvas_ctx.pixels[0], 255);
+        assert_eq!(canvas_ctx.pixels[1], 0);
+        assert_eq!(canvas_ctx.pixels[2], 0);
+        assert_eq!(canvas_ctx.pixels[3], 255);
+    }
+
+    #[test]
+    fn canvas_stroke_rect() {
+        let tree = JsDomTree::from_dom(&make_canvas_dom());
+        let rt = QuickJsRuntime::new(tree.clone()).unwrap();
+        rt.eval_with_dom(r#"
+            var c = document.getElementById("c");
+            var ctx = c.getContext("2d");
+            ctx.strokeStyle = "blue";
+            ctx.lineWidth = 2;
+            ctx.strokeRect(10, 10, 30, 30);
+        "#);
+
+        let t = tree.lock().unwrap();
+        let handle = t.get_element_by_id("c").unwrap();
+        let canvas_ctx = t.get_canvas_context_ref(handle).unwrap();
+        // Pixel at (15, 10) should be blue (on top edge).
+        let idx = (10 * 100 + 15) * 4;
+        assert_eq!(canvas_ctx.pixels[idx], 0);
+        assert_eq!(canvas_ctx.pixels[idx + 1], 0);
+        assert_eq!(canvas_ctx.pixels[idx + 2], 255);
+    }
+
+    #[test]
+    fn canvas_clear_rect() {
+        let tree = JsDomTree::from_dom(&make_canvas_dom());
+        let rt = QuickJsRuntime::new(tree.clone()).unwrap();
+        rt.eval_with_dom(r#"
+            var c = document.getElementById("c");
+            var ctx = c.getContext("2d");
+            ctx.fillStyle = "green";
+            ctx.fillRect(0, 0, 100, 100);
+            ctx.clearRect(10, 10, 20, 20);
+        "#);
+
+        let t = tree.lock().unwrap();
+        let handle = t.get_element_by_id("c").unwrap();
+        let canvas_ctx = t.get_canvas_context_ref(handle).unwrap();
+        // Cleared pixel at (15, 15) should be transparent.
+        let idx = (15 * 100 + 15) * 4;
+        assert_eq!(canvas_ctx.pixels[idx + 3], 0);
+        // Non-cleared pixel should still be green.
+        assert_eq!(canvas_ctx.pixels[0], 0);
+        assert_eq!(canvas_ctx.pixels[1], 128);
+        assert_eq!(canvas_ctx.pixels[2], 0);
+        assert_eq!(canvas_ctx.pixels[3], 255);
+    }
+
+    #[test]
+    fn canvas_path_and_fill() {
+        let tree = JsDomTree::from_dom(&make_canvas_dom());
+        let rt = QuickJsRuntime::new(tree.clone()).unwrap();
+        rt.eval_with_dom(r#"
+            var c = document.getElementById("c");
+            var ctx = c.getContext("2d");
+            ctx.fillStyle = "red";
+            ctx.beginPath();
+            ctx.rect(0, 0, 20, 20);
+            ctx.fill();
+        "#);
+
+        let t = tree.lock().unwrap();
+        let handle = t.get_element_by_id("c").unwrap();
+        let canvas_ctx = t.get_canvas_context_ref(handle).unwrap();
+        // Pixel at (10, 10) should be red.
+        let idx = (10 * 100 + 10) * 4;
+        assert_eq!(canvas_ctx.pixels[idx], 255);
+        assert_eq!(canvas_ctx.pixels[idx + 3], 255);
+    }
+
+    #[test]
+    fn canvas_save_restore() {
+        let tree = JsDomTree::from_dom(&make_canvas_dom());
+        let rt = QuickJsRuntime::new(tree.clone()).unwrap();
+        let result = rt.eval_with_dom(r#"
+            var c = document.getElementById("c");
+            var ctx = c.getContext("2d");
+            ctx.fillStyle = "red";
+            ctx.save();
+            ctx.fillStyle = "blue";
+            ctx.restore();
+            ctx.fillStyle;
+        "#);
+        // After restore, fillStyle should be back to red.
+        assert_eq!(result, JsValue::String("#ff0000".into()));
+    }
+
+    #[test]
+    fn canvas_measure_text() {
+        let tree = JsDomTree::from_dom(&make_canvas_dom());
+        let rt = QuickJsRuntime::new(tree.clone()).unwrap();
+        let result = rt.eval_with_dom(r#"
+            var c = document.getElementById("c");
+            var ctx = c.getContext("2d");
+            var m = ctx.measureText("hello");
+            m.width > 0 ? "ok" : "fail";
+        "#);
+        assert_eq!(result, JsValue::String("ok".into()));
+    }
+
+    #[test]
+    fn canvas_get_context_returns_null_for_non_canvas() {
+        let tree = JsDomTree::from_dom(&make_test_dom());
+        let rt = QuickJsRuntime::new(tree).unwrap();
+        let result = rt.eval_with_dom(r#"
+            var el = document.getElementById("main");
+            var ctx = el.getContext("2d");
+            ctx === null ? "null" : "not null";
+        "#);
+        assert_eq!(result, JsValue::String("null".into()));
+    }
+
+    #[test]
+    fn canvas_dimensions() {
+        let tree = JsDomTree::from_dom(&make_canvas_dom());
+        let rt = QuickJsRuntime::new(tree).unwrap();
+        let result = rt.eval_with_dom(r#"
+            var c = document.getElementById("c");
+            c.width + "x" + c.height;
+        "#);
+        assert_eq!(result, JsValue::String("100x100".into()));
+    }
+
+    #[test]
+    fn canvas_collect_pixels() {
+        let tree = JsDomTree::from_dom(&make_canvas_dom());
+        let rt = QuickJsRuntime::new(tree.clone()).unwrap();
+        rt.eval_with_dom(r#"
+            var c = document.getElementById("c");
+            var ctx = c.getContext("2d");
+            ctx.fillStyle = "red";
+            ctx.fillRect(0, 0, 10, 10);
+        "#);
+
+        let t = tree.lock().unwrap();
+        let canvases = t.collect_canvas_pixels();
+        assert_eq!(canvases.len(), 1);
+        let (id, w, h, pixels) = &canvases[0];
+        assert_eq!(id, "c");
+        assert_eq!(*w, 100);
+        assert_eq!(*h, 100);
+        assert_eq!(pixels.len(), 100 * 100 * 4);
+        // First pixel should be red.
+        assert_eq!(pixels[0], 255);
+        assert_eq!(pixels[1], 0);
+        assert_eq!(pixels[2], 0);
     }
 }

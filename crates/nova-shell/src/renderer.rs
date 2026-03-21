@@ -8,10 +8,53 @@
 //! If no font file is found, falls back to a built-in bitmap font.
 
 use std::collections::HashMap;
+use std::io::Cursor;
 
 use nova_mod_api::{Color, RenderCommands, RenderOp};
 
 use crate::text_shaping::TextShaper;
+
+// ---------------------------------------------------------------------------
+// WOFF/WOFF2 decompression helpers
+// ---------------------------------------------------------------------------
+
+/// Decompress a font blob if it is WOFF or WOFF2 encoded.
+///
+/// Returns `Some(decompressed_ttf_bytes)` on success (or if the input is
+/// already a plain TTF/OTF). Returns `None` if the data is clearly corrupt
+/// or decompression fails.
+fn decompress_font_data(raw: &[u8]) -> Option<Vec<u8>> {
+    if raw.len() < 4 {
+        return None;
+    }
+
+    let sig = &raw[..4];
+
+    // WOFF2 signature: "wOF2"
+    if sig == b"wOF2" {
+        match woff2_patched::convert_woff2_to_ttf(&mut Cursor::new(raw)) {
+            Ok(ttf) => return Some(ttf),
+            Err(e) => {
+                tracing::warn!("WOFF2 decompression failed: {e}");
+                return None;
+            }
+        }
+    }
+
+    // WOFF1 signature: "wOFF"
+    if sig == b"wOFF" {
+        match woff::version1::decompress(raw) {
+            Some(ttf) => return Some(ttf),
+            None => {
+                tracing::warn!("WOFF decompression failed");
+                return None;
+            }
+        }
+    }
+
+    // Already a plain TTF/OTF — return as-is.
+    Some(raw.to_vec())
+}
 
 // ---------------------------------------------------------------------------
 // Clip rectangle
@@ -95,6 +138,19 @@ impl FreeTypeRasterizer {
         let key = family.to_lowercase();
         if self.custom_bytes.contains_key(&key) {
             return;
+        }
+        // Decompress WOFF/WOFF2 if needed.
+        let bytes = match decompress_font_data(&bytes) {
+            Some(b) => b,
+            None => return,
+        };
+        // Evict oldest entry if cache is full (~20 fonts).
+        if self.custom_bytes.len() >= 20 {
+            if let Some(evict_key) = self.custom_bytes.keys().next().cloned() {
+                self.custom_bytes.remove(&evict_key);
+                // Also evict associated glyph cache entries.
+                self.cache.retain(|(k, _, _), _| k != &evict_key);
+            }
         }
         if self.library.new_memory_face(bytes.clone(), 0).is_ok() {
             self.custom_bytes.insert(key, bytes);
@@ -276,11 +332,15 @@ struct FontRenderer {
 }
 
 impl FontRenderer {
-    /// Resolve a font family name to a TTF file path using fontconfig.
+    /// Resolve a single font family name to a TTF file path using fontconfig.
     ///
     /// Handles `system-ui`, `sans-serif`, `serif`, `monospace` generic
     /// families, and arbitrary family names. Returns `None` if fontconfig
     /// is not available or no matching font is found.
+    ///
+    /// Common web font names (Arial, Helvetica, Times New Roman, etc.) are
+    /// mapped to available system fonts when fontconfig cannot find the
+    /// exact name.
     fn resolve_font_family(family: &str) -> Option<std::path::PathBuf> {
         use std::sync::Mutex;
         use std::collections::HashMap as StdHashMap;
@@ -289,8 +349,10 @@ impl FontRenderer {
         static CACHE: std::sync::LazyLock<Mutex<StdHashMap<String, Option<std::path::PathBuf>>>> =
             std::sync::LazyLock::new(|| Mutex::new(StdHashMap::new()));
 
+        let cleaned = family.trim().trim_matches('"').trim_matches('\'');
+
         // Map CSS generic families to fontconfig patterns.
-        let fc_family = match family.trim().trim_matches('"').trim_matches('\'') {
+        let fc_family = match cleaned {
             "system-ui" => "sans-serif",
             "sans-serif" => "sans-serif",
             "serif" => "serif",
@@ -307,15 +369,61 @@ impl FontRenderer {
             }
         }
 
+        // Try fontconfig first.
         let result = fontconfig::Fontconfig::new()
             .and_then(|fc| fc.find(fc_family, None))
             .map(|font| font.path);
 
-        if let Ok(mut cache) = CACHE.lock() {
-            cache.insert(key, result.clone());
+        // If fontconfig found something, cache and return.
+        if result.is_some() {
+            if let Ok(mut cache) = CACHE.lock() {
+                cache.insert(key, result.clone());
+            }
+            return result;
         }
 
-        result
+        // Fontconfig didn't find it -- try common web font name aliases.
+        let alias = match cleaned.to_lowercase().as_str() {
+            "arial" | "helvetica" | "helvetica neue" => Some("Liberation Sans"),
+            "times new roman" | "times" | "georgia" => Some("Liberation Serif"),
+            "courier new" | "courier" => Some("Liberation Mono"),
+            "verdana" | "tahoma" | "trebuchet ms" | "lucida grande" => Some("Liberation Sans"),
+            "palatino" | "palatino linotype" | "book antiqua" => Some("Liberation Serif"),
+            "impact" => Some("Liberation Sans"),
+            // Generic CSS families that fontconfig missed -- try known system fonts.
+            "cursive" | "fantasy" => Some("DejaVu Sans"),
+            _ => None,
+        };
+
+        let fallback_result = alias.and_then(|alias_name| {
+            fontconfig::Fontconfig::new()
+                .and_then(|fc| fc.find(alias_name, None))
+                .map(|font| font.path)
+        });
+
+        if let Ok(mut cache) = CACHE.lock() {
+            cache.insert(key, fallback_result.clone());
+        }
+
+        fallback_result
+    }
+
+    /// Resolve a CSS font-family stack (comma-separated list) to a system
+    /// font path.
+    ///
+    /// Tries each candidate in order, resolving through fontconfig and
+    /// web-font name aliases. Returns the first successful match.
+    fn resolve_font_stack(font_family_css: &str) -> Option<std::path::PathBuf> {
+        for candidate in font_family_css.split(',') {
+            let candidate = candidate.trim().trim_matches('"').trim_matches('\'');
+            if candidate.is_empty() {
+                continue;
+            }
+            if let Some(path) = Self::resolve_font_family(candidate) {
+                return Some(path);
+            }
+        }
+        None
     }
 
     /// Try to create a `FontRenderer` from the bundled DejaVu Sans fonts.
@@ -397,15 +505,37 @@ impl FontRenderer {
         })
     }
 
+    /// Maximum number of custom fonts to keep in the cache.
+    ///
+    /// Once this limit is reached, the oldest entries are evicted to make
+    /// room for new fonts. This prevents unbounded memory growth when
+    /// browsing pages that reference many different font families.
+    const MAX_CUSTOM_FONTS: usize = 20;
+
     /// Load a custom font from raw TTF/OTF bytes.
     ///
     /// The font is stored under the given `family` name (lowercased for
     /// case-insensitive lookup). If parsing fails, the font is silently
-    /// skipped with a warning.
+    /// skipped with a warning. The cache is limited to
+    /// [`Self::MAX_CUSTOM_FONTS`] entries.
     fn load_custom_font(&mut self, family: &str, data: Vec<u8>) {
         let key = family.to_lowercase();
         if self.custom_fonts.contains_key(&key) {
             return; // already loaded
+        }
+        // Decompress WOFF/WOFF2 if needed.
+        let data = match decompress_font_data(&data) {
+            Some(b) => b,
+            None => return,
+        };
+        // Evict oldest entries if we've hit the cache limit.
+        if self.custom_fonts.len() >= Self::MAX_CUSTOM_FONTS {
+            // Remove the first key (arbitrary but deterministic for HashMap).
+            if let Some(evict_key) = self.custom_fonts.keys().next().cloned() {
+                tracing::debug!(family = %evict_key, "evicting cached font (limit reached)");
+                self.custom_fonts.remove(&evict_key);
+                self.custom_cache.retain(|(k, _, _), _| k != &evict_key);
+            }
         }
         // Also load into the text shaper if available.
         if let Some(ref mut shaper) = self.text_shaper {
@@ -531,6 +661,64 @@ impl FontRenderer {
 // Framebuffer
 // ---------------------------------------------------------------------------
 
+/// A 2D affine transform matrix stored as `[a, b, c, d, e, f]`.
+///
+/// Represents the matrix:
+/// ```text
+/// | a c e |
+/// | b d f |
+/// | 0 0 1 |
+/// ```
+#[derive(Debug, Clone, Copy)]
+struct AffineTransform {
+    m: [f32; 6],
+}
+
+impl AffineTransform {
+    /// Identity transform.
+    fn identity() -> Self {
+        Self { m: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0] }
+    }
+
+    /// Multiply (compose) self * other.
+    fn multiply(&self, other: &AffineTransform) -> AffineTransform {
+        let a = &self.m;
+        let b = &other.m;
+        AffineTransform {
+            m: [
+                a[0] * b[0] + a[2] * b[1],
+                a[1] * b[0] + a[3] * b[1],
+                a[0] * b[2] + a[2] * b[3],
+                a[1] * b[2] + a[3] * b[3],
+                a[0] * b[4] + a[2] * b[5] + a[4],
+                a[1] * b[4] + a[3] * b[5] + a[5],
+            ],
+        }
+    }
+
+    /// Transform a point (x, y).
+    fn transform_point(&self, x: f32, y: f32) -> (f32, f32) {
+        let m = &self.m;
+        (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
+    }
+
+    /// Whether this is the identity transform.
+    fn is_identity(&self) -> bool {
+        let m = &self.m;
+        (m[0] - 1.0).abs() < 1e-6
+            && m[1].abs() < 1e-6
+            && m[2].abs() < 1e-6
+            && (m[3] - 1.0).abs() < 1e-6
+            && m[4].abs() < 1e-6
+            && m[5].abs() < 1e-6
+    }
+
+    /// Create from a raw matrix array `[a, b, c, d, e, f]`.
+    fn from_array(m: [f32; 6]) -> Self {
+        Self { m }
+    }
+}
+
 /// A simple software framebuffer.
 pub struct Framebuffer {
     pub width: u32,
@@ -546,6 +734,13 @@ pub struct Framebuffer {
     translate_y_offset: f32,
     /// Stack of opacity values for nested PushOpacity/PopOpacity.
     opacity_stack: Vec<f32>,
+    /// Stack of 2D affine transforms for Save/Transform/Restore.
+    transform_stack: Vec<AffineTransform>,
+    /// Current accumulated transform (product of all transforms in the stack).
+    current_transform: AffineTransform,
+    /// Nesting depth of fixed-position elements. When > 0, scroll offsets are
+    /// ignored so fixed elements stay anchored to the viewport.
+    fixed_depth: u32,
 }
 
 impl Framebuffer {
@@ -561,6 +756,9 @@ impl Framebuffer {
             clip_stack: Vec::new(),
             translate_y_offset: 0.0,
             opacity_stack: Vec::new(),
+            transform_stack: Vec::new(),
+            current_transform: AffineTransform::identity(),
+            fixed_depth: 0,
         }
     }
 
@@ -678,6 +876,15 @@ impl Framebuffer {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return;
         }
+
+        // Enforce the clip stack — skip pixels outside the effective clip region.
+        if !self.clip_stack.is_empty() {
+            let (cx0, cy0, cx1, cy1) = self.effective_clip();
+            if x < cx0 || x >= cx1 || y < cy0 || y >= cy1 {
+                return;
+            }
+        }
+
         let idx = ((y as u32 * self.width + x as u32) * 4) as usize;
         if idx + 3 >= self.pixels.len() {
             return;
@@ -875,18 +1082,25 @@ impl Framebuffer {
                 if has_it {
                     return Some(key);
                 }
-                // Try fontconfig to load this system font on demand (first time only).
-                if let Some(path) = FontRenderer::resolve_font_family(candidate) {
-                    if let Ok(bytes) = std::fs::read(&path) {
-                        if let Some(ref mut renderer) = self.font_renderer {
-                            renderer.load_custom_font(candidate, bytes.clone());
-                            // Also load into FreeType rasterizer.
-                            if let Some(ref mut ft) = renderer.ft_rasterizer {
-                                ft.load_custom_font(candidate, bytes);
-                            }
-                            if renderer.custom_fonts.contains_key(&key) {
-                                return Some(key);
-                            }
+            }
+            // None of the candidates were already loaded -- resolve the
+            // font stack via fontconfig (with web-font name aliases) and
+            // load the first match on demand.
+            if let Some(path) = FontRenderer::resolve_font_stack(family_str) {
+                // Determine which candidate name this path corresponds to.
+                // Use the file stem as the family key for cache purposes.
+                let family_name = path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("resolved-font");
+                let key = family_name.to_lowercase();
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if let Some(ref mut renderer) = self.font_renderer {
+                        renderer.load_custom_font(family_name, bytes.clone());
+                        if let Some(ref mut ft) = renderer.ft_rasterizer {
+                            ft.load_custom_font(family_name, bytes);
+                        }
+                        if renderer.custom_fonts.contains_key(&key) {
+                            return Some(key);
                         }
                     }
                 }
@@ -1161,6 +1375,9 @@ impl Framebuffer {
         self.clip_stack.clear();
         self.opacity_stack.clear();
         self.translate_y_offset = 0.0;
+        self.transform_stack.clear();
+        self.current_transform = AffineTransform::identity();
+        self.fixed_depth = 0;
 
         // Load any custom @font-face fonts that haven't been loaded yet.
         if !commands.fonts.is_empty() {
@@ -1171,35 +1388,56 @@ impl Framebuffer {
 
         for op in &commands.ops {
             let sy_extra = self.translate_y_offset;
+            // When inside a fixed-position element, ignore scroll offsets
+            // so the element stays anchored to the viewport.
+            let effective_scroll_x = if self.fixed_depth > 0 { 0.0 } else { sx };
+            let effective_scroll_y = if self.fixed_depth > 0 { 0.0 } else { scroll_y };
+
+            // Helper: apply scroll/offset then current transform to a point.
+            let apply_pos = |ct: &AffineTransform, x: f32, y: f32| -> (f32, f32) {
+                let base_x = x - effective_scroll_x;
+                let base_y = y + y_offset - effective_scroll_y + sy_extra;
+                if ct.is_identity() {
+                    (base_x, base_y)
+                } else {
+                    ct.transform_point(base_x, base_y)
+                }
+            };
+
             match op {
                 RenderOp::FillRect { x, y, width, height, color } => {
                     let c = self.apply_opacity(*color);
-                    self.fill_rect(*x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, c);
+                    let (tx, ty) = apply_pos(&self.current_transform, *x, *y);
+                    self.fill_rect(tx, ty, *width, *height, c);
                 }
                 RenderOp::DrawText { x, y, text, font_size, color, font_weight, font_style, font_family } => {
                     let c = self.apply_opacity(*color);
+                    let (tx, ty) = apply_pos(&self.current_transform, *x, *y);
                     self.draw_text(
-                        *x - sx, *y + y_offset - scroll_y + sy_extra, text, *font_size, c,
+                        tx, ty, text, *font_size, c,
                         *font_weight, font_style.as_deref(), font_family.as_deref(),
                     );
                 }
                 RenderOp::StrokeRect { x, y, width, height, color, width_px } => {
                     let c = self.apply_opacity(*color);
-                    self.stroke_rect(*x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, c, *width_px);
+                    let (tx, ty) = apply_pos(&self.current_transform, *x, *y);
+                    self.stroke_rect(tx, ty, *width, *height, c, *width_px);
                 }
                 RenderOp::DrawImage {
                     x, y, width, height,
                     img_width, img_height, pixels,
                 } => {
+                    let (tx, ty) = apply_pos(&self.current_transform, *x, *y);
                     self.draw_image(
-                        *x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height,
+                        tx, ty, *width, *height,
                         *img_width, *img_height, pixels,
                     );
                 }
                 RenderOp::PushClip { x, y, width, height } => {
+                    let (tx, ty) = apply_pos(&self.current_transform, *x, *y);
                     self.clip_stack.push(ClipRect {
-                        x: (*x - sx).round() as i32,
-                        y: (*y + y_offset - scroll_y + sy_extra).round() as i32,
+                        x: tx.round() as i32,
+                        y: ty.round() as i32,
                         width: width.round() as i32,
                         height: height.round() as i32,
                     });
@@ -1209,17 +1447,19 @@ impl Framebuffer {
                 }
                 RenderOp::FillRoundedRect { x, y, width, height, color, radius } => {
                     let c = self.apply_opacity(*color);
+                    let (tx, ty) = apply_pos(&self.current_transform, *x, *y);
                     self.fill_rounded_rect(
-                        *x - sx, *y + y_offset - scroll_y + sy_extra, *width, *height, c, *radius,
+                        tx, ty, *width, *height, c, *radius,
                     );
                 }
                 RenderOp::BoxShadow {
                     x, y, width, height, color, offset_x, offset_y, blur: _,
                 } => {
                     let c = self.apply_opacity(*color);
+                    let (tx, ty) = apply_pos(&self.current_transform, *x + *offset_x, *y + *offset_y);
                     self.fill_rect(
-                        *x + *offset_x - sx,
-                        *y + *offset_y + y_offset - scroll_y + sy_extra,
+                        tx,
+                        ty,
                         *width,
                         *height,
                         c,
@@ -1244,6 +1484,30 @@ impl Framebuffer {
                 }
                 RenderOp::StickyEnd => {
                     self.translate_y_offset = 0.0;
+                }
+                // Save/Restore/Transform — manage the transform stack.
+                RenderOp::Save => {
+                    self.transform_stack.push(self.current_transform);
+                }
+                RenderOp::Restore => {
+                    if let Some(prev) = self.transform_stack.pop() {
+                        self.current_transform = prev;
+                    }
+                }
+                RenderOp::Transform { matrix } => {
+                    let t = AffineTransform::from_array(*matrix);
+                    self.current_transform = self.current_transform.multiply(&t);
+                }
+                RenderOp::Translate { x: tx, y: ty } => {
+                    let t = AffineTransform::from_array([1.0, 0.0, 0.0, 1.0, *tx, *ty]);
+                    self.current_transform = self.current_transform.multiply(&t);
+                }
+                // Fixed positioning: ignore scroll offsets for enclosed ops.
+                RenderOp::FixedStart => {
+                    self.fixed_depth += 1;
+                }
+                RenderOp::FixedEnd => {
+                    self.fixed_depth = self.fixed_depth.saturating_sub(1);
                 }
                 // Link ops are metadata-only; they don't draw anything.
                 RenderOp::Link { .. } => {}

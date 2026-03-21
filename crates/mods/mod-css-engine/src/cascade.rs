@@ -5,7 +5,7 @@
 //! inline styles, then writes the computed styles into `data-nova-style`
 //! attributes on each element.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use nova_mod_api::content::DomNode;
 
@@ -59,33 +59,41 @@ impl RuleIndex {
     }
 
     fn candidates_for(&self, tag: &str, attributes: &[(String, String)]) -> Vec<usize> {
-        let mut seen = Vec::new();
+        let mut seen = HashSet::new();
         let mut result = Vec::new();
-        let push = |idx: usize, seen: &mut Vec<usize>, result: &mut Vec<usize>| {
-            if !seen.contains(&idx) {
-                seen.push(idx);
-                result.push(idx);
-            }
-        };
 
         if let Some(id) = attributes.iter().find(|(k, _)| k == "id").map(|(_, v)| v) {
             if let Some(indices) = self.by_id.get(id) {
-                for &idx in indices { push(idx, &mut seen, &mut result); }
+                for &idx in indices {
+                    if seen.insert(idx) {
+                        result.push(idx);
+                    }
+                }
             }
         }
         if let Some(class_attr) = attributes.iter().find(|(k, _)| k == "class").map(|(_, v)| v) {
             for cls in class_attr.split_whitespace() {
                 if let Some(indices) = self.by_class.get(cls) {
-                    for &idx in indices { push(idx, &mut seen, &mut result); }
+                    for &idx in indices {
+                        if seen.insert(idx) {
+                            result.push(idx);
+                        }
+                    }
                 }
             }
         }
         let tag_lower = tag.to_ascii_lowercase();
         if let Some(indices) = self.by_tag.get(&tag_lower) {
-            for &idx in indices { push(idx, &mut seen, &mut result); }
+            for &idx in indices {
+                if seen.insert(idx) {
+                    result.push(idx);
+                }
+            }
         }
         for &idx in &self.universal {
-            push(idx, &mut seen, &mut result);
+            if seen.insert(idx) {
+                result.push(idx);
+            }
         }
         result
     }
@@ -170,6 +178,24 @@ pub fn compute_styles(dom: DomNode, extra_css: &[String], viewport_width: f32) -
     }
     for css in extra_css {
         rules.extend(parser::parse_stylesheet(css, viewport_width));
+    }
+
+    // 2b. For very large stylesheets, skip rules with overly complex
+    // selectors (4+ compound parts). Most visual impact comes from simple
+    // selectors, and this reduces matching cost significantly.
+    let original_count = rules.len();
+    if rules.len() > 2000 {
+        rules.retain(|rule| {
+            rule.selector.selectors.iter().all(|sel| sel.parts.len() <= 4)
+        });
+        if rules.len() < original_count {
+            tracing::info!(
+                original = original_count,
+                retained = rules.len(),
+                dropped = original_count - rules.len(),
+                "dropped complex CSS selectors for performance"
+            );
+        }
     }
 
     tracing::info!(
@@ -361,30 +387,57 @@ fn apply_styles_recursive(
             let this_ref: &DomNode = &this_node;
             new_ancestors.push(this_ref);
 
-            let mut new_children = apply_styles_to_children(children, rules, index, &new_ancestors);
+            // ── Shadow DOM style encapsulation ───────────────────────
+            // If this element is a shadow host (has `data-nova-shadow-host`),
+            // its children live in a shadow tree. We parse the shadow-scoped
+            // stylesheets and use only those rules (plus `:host` rules) for
+            // the children, rather than the document-level rules.
+            let is_shadow_host = new_attributes.iter().any(|(k, _)| k == "data-nova-shadow-host");
+            let shadow_css = new_attributes.iter()
+                .find(|(k, _)| k == "data-nova-shadow-styles")
+                .map(|(_, v)| v.clone());
 
-            // Inject ::before and ::after pseudo-element text nodes when a CSS
+            let mut new_children = if is_shadow_host {
+                if let Some(css) = &shadow_css {
+                    // Parse shadow-scoped stylesheets.
+                    let shadow_rules = parser::parse_stylesheet(css, 1280.0);
+                    let shadow_index = RuleIndex::build(&shadow_rules);
+                    apply_styles_to_children(children, &shadow_rules, &shadow_index, &new_ancestors)
+                } else {
+                    // Shadow host with no scoped styles: children get only
+                    // inherited properties, no document rules.
+                    let empty_rules: Vec<CssRule> = Vec::new();
+                    let empty_index = RuleIndex::build(&empty_rules);
+                    apply_styles_to_children(children, &empty_rules, &empty_index, &new_ancestors)
+                }
+            } else {
+                apply_styles_to_children(children, rules, index, &new_ancestors)
+            };
+
+            // Inject ::before and ::after pseudo-element synthetic nodes when a CSS
             // rule targets this element with `::before` or `::after` and
-            // declares a `content` property with a quoted string.
-            if let Some(before_text) = pseudo_element_content(
+            // declares a `content` property.
+            if let Some(before_node) = build_pseudo_element_node(
                 &tag,
                 &new_attributes,
                 &this_node,
                 rules,
+                index,
                 ancestors,
                 PseudoElement::Before,
             ) {
-                new_children.insert(0, DomNode::Text(before_text));
+                new_children.insert(0, before_node);
             }
-            if let Some(after_text) = pseudo_element_content(
+            if let Some(after_node) = build_pseudo_element_node(
                 &tag,
                 &new_attributes,
                 &this_node,
                 rules,
+                index,
                 ancestors,
                 PseudoElement::After,
             ) {
-                new_children.push(DomNode::Text(after_text));
+                new_children.push(after_node);
             }
 
             DomNode::Element {
@@ -467,17 +520,35 @@ fn apply_styles_recursive_with_siblings(
             let this_ref: &DomNode = &this_node;
             new_ancestors.push(this_ref);
 
-            let mut new_children = apply_styles_to_children(children, rules, index, &new_ancestors);
+            // ── Shadow DOM style encapsulation ───────────────────────
+            let is_shadow_host = new_attributes.iter().any(|(k, _)| k == "data-nova-shadow-host");
+            let shadow_css = new_attributes.iter()
+                .find(|(k, _)| k == "data-nova-shadow-styles")
+                .map(|(_, v)| v.clone());
 
-            if let Some(before_text) = pseudo_element_content(
-                &tag, &new_attributes, &this_node, rules, ancestors, PseudoElement::Before,
+            let mut new_children = if is_shadow_host {
+                if let Some(css) = &shadow_css {
+                    let shadow_rules = parser::parse_stylesheet(css, 1280.0);
+                    let shadow_index = RuleIndex::build(&shadow_rules);
+                    apply_styles_to_children(children, &shadow_rules, &shadow_index, &new_ancestors)
+                } else {
+                    let empty_rules: Vec<CssRule> = Vec::new();
+                    let empty_index = RuleIndex::build(&empty_rules);
+                    apply_styles_to_children(children, &empty_rules, &empty_index, &new_ancestors)
+                }
+            } else {
+                apply_styles_to_children(children, rules, index, &new_ancestors)
+            };
+
+            if let Some(before_node) = build_pseudo_element_node(
+                &tag, &new_attributes, &this_node, rules, index, ancestors, PseudoElement::Before,
             ) {
-                new_children.insert(0, DomNode::Text(before_text));
+                new_children.insert(0, before_node);
             }
-            if let Some(after_text) = pseudo_element_content(
-                &tag, &new_attributes, &this_node, rules, ancestors, PseudoElement::After,
+            if let Some(after_node) = build_pseudo_element_node(
+                &tag, &new_attributes, &this_node, rules, index, ancestors, PseudoElement::After,
             ) {
-                new_children.push(DomNode::Text(after_text));
+                new_children.push(after_node);
             }
 
             DomNode::Element {
@@ -556,7 +627,7 @@ fn compute_element_style_impl(
 
     // Track which inherited properties we've already found (from a closer
     // ancestor) so we only take the nearest value for each property.
-    let mut inherited_props: Vec<String> = Vec::new();
+    let mut inherited_props: HashSet<String> = HashSet::new();
     for ancestor in ancestors.iter().rev() {
         if let DomNode::Element { attributes, .. } = ancestor {
             if let Some(style_str) = attributes.iter().find(|(k, _)| k == "data-nova-style") {
@@ -566,9 +637,8 @@ fn compute_element_style_impl(
                         let prop = parts[0].trim();
                         let val = parts[1].trim();
                         if INHERITED_PROPERTIES.contains(&prop)
-                            && !inherited_props.contains(&prop.to_string())
+                            && inherited_props.insert(prop.to_string())
                         {
-                            inherited_props.push(prop.to_string());
                             declarations.push(CascadedDeclaration {
                                 property: prop.to_string(),
                                 value: val.to_string(),
@@ -626,6 +696,39 @@ fn compute_element_style_impl(
         }
     }
 
+    // 2b. Shadow DOM `:host` rules — if this element is a shadow host,
+    //     parse the shadow-scoped stylesheets and apply any `:host` rules
+    //     to the host element itself.
+    if let Some(shadow_css) = attributes.iter().find(|(k, _)| k == "data-nova-shadow-styles") {
+        let shadow_rules = parser::parse_stylesheet(&shadow_css.1, 1280.0);
+        // Create a temporary node with shadow-host attribute for :host matching.
+        let host_node = DomNode::Element {
+            tag: tag.to_string(),
+            attributes: {
+                let mut attrs = attributes.to_vec();
+                if !attrs.iter().any(|(k, _)| k == "data-nova-shadow-host") {
+                    attrs.push(("data-nova-shadow-host".into(), "true".into()));
+                }
+                attrs
+            },
+            children: vec![],
+        };
+        for rule in &shadow_rules {
+            if rule.selector.matches(&host_node, ancestors, siblings) {
+                let spec = rule.selector.specificity();
+                for decl in &rule.declarations {
+                    declarations.push(CascadedDeclaration {
+                        property: decl.property.clone(),
+                        value: decl.value.clone(),
+                        specificity: spec,
+                        origin: CascadeOrigin::AuthorStylesheet,
+                        important: decl.important,
+                    });
+                }
+            }
+        }
+    }
+
     // 3. Inline styles (highest priority).
     if let Some(style_attr) = attributes.iter().find(|(k, _)| k == "style") {
         let inline_decls = parser::parse_inline_style(&style_attr.1);
@@ -659,11 +762,14 @@ fn compute_element_style_impl(
     });
 
     // 6. Deduplicate: for each property, the last declaration wins.
+    // Use a HashMap for O(1) lookups and preserve insertion order via Vec.
+    let mut prop_index: HashMap<String, usize> = HashMap::new();
     let mut final_props: Vec<(String, String)> = Vec::new();
     for decl in expanded {
-        if let Some(existing) = final_props.iter_mut().find(|(p, _)| *p == decl.property) {
-            existing.1 = decl.value;
+        if let Some(&idx) = prop_index.get(&decl.property) {
+            final_props[idx].1 = decl.value;
         } else {
+            prop_index.insert(decl.property.clone(), final_props.len());
             final_props.push((decl.property, decl.value));
         }
     }
@@ -1250,42 +1356,188 @@ fn resolve_var_once(value: &str, custom_props: &std::collections::HashMap<String
     result
 }
 
-/// Check if any CSS rule targets `node` with `pe` (::before or ::after) and
-/// declares a quoted `content` string.  Returns the unquoted content text if
-/// found, or `None` otherwise.
-fn pseudo_element_content(
-    _tag: &str,
-    _attributes: &[(String, String)],
+/// Information about a matched pseudo-element rule: the resolved content text
+/// and the full set of CSS declarations to apply as inline styles.
+struct PseudoElementMatch {
+    /// The resolved text content (may be empty for layout-only pseudo-elements).
+    content: String,
+    /// All declarations from the matching rule (serialized as inline CSS).
+    style: String,
+}
+
+/// Check if any CSS rule targets `node` with `pe` (::before or ::after).
+///
+/// Returns a `PseudoElementMatch` with the resolved content and the pseudo-element's
+/// CSS declarations, or `None` if no matching rule declares a valid `content`.
+///
+/// Uses the rule index to only check candidate rules for the element,
+/// dramatically reducing the number of rules checked on large stylesheets.
+fn find_pseudo_element_match(
+    tag: &str,
+    attributes: &[(String, String)],
     node: &DomNode,
     rules: &[CssRule],
+    index: &RuleIndex,
     ancestors: &[&DomNode],
     pe: PseudoElement,
-) -> Option<String> {
-    for rule in rules {
+) -> Option<PseudoElementMatch> {
+    let candidates = index.candidates_for(tag, attributes);
+
+    for &rule_idx in &candidates {
+        let rule = &rules[rule_idx];
         if rule.selector.matches_with_pseudo_element(node, ancestors, pe) {
-            // Look for `content` property with a quoted string value.
+            // Look for `content` property.
+            let mut content_val: Option<String> = None;
             for decl in &rule.declarations {
                 if decl.property == "content" {
                     let val = decl.value.trim();
+                    // `none` and `normal` mean "no pseudo-element".
+                    if val == "none" || val == "normal" {
+                        return None;
+                    }
                     // Accept both double- and single-quoted strings.
                     let unquoted = if (val.starts_with('"') && val.ends_with('"'))
                         || (val.starts_with('\'') && val.ends_with('\''))
                     {
-                        val[1..val.len() - 1].to_string()
-                    } else if val == "none" || val == "normal" || val.is_empty() {
+                        let raw = &val[1..val.len() - 1];
+                        resolve_css_content_escapes(raw)
+                    } else if val.is_empty() {
                         continue;
+                    } else if val.starts_with("attr(") && val.ends_with(')') {
+                        // `content: attr(name)` — resolve from the element's attributes.
+                        let attr_name = val[5..val.len() - 1].trim();
+                        attributes
+                            .iter()
+                            .find(|(k, _)| k == attr_name)
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_default()
                     } else {
-                        // Unquoted keyword — treat as raw text.
+                        // Unquoted keyword (e.g. open-quote, close-quote) — treat as raw text.
                         val.to_string()
                     };
-                    if !unquoted.is_empty() {
-                        return Some(unquoted);
-                    }
+                    content_val = Some(unquoted);
                 }
+            }
+
+            // If we found a content declaration (even empty string), build the match.
+            if let Some(content) = content_val {
+                // Serialize all declarations (except `content`) as inline CSS.
+                let style = rule
+                    .declarations
+                    .iter()
+                    .filter(|d| d.property != "content")
+                    .map(|d| format!("{}: {}", d.property, d.value))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Some(PseudoElementMatch { content, style });
             }
         }
     }
     None
+}
+
+/// Resolve CSS escape sequences in a `content` string value.
+///
+/// Handles `\HHHH` hex escapes (1-6 hex digits) for Unicode code points,
+/// commonly used for icon fonts (e.g. `\f00c` for FontAwesome checkmark).
+/// Also handles `\\` for a literal backslash and `\"` for a literal quote.
+fn resolve_css_content_escapes(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            // Peek at the next character to determine the escape type.
+            match chars.peek() {
+                Some(&'\\') => {
+                    result.push('\\');
+                    chars.next();
+                }
+                Some(&'"') => {
+                    result.push('"');
+                    chars.next();
+                }
+                Some(&'\'') => {
+                    result.push('\'');
+                    chars.next();
+                }
+                Some(&'n') => {
+                    result.push('\n');
+                    chars.next();
+                }
+                Some(c) if c.is_ascii_hexdigit() => {
+                    // Read up to 6 hex digits.
+                    let mut hex = String::new();
+                    while hex.len() < 6 {
+                        if let Some(&c) = chars.peek() {
+                            if c.is_ascii_hexdigit() {
+                                hex.push(c);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    // Optional single trailing space is consumed per CSS spec.
+                    if let Some(&' ') = chars.peek() {
+                        chars.next();
+                    }
+                    if let Ok(code_point) = u32::from_str_radix(&hex, 16) {
+                        if let Some(c) = char::from_u32(code_point) {
+                            result.push(c);
+                        }
+                    }
+                }
+                _ => {
+                    // Unknown escape — pass through the backslash.
+                    result.push('\\');
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
+/// Build a synthetic `DomNode::Element` for a `::before` or `::after` pseudo-element.
+///
+/// Returns `None` if no matching rule or the content is `none`/`normal`.
+fn build_pseudo_element_node(
+    tag: &str,
+    attributes: &[(String, String)],
+    node: &DomNode,
+    rules: &[CssRule],
+    index: &RuleIndex,
+    ancestors: &[&DomNode],
+    pe: PseudoElement,
+) -> Option<DomNode> {
+    let m = find_pseudo_element_match(tag, attributes, node, rules, index, ancestors, pe)?;
+
+    let pseudo_tag = match pe {
+        PseudoElement::Before => "nova-before",
+        PseudoElement::After => "nova-after",
+    };
+
+    let mut attrs = Vec::new();
+    if !m.style.is_empty() {
+        attrs.push(("data-nova-style".to_string(), m.style));
+    }
+
+    let children = if m.content.is_empty() {
+        vec![]
+    } else {
+        vec![DomNode::Text(m.content)]
+    };
+
+    Some(DomNode::Element {
+        tag: pseudo_tag.to_string(),
+        attributes: attrs,
+        children,
+    })
 }
 
 /// Convert HTML presentational attributes to CSS property-value pairs.
@@ -1363,6 +1615,9 @@ fn apply_presentational_attributes(
             "cellspacing" if tag == "table" => {
                 let num = val.trim_end_matches("px");
                 result.push(("border-spacing".into(), format!("{num}px")));
+            }
+            "nowrap" if matches!(tag, "td" | "th") => {
+                result.push(("white-space".into(), "nowrap".into()));
             }
             _ => {}
         }
@@ -2003,7 +2258,7 @@ mod pseudo_element_injection_tests {
     }
 
     #[test]
-    fn before_pseudo_injects_text_child() {
+    fn before_pseudo_injects_element_child() {
         let dom = DomNode::Document {
             children: vec![DomNode::Element {
                 tag: "body".into(),
@@ -2013,7 +2268,7 @@ mod pseudo_element_injection_tests {
                         tag: "style".into(),
                         attributes: vec![],
                         children: vec![DomNode::Text(
-                            r#"p::before { content: ">>"; }"#.into(),
+                            r#"p::before { content: ">>"; color: red; }"#.into(),
                         )],
                     },
                     DomNode::Element {
@@ -2028,24 +2283,31 @@ mod pseudo_element_injection_tests {
         let result = compute_styles(dom, &[], 800.0);
         let p = find_element(&result, "p").expect("should find p");
         if let DomNode::Element { children, .. } = p {
-            // First child should be the injected ::before text.
             assert!(
                 !children.is_empty(),
                 "p should have children after ::before injection"
             );
-            // The first child should be the injected text ">>"
-            assert!(
-                matches!(&children[0], DomNode::Text(t) if t == ">>"),
-                "first child should be '>>'. Got: {:?}",
-                &children[0]
-            );
+            // The first child should be a <nova-before> element.
+            match &children[0] {
+                DomNode::Element { tag, attributes, children: inner } => {
+                    assert_eq!(tag, "nova-before", "first child should be nova-before");
+                    // Should have data-nova-style with the pseudo-element's styles.
+                    let style = attributes.iter().find(|(k, _)| k == "data-nova-style");
+                    assert!(style.is_some(), "nova-before should have data-nova-style");
+                    assert!(style.unwrap().1.contains("color: red"), "should contain color: red");
+                    // Should have a text child with ">>"
+                    assert_eq!(inner.len(), 1);
+                    assert!(matches!(&inner[0], DomNode::Text(t) if t == ">>"));
+                }
+                other => panic!("expected nova-before Element, got: {:?}", other),
+            }
         } else {
             panic!("expected Element for p");
         }
     }
 
     #[test]
-    fn after_pseudo_injects_text_child() {
+    fn after_pseudo_injects_element_child() {
         let dom = DomNode::Document {
             children: vec![DomNode::Element {
                 tag: "body".into(),
@@ -2071,11 +2333,14 @@ mod pseudo_element_injection_tests {
         let span = find_element(&result, "span").expect("should find span");
         if let DomNode::Element { children, .. } = span {
             let last = children.last().expect("span should have children");
-            assert!(
-                matches!(last, DomNode::Text(t) if t == " [end]"),
-                "last child should be ' [end]'. Got: {:?}",
-                last
-            );
+            match last {
+                DomNode::Element { tag, children: inner, .. } => {
+                    assert_eq!(tag, "nova-after", "last child should be nova-after");
+                    assert_eq!(inner.len(), 1);
+                    assert!(matches!(&inner[0], DomNode::Text(t) if t == " [end]"));
+                }
+                other => panic!("expected nova-after Element, got: {:?}", other),
+            }
         } else {
             panic!("expected Element for span");
         }
@@ -2107,7 +2372,7 @@ mod pseudo_element_injection_tests {
         let result = compute_styles(dom, &[], 800.0);
         let p = find_element(&result, "p").expect("should find p");
         if let DomNode::Element { children, .. } = p {
-            // With content: none, no text should be injected.
+            // With content: none, no pseudo-element should be injected.
             assert_eq!(
                 children.len(),
                 1,
@@ -2116,5 +2381,190 @@ mod pseudo_element_injection_tests {
         } else {
             panic!("expected Element for p");
         }
+    }
+
+    #[test]
+    fn empty_content_injects_empty_element() {
+        // `content: ""` is commonly used for clearfix and layout tricks.
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "body".into(),
+                attributes: vec![],
+                children: vec![
+                    DomNode::Element {
+                        tag: "style".into(),
+                        attributes: vec![],
+                        children: vec![DomNode::Text(
+                            r#"div::after { content: ""; display: block; clear: both; }"#.into(),
+                        )],
+                    },
+                    DomNode::Element {
+                        tag: "div".into(),
+                        attributes: vec![],
+                        children: vec![DomNode::Text("Content".into())],
+                    },
+                ],
+            }],
+        };
+
+        let result = compute_styles(dom, &[], 800.0);
+        let div = find_element(&result, "div").expect("should find div");
+        if let DomNode::Element { children, .. } = div {
+            assert!(children.len() >= 2, "div should have 2+ children (original + ::after)");
+            let last = children.last().unwrap();
+            match last {
+                DomNode::Element { tag, children: inner, attributes } => {
+                    assert_eq!(tag, "nova-after");
+                    // Empty content means no text child.
+                    assert!(inner.is_empty(), "empty content should have no text child");
+                    // Should have display: block and clear: both in styles.
+                    let style = attributes.iter().find(|(k, _)| k == "data-nova-style");
+                    assert!(style.is_some(), "should have data-nova-style");
+                    let style_val = &style.unwrap().1;
+                    assert!(style_val.contains("display: block"), "style: {style_val}");
+                    assert!(style_val.contains("clear: both"), "style: {style_val}");
+                }
+                other => panic!("expected nova-after Element, got: {:?}", other),
+            }
+        } else {
+            panic!("expected Element for div");
+        }
+    }
+
+    #[test]
+    fn legacy_single_colon_syntax() {
+        // `:before` (single colon) should work the same as `::before`.
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "body".into(),
+                attributes: vec![],
+                children: vec![
+                    DomNode::Element {
+                        tag: "style".into(),
+                        attributes: vec![],
+                        children: vec![DomNode::Text(
+                            r#"p:before { content: "->"; }"#.into(),
+                        )],
+                    },
+                    DomNode::Element {
+                        tag: "p".into(),
+                        attributes: vec![],
+                        children: vec![DomNode::Text("Hello".into())],
+                    },
+                ],
+            }],
+        };
+
+        let result = compute_styles(dom, &[], 800.0);
+        let p = find_element(&result, "p").expect("should find p");
+        if let DomNode::Element { children, .. } = p {
+            assert!(children.len() >= 2, "p should have 2+ children with :before");
+            match &children[0] {
+                DomNode::Element { tag, children: inner, .. } => {
+                    assert_eq!(tag, "nova-before");
+                    assert!(matches!(&inner[0], DomNode::Text(t) if t == "->"));
+                }
+                other => panic!("expected nova-before, got: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_escape_in_content() {
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "body".into(),
+                attributes: vec![],
+                children: vec![
+                    DomNode::Element {
+                        tag: "style".into(),
+                        attributes: vec![],
+                        children: vec![DomNode::Text(
+                            r#"span::before { content: "\f00c"; }"#.into(),
+                        )],
+                    },
+                    DomNode::Element {
+                        tag: "span".into(),
+                        attributes: vec![],
+                        children: vec![],
+                    },
+                ],
+            }],
+        };
+
+        let result = compute_styles(dom, &[], 800.0);
+        let span = find_element(&result, "span").expect("should find span");
+        if let DomNode::Element { children, .. } = span {
+            assert!(!children.is_empty(), "should have ::before child");
+            match &children[0] {
+                DomNode::Element { tag, children: inner, .. } => {
+                    assert_eq!(tag, "nova-before");
+                    // \f00c = U+F00C (FontAwesome checkmark)
+                    let expected = char::from_u32(0xf00c).unwrap().to_string();
+                    assert!(matches!(&inner[0], DomNode::Text(t) if *t == expected));
+                }
+                other => panic!("expected nova-before, got: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn attr_content_function() {
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "body".into(),
+                attributes: vec![],
+                children: vec![
+                    DomNode::Element {
+                        tag: "style".into(),
+                        attributes: vec![],
+                        children: vec![DomNode::Text(
+                            r#"span::before { content: attr(data-label); }"#.into(),
+                        )],
+                    },
+                    DomNode::Element {
+                        tag: "span".into(),
+                        attributes: vec![("data-label".into(), "Hello!".into())],
+                        children: vec![],
+                    },
+                ],
+            }],
+        };
+
+        let result = compute_styles(dom, &[], 800.0);
+        let span = find_element(&result, "span").expect("should find span");
+        if let DomNode::Element { children, .. } = span {
+            assert!(!children.is_empty(), "should have ::before child");
+            match &children[0] {
+                DomNode::Element { tag, children: inner, .. } => {
+                    assert_eq!(tag, "nova-before");
+                    assert!(matches!(&inner[0], DomNode::Text(t) if t == "Hello!"));
+                }
+                other => panic!("expected nova-before, got: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_css_content_escapes_hex() {
+        // Font Awesome icon: \f00c -> U+F00C (check mark)
+        assert_eq!(resolve_css_content_escapes("\\f00c"), "\u{f00c}");
+    }
+
+    #[test]
+    fn resolve_css_content_escapes_mixed() {
+        // Mixed text and escapes.
+        assert_eq!(resolve_css_content_escapes("A\\f00c B"), "A\u{f00c}B");
+    }
+
+    #[test]
+    fn resolve_css_content_escapes_no_escapes() {
+        assert_eq!(resolve_css_content_escapes("hello world"), "hello world");
+    }
+
+    #[test]
+    fn resolve_css_content_escapes_six_digit_hex() {
+        // Full 6-digit hex: \01F600 (emoji smiley)
+        assert_eq!(resolve_css_content_escapes("\\01F600"), "\u{1F600}");
     }
 }

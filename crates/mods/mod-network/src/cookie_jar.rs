@@ -7,11 +7,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use url::Url;
 
 /// The `SameSite` attribute of a cookie.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SameSite {
     /// Cookie is sent in all contexts.
     None,
@@ -22,7 +23,7 @@ pub enum SameSite {
 }
 
 /// A single HTTP cookie.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cookie {
     /// Cookie name.
     pub name: String,
@@ -264,6 +265,87 @@ impl CookieJar {
     /// Return whether the cookie jar is empty.
     pub fn is_empty(&self) -> bool {
         self.cookies.lock().unwrap().is_empty()
+    }
+
+    /// Load cookies from a JSON file, merging them into the jar.
+    ///
+    /// Only loads non-expired, non-session cookies (those with an `expires` field).
+    /// Silently ignores missing or malformed files.
+    pub fn load_from_file(&self, path: &std::path::Path) {
+        let data = match std::fs::read_to_string(path) {
+            Ok(d) => d,
+            Err(e) => {
+                debug!(path = %path.display(), error = %e, "no cookie file to load");
+                return;
+            }
+        };
+
+        let loaded: Vec<Cookie> = match serde_json::from_str(&data) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "failed to parse cookie file");
+                return;
+            }
+        };
+
+        let now = SystemTime::now();
+        let mut count = 0;
+        for cookie in loaded {
+            // Skip expired cookies.
+            if let Some(exp) = cookie.expires {
+                if exp <= now {
+                    continue;
+                }
+            } else {
+                // Session cookies are not persisted.
+                continue;
+            }
+            self.store(cookie);
+            count += 1;
+        }
+
+        debug!(path = %path.display(), count, "loaded cookies from file");
+    }
+
+    /// Save all non-session cookies to a JSON file.
+    ///
+    /// Only persists cookies that have an `expires` field (non-session cookies).
+    /// Creates parent directories if needed.
+    pub fn save_to_file(&self, path: &std::path::Path) {
+        let cookies = self.cookies.lock().unwrap();
+        let now = SystemTime::now();
+
+        // Only persist non-session, non-expired cookies.
+        let persistable: Vec<&Cookie> = cookies
+            .iter()
+            .filter(|c| {
+                if let Some(exp) = c.expires {
+                    exp > now
+                } else {
+                    false // Skip session cookies.
+                }
+            })
+            .collect();
+
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                warn!(path = %path.display(), error = %e, "failed to create cookie dir");
+                return;
+            }
+        }
+
+        match serde_json::to_string_pretty(&persistable) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(path, json) {
+                    warn!(path = %path.display(), error = %e, "failed to write cookie file");
+                } else {
+                    debug!(path = %path.display(), count = persistable.len(), "saved cookies to file");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to serialize cookies");
+            }
+        }
     }
 }
 

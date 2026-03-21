@@ -5,13 +5,35 @@
 //! Uses hyper for HTTP/1.1 and rustls for TLS.
 
 use std::io::Read as IoRead;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use semver::Version;
 use tracing::{debug, info, warn};
+
+mod cookie_jar;
+use cookie_jar::CookieJar;
+
+/// Global cookie jar shared across all network requests.
+fn global_cookie_jar() -> &'static Mutex<CookieJar> {
+    static JAR: OnceLock<Mutex<CookieJar>> = OnceLock::new();
+    JAR.get_or_init(|| {
+        let jar = CookieJar::new();
+        jar.load_from_file(&cookie_file_path());
+        Mutex::new(jar)
+    })
+}
+
+/// Path to the persistent cookie file: `~/.nova/cookies.json`.
+fn cookie_file_path() -> PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".nova").join("cookies.json")
+}
 
 use nova_mod_api::{
     capability::CapabilityType,
@@ -24,14 +46,22 @@ use nova_mod_api::{
     CoreApi, NovaMod,
 };
 
+pub mod cache;
+pub mod cors;
 pub mod form;
+pub mod hsts;
 pub mod http2;
 mod transport;
+pub mod websocket;
 
 /// The network mod — fetches resources over HTTP and HTTPS.
 pub struct NetworkMod {
     manifest: ModManifest,
     core: Option<Arc<dyn CoreApi>>,
+    /// HTTP cache for storing and revalidating responses.
+    cache: cache::HttpCache,
+    /// WebSocket connection manager.
+    ws_manager: websocket::WebSocketManager,
 }
 
 impl NetworkMod {
@@ -66,6 +96,8 @@ impl NetworkMod {
         Self {
             manifest,
             core: None,
+            cache: cache::HttpCache::default(),
+            ws_manager: websocket::WebSocketManager::new(),
         }
     }
 
@@ -84,7 +116,63 @@ impl NetworkMod {
     /// Perform a real HTTP/HTTPS request with an explicit method and optional body.
     ///
     /// Used for form submissions (POST) and other non-GET requests.
+    /// Integrates with the HTTP cache:
+    /// - Fresh cached responses are returned immediately.
+    /// - Stale cached responses trigger conditional requests (If-None-Match / If-Modified-Since).
+    /// - New responses are stored in the cache if cacheable.
     async fn fetch_real_with_body(
+        &self,
+        url_str: &str,
+        initial_method: &str,
+        _headers: &[(String, String)],
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse, NovaError> {
+        // Check cache for GET requests before making a network request.
+        if initial_method == "GET" {
+            if let Some(cached) = self.cache.lookup(url_str, "GET") {
+                if cache::HttpCache::is_fresh(&cached) {
+                    info!(url = %url_str, "serving from cache (fresh)");
+                    return Ok(cached.response);
+                }
+
+                // Stale entry — make conditional request.
+                let cond_headers = cache::HttpCache::conditional_headers(&cached);
+                if !cond_headers.is_empty() {
+                    debug!(url = %url_str, "making conditional request for stale cache entry");
+                    let mut merged_headers: Vec<(String, String)> = _headers.to_vec();
+                    merged_headers.extend(cond_headers);
+
+                    let response = self.fetch_with_redirects(
+                        url_str, initial_method, &merged_headers, body,
+                    ).await?;
+
+                    if response.status == 304 {
+                        self.cache.update_headers(url_str, "GET", &response.headers);
+                        info!(url = %url_str, "304 Not Modified, serving from cache");
+                        return Ok(cached.response);
+                    }
+
+                    self.cache.store(url_str, "GET", &response);
+                    return Ok(response);
+                }
+            }
+        }
+
+        // No cache hit — make normal request.
+        let response = self.fetch_with_redirects(
+            url_str, initial_method, _headers, body,
+        ).await?;
+
+        // Store in cache if applicable.
+        self.cache.store(url_str, initial_method, &response);
+
+        Ok(response)
+    }
+
+    /// Perform an HTTP request with redirect following.
+    ///
+    /// This is the core redirect loop, extracted so cache logic can call it.
+    async fn fetch_with_redirects(
         &self,
         url_str: &str,
         initial_method: &str,
@@ -112,7 +200,6 @@ impl NetworkMod {
                     .map(|(_, v)| v.clone());
 
                 if let Some(loc) = location {
-                    // Resolve relative URLs against the current URL.
                     let base = url::Url::parse(&current_url)
                         .map_err(|e| NovaError::NetworkError(format!("invalid URL: {e}")))?;
                     let resolved = base.join(&loc)
@@ -126,12 +213,9 @@ impl NetworkMod {
                         "following HTTP redirect"
                     );
 
-                    // For 303, always switch to GET.
-                    // For 301/302, switch to GET (common browser behavior).
-                    // For 307/308, preserve the original method.
                     if matches!(response.status, 301 | 302 | 303) {
                         method = "GET".to_string();
-                        current_body = None; // Body is not forwarded on GET redirect.
+                        current_body = None;
                     }
 
                     current_url = resolved.to_string();
@@ -139,7 +223,6 @@ impl NetworkMod {
                 }
             }
 
-            // Update the response URL to reflect the final URL after redirects.
             let mut final_response = response;
             final_response.url = current_url;
             return Ok(final_response);
@@ -212,6 +295,17 @@ impl NetworkMod {
             request.push_str(&format!("Content-Length: {}\r\n", body_data.len()));
         }
 
+        // Add cookies for this URL.
+        {
+            let jar = global_cookie_jar().lock().unwrap();
+            let matching = jar.cookies_for_url(&parsed);
+            if !matching.is_empty() {
+                let cookie_header = CookieJar::to_cookie_header(&matching);
+                debug!(url = %url_str, cookies = %cookie_header, "attaching cookies");
+                request.push_str(&format!("Cookie: {cookie_header}\r\n"));
+            }
+        }
+
         // Add extra headers.
         for (key, value) in extra_headers {
             request.push_str(&format!("{key}: {value}\r\n"));
@@ -226,6 +320,25 @@ impl NetworkMod {
             body,
         ).await?;
         let response = parse_http_response(&raw_response, url_str)?;
+
+        // Process Set-Cookie headers from the response.
+        {
+            let jar = global_cookie_jar().lock().unwrap();
+            for (name, value) in &response.headers {
+                if name == "set-cookie" {
+                    if let Some(cookie) = CookieJar::parse_set_cookie(value, &parsed) {
+                        debug!(
+                            cookie_name = %cookie.name,
+                            domain = %cookie.domain,
+                            "storing cookie from response"
+                        );
+                        jar.store(cookie);
+                    }
+                }
+            }
+            // Persist cookies to disk after any changes.
+            jar.save_to_file(&cookie_file_path());
+        }
 
         info!(
             url = %url_str,

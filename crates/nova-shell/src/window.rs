@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
@@ -19,8 +19,12 @@ use winit::{
 
 use nova_core::NovaCore;
 use nova_gpu::compositor::LayerTree;
+use nova_gpu::vello_backend::VelloBackend;
 use nova_mod_api::{Color, RenderCommands, RenderOp, TypedData, Viewport};
 
+use crate::bookmarks::BookmarkStore;
+use crate::downloads::DownloadsManager;
+use crate::persistent_history::PersistentHistory;
 use crate::renderer::Framebuffer;
 
 /// Height of the URL bar area in logical pixels.
@@ -77,11 +81,85 @@ pub struct FormFieldRegion {
     form_method: String,
     /// The `enctype` of the parent `<form>` element.
     form_enctype: String,
+    /// The placeholder text for the field.
+    pub placeholder: String,
+    /// Whether the field is checked (checkbox/radio).
+    pub checked: bool,
+    /// Whether the field is required.
+    pub required: bool,
+    /// Options for `<select>` elements.
+    pub options: Vec<(String, String, bool)>,
+    /// Validation pattern.
+    pub pattern: String,
+    /// Min value for number inputs.
+    pub min: String,
+    /// Max value for number inputs.
+    pub max: String,
+    /// Max character length.
+    pub maxlength: Option<usize>,
+    /// Min character length.
+    pub minlength: Option<usize>,
 }
 
 impl FormFieldRegion {
     fn contains(&self, px: f32, py: f32) -> bool {
         px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
+    }
+
+    /// Validate the field value according to HTML5 validation attributes.
+    ///
+    /// Returns `None` if valid, or `Some(error_message)` if invalid.
+    pub fn validate(&self) -> Option<String> {
+        // Required check.
+        if self.required && self.value.is_empty()
+            && !matches!(self.field_type.as_str(), "checkbox" | "radio")
+        {
+            return Some("This field is required".to_string());
+        }
+        // Required checkbox must be checked.
+        if self.required && self.field_type == "checkbox" && !self.checked {
+            return Some("This checkbox is required".to_string());
+        }
+        // Pattern validation.
+        if !self.pattern.is_empty() && !self.value.is_empty() {
+            if let Ok(re) = regex::Regex::new(&format!("^(?:{})$", self.pattern)) {
+                if !re.is_match(&self.value) {
+                    return Some(format!("Value does not match pattern: {}", self.pattern));
+                }
+            }
+        }
+        // Min/max for number inputs.
+        if self.field_type == "number" && !self.value.is_empty() {
+            if let Ok(v) = self.value.parse::<f64>() {
+                if !self.min.is_empty() {
+                    if let Ok(min_v) = self.min.parse::<f64>() {
+                        if v < min_v {
+                            return Some(format!("Value must be at least {}", self.min));
+                        }
+                    }
+                }
+                if !self.max.is_empty() {
+                    if let Ok(max_v) = self.max.parse::<f64>() {
+                        if v > max_v {
+                            return Some(format!("Value must be at most {}", self.max));
+                        }
+                    }
+                }
+            }
+        }
+        // Maxlength.
+        if let Some(maxlen) = self.maxlength {
+            if self.value.len() > maxlen {
+                return Some(format!("Value must be at most {} characters", maxlen));
+            }
+        }
+        // Minlength.
+        if let Some(minlen) = self.minlength {
+            if !self.value.is_empty() && self.value.len() < minlen {
+                return Some(format!("Value must be at least {} characters", minlen));
+            }
+        }
+        None
     }
 }
 
@@ -158,6 +236,55 @@ pub struct BrowserWindow {
     layer_tree: Option<LayerTree>,
     /// Whether the content framebuffer needs to be rebuilt (dirty content).
     content_dirty: bool,
+
+    // -- Find in Page (Ctrl+F) --
+    /// Whether the find bar is visible.
+    find_bar_visible: bool,
+    /// Current search query text.
+    find_query: String,
+    /// All match positions as `(render_op_index, char_offset)`.
+    find_matches: Vec<FindMatch>,
+    /// Index of the current highlighted match.
+    find_current: usize,
+
+    // -- Zoom (Ctrl+Plus/Minus) --
+    /// Current zoom level (1.0 = 100%).
+    zoom_level: f32,
+    /// Ticks remaining to display the zoom indicator overlay.
+    zoom_indicator_ticks: u32,
+
+    // -- Bookmarks --
+    /// Persistent bookmark store.
+    bookmark_store: BookmarkStore,
+
+    // -- Persistent history --
+    /// Persistent browsing history.
+    persistent_history: PersistentHistory,
+
+    // -- Downloads --
+    /// Downloads manager.
+    downloads_manager: DownloadsManager,
+
+    // -- Vello GPU rendering --
+    /// Vello GPU backend for hardware-accelerated rendering of page content.
+    /// When available, this replaces the software `Framebuffer` renderer for
+    /// page content (the URL bar is still drawn in software on top).
+    vello_backend: VelloBackend,
+    /// Whether to attempt GPU rendering (disabled if GPU init fails).
+    use_gpu_rendering: bool,
+}
+
+/// A match found during Find in Page.
+#[derive(Debug, Clone)]
+struct FindMatch {
+    /// Y coordinate of the match in page coordinates.
+    y: f32,
+    /// X coordinate of the match.
+    x: f32,
+    /// Width of the matched text.
+    width: f32,
+    /// Height of the matched text line.
+    height: f32,
 }
 
 impl BrowserWindow {
@@ -185,6 +312,12 @@ impl BrowserWindow {
             height: height as f32,
             scale_factor: 1.0,
         };
+
+        let bookmark_store = BookmarkStore::load();
+        let persistent_history = PersistentHistory::load();
+
+        let mut vello_backend = VelloBackend::new();
+        vello_backend.init(1.0);
 
         Self {
             window: None,
@@ -214,6 +347,17 @@ impl BrowserWindow {
             viewport,
             layer_tree,
             content_dirty: false,
+            find_bar_visible: false,
+            find_query: String::new(),
+            find_matches: Vec::new(),
+            find_current: 0,
+            zoom_level: 1.0,
+            zoom_indicator_ticks: 0,
+            bookmark_store,
+            persistent_history,
+            downloads_manager: DownloadsManager::new(),
+            vello_backend,
+            use_gpu_rendering: false, // Disabled: Vello text rendering not yet complete; software FreeType renderer used.
         }
     }
 
@@ -246,12 +390,18 @@ impl BrowserWindow {
             if let RenderOp::FormField {
                 x, y, width, height, value, field_type,
                 name, form_action, form_method, form_enctype,
+                placeholder, checked, required, options,
+                pattern, min, max, maxlength, minlength,
             } = op {
                 Some(FormFieldRegion {
                     x: *x, y: *y, width: *width, height: *height,
                     value: value.clone(), field_type: field_type.clone(),
                     name: name.clone(), form_action: form_action.clone(),
                     form_method: form_method.clone(), form_enctype: form_enctype.clone(),
+                    placeholder: placeholder.clone(), checked: *checked,
+                    required: *required, options: options.clone(),
+                    pattern: pattern.clone(), min: min.clone(), max: max.clone(),
+                    maxlength: *maxlength, minlength: *minlength,
                 })
             } else {
                 None
@@ -493,17 +643,48 @@ impl BrowserWindow {
     }
 
     /// Render the full frame: URL bar + scrolled page content + scrollbar.
+    ///
+    /// When the Vello GPU backend is available and `use_gpu_rendering` is enabled,
+    /// page content is rendered on the GPU and the resulting pixels are copied
+    /// into the framebuffer. The URL bar and scrollbar are always drawn in
+    /// software on top.
+    ///
+    /// If GPU rendering fails or is unavailable, falls back to the software
+    /// `Framebuffer` renderer.
     fn rebuild_framebuffer(&mut self) {
         self.framebuffer.reset(self.width, self.height);
 
-        // Render page content shifted down by the URL bar and by scroll offset.
-        self.framebuffer.render_scrolled(
-            &self.render_commands,
-            URL_BAR_HEIGHT,
-            self.scroll_x,
-            self.scroll_y,
-            self.content_height,
-        );
+        // Try GPU rendering for page content.
+        let mut used_gpu = false;
+        if self.use_gpu_rendering {
+            let gpu_pixels = self.vello_backend.render_to_texture(
+                &self.render_commands.ops,
+                self.width,
+                self.height,
+            );
+
+            if self.vello_backend.has_gpu() && gpu_pixels.len() == (self.width as usize * self.height as usize * 4) {
+                // GPU render succeeded — copy pixels into the framebuffer.
+                self.framebuffer.pixels.copy_from_slice(&gpu_pixels);
+                used_gpu = true;
+                debug!("Frame rendered via Vello GPU backend");
+            } else if !self.vello_backend.has_gpu() {
+                // GPU init failed permanently — disable GPU rendering for this session.
+                info!("Vello GPU not available, falling back to software renderer permanently");
+                self.use_gpu_rendering = false;
+            }
+        }
+
+        if !used_gpu {
+            // Software fallback: render page content with the CPU renderer.
+            self.framebuffer.render_scrolled(
+                &self.render_commands,
+                URL_BAR_HEIGHT,
+                self.scroll_x,
+                self.scroll_y,
+                self.content_height,
+            );
+        }
 
         // Draw focus ring on the focused form field (if any).
         if let Some(idx) = self.focused_field {
@@ -515,8 +696,20 @@ impl BrowserWindow {
             }
         }
 
+        // Draw find-in-page highlights (before URL bar so they appear under it).
+        self.draw_find_highlights();
+
         // Draw the URL bar on top (overwrites the top region, not affected by scroll).
         self.draw_url_bar();
+
+        // Draw the bookmark star in the URL bar.
+        self.draw_bookmark_star();
+
+        // Draw find bar overlay.
+        self.draw_find_bar();
+
+        // Draw zoom indicator.
+        self.draw_zoom_indicator();
     }
 
     /// Draw the URL bar chrome at the top of the framebuffer.
@@ -884,6 +1077,12 @@ impl BrowserWindow {
                     let s = text.as_str();
                     if !s.is_empty() && s.chars().all(|c| !c.is_control()) {
                         if let Some(field) = self.form_fields.get_mut(idx) {
+                            // Enforce maxlength.
+                            if let Some(maxlen) = field.maxlength {
+                                if field.value.len() + s.len() > maxlen {
+                                    return true; // don't add more text
+                                }
+                            }
                             field.value.push_str(s);
                         }
                         return true;
@@ -898,6 +1097,7 @@ impl BrowserWindow {
     ///
     /// Collects all form fields sharing the same `form_action` and builds
     /// a query string (GET) or POST body from their name/value pairs.
+    /// Performs HTML5 validation before submission.
     fn submit_form(&mut self, trigger_idx: usize) {
         let trigger = match self.form_fields.get(trigger_idx) {
             Some(f) => f.clone(),
@@ -906,12 +1106,47 @@ impl BrowserWindow {
 
         let form_action = trigger.form_action.clone();
         let form_method = trigger.form_method.clone();
+        let form_enctype = trigger.form_enctype.clone();
+
+        // Validate all fields in this form before submission.
+        let mut validation_errors = Vec::new();
+        for field in &self.form_fields {
+            if field.form_action == form_action && !field.name.is_empty() {
+                if let Some(error) = field.validate() {
+                    validation_errors.push(format!("{}: {}", field.name, error));
+                }
+            }
+        }
+        if !validation_errors.is_empty() {
+            warn!("Form validation failed: {:?}", validation_errors);
+            // TODO: Show validation errors visually.
+            return;
+        }
 
         // Collect all fields that belong to the same form (same action URL).
         let fields: Vec<(String, String)> = self.form_fields.iter()
             .filter(|f| f.form_action == form_action && !f.name.is_empty())
             .filter(|f| !matches!(f.field_type.as_str(), "submit" | "button" | "reset"))
-            .map(|f| (f.name.clone(), f.value.clone()))
+            .filter_map(|f| {
+                match f.field_type.as_str() {
+                    "checkbox" => {
+                        if f.checked {
+                            Some((f.name.clone(), if f.value.is_empty() { "on".to_string() } else { f.value.clone() }))
+                        } else {
+                            None // unchecked checkboxes are not submitted
+                        }
+                    }
+                    "radio" => {
+                        if f.checked {
+                            Some((f.name.clone(), f.value.clone()))
+                        } else {
+                            None // unselected radios are not submitted
+                        }
+                    }
+                    "file" | "hidden" => Some((f.name.clone(), f.value.clone())),
+                    _ => Some((f.name.clone(), f.value.clone())),
+                }
+            })
             .collect();
 
         // Resolve form action URL against current page URL.
@@ -939,20 +1174,327 @@ impl BrowserWindow {
             };
             info!(url = %nav_url, "Form GET submission");
             self.navigate_in_place(&nav_url);
+        } else if form_enctype == "multipart/form-data" {
+            // POST submission with multipart form data.
+            let boundary = format!("----NovaFormBoundary{:x}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis());
+            let mut body = Vec::new();
+            for (key, value) in &fields {
+                body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+                body.extend_from_slice(
+                    format!("Content-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n").as_bytes()
+                );
+            }
+            body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+            let content_type = format!("multipart/form-data; boundary={boundary}");
+            info!(url = %action_url, "Form POST (multipart) submission");
+            self.navigate_post(&action_url, body, &content_type);
         } else {
-            // POST: For now, use GET as fallback (full POST requires pipeline changes).
-            let query = fields.iter()
+            // POST submission with application/x-www-form-urlencoded.
+            let encoded = fields.iter()
                 .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
                 .collect::<Vec<_>>()
                 .join("&");
-            let nav_url = if action_url.contains('?') {
-                format!("{action_url}&{query}")
-            } else {
-                format!("{action_url}?{query}")
-            };
-            info!(url = %nav_url, "Form POST submission (using GET fallback)");
-            self.navigate_in_place(&nav_url);
+            info!(url = %action_url, "Form POST (urlencoded) submission");
+            self.navigate_post(
+                &action_url,
+                encoded.into_bytes(),
+                "application/x-www-form-urlencoded",
+            );
         }
+    }
+
+    /// Navigate via POST method.
+    fn navigate_post(&mut self, url: &str, body: Vec<u8>, content_type: &str) {
+        let core = self.core.clone();
+        let viewport = self.viewport;
+        let url_owned = url.to_string();
+        let ct_owned = content_type.to_string();
+        let handle = self.tokio_handle.clone();
+
+        let result = std::thread::spawn(move || {
+            handle.block_on(async {
+                core.navigate_post(&url_owned, body, &ct_owned, viewport).await
+            })
+        })
+        .join()
+        .map_err(|_| nova_mod_api::NovaError::Internal("navigation thread panicked".into()))
+        .and_then(|r| r);
+
+        match result {
+            Ok(TypedData::RenderCommands(cmds)) => {
+                info!("POST navigation successful! {} render ops", cmds.ops.len());
+                self.hit_regions = Self::extract_hit_regions(&cmds);
+                self.form_fields = Self::extract_form_fields(&cmds);
+                self.focused_field = None;
+                self.content_height = Self::compute_content_height(&cmds);
+                self.content_width = Self::compute_content_width(&cmds);
+                self.render_commands = cmds;
+                self.scroll_y = 0.0;
+                self.scroll_x = 0.0;
+                self.url_bar_focused = false;
+                self.url_bar_select_all = false;
+                self.url_bar_text = url.to_string();
+                self.url_bar_cursor = self.url_bar_text.len();
+                if let Some(w) = &self.window {
+                    w.set_title(&format!("NOVA - {}", self.url_bar_text));
+                }
+                self.request_redraw();
+            }
+            Ok(_) => {
+                info!("POST navigation returned unexpected type");
+                self.request_redraw();
+            }
+            Err(e) => {
+                error!("POST navigation failed: {e}");
+                self.request_redraw();
+            }
+        }
+    }
+
+    // -- Find in Page -------------------------------------------------------
+
+    /// Perform a search through all DrawText render ops and collect match positions.
+    fn find_in_page(&mut self) {
+        self.find_matches.clear();
+        self.find_current = 0;
+
+        if self.find_query.is_empty() {
+            return;
+        }
+
+        let query_lower = self.find_query.to_lowercase();
+        let approx_char_w_factor = 0.6;
+
+        for op in &self.render_commands.ops {
+            if let RenderOp::DrawText {
+                x,
+                y,
+                text,
+                font_size,
+                ..
+            } = op
+            {
+                let text_lower = text.to_lowercase();
+                let char_w = font_size * approx_char_w_factor;
+
+                // Find all occurrences in this text.
+                let mut start = 0;
+                while let Some(pos) = text_lower[start..].find(&query_lower) {
+                    let char_offset = start + pos;
+                    let match_x = x + char_offset as f32 * char_w;
+                    let match_w = query_lower.len() as f32 * char_w;
+
+                    self.find_matches.push(FindMatch {
+                        x: match_x,
+                        y: *y,
+                        width: match_w,
+                        height: font_size * 1.2,
+                    });
+
+                    start = char_offset + query_lower.len();
+                }
+            }
+        }
+
+        debug!(
+            query = %self.find_query,
+            matches = self.find_matches.len(),
+            "find in page"
+        );
+
+        // Scroll to first match if any.
+        if !self.find_matches.is_empty() {
+            self.scroll_to_find_match();
+        }
+    }
+
+    /// Navigate to the next find match.
+    fn find_next(&mut self) {
+        if self.find_matches.is_empty() {
+            return;
+        }
+        self.find_current = (self.find_current + 1) % self.find_matches.len();
+        self.scroll_to_find_match();
+    }
+
+    /// Navigate to the previous find match.
+    fn find_prev(&mut self) {
+        if self.find_matches.is_empty() {
+            return;
+        }
+        if self.find_current == 0 {
+            self.find_current = self.find_matches.len() - 1;
+        } else {
+            self.find_current -= 1;
+        }
+        self.scroll_to_find_match();
+    }
+
+    /// Scroll the viewport to show the current find match.
+    fn scroll_to_find_match(&mut self) {
+        if let Some(m) = self.find_matches.get(self.find_current) {
+            let page_viewport = (self.height as f32 - URL_BAR_HEIGHT).max(0.0);
+            // Center the match vertically in the viewport.
+            self.scroll_y = (m.y - page_viewport / 2.0).max(0.0);
+            self.clamp_scroll();
+        }
+    }
+
+    /// Draw the find bar overlay at the top-right of the window.
+    fn draw_find_bar(&mut self) {
+        if !self.find_bar_visible {
+            return;
+        }
+
+        let bar_w = 320.0_f32;
+        let bar_h = 32.0_f32;
+        let bar_x = (self.width as f32 - bar_w - 8.0).max(0.0);
+        let bar_y = URL_BAR_HEIGHT + 4.0;
+
+        // Background.
+        let bg = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.95 };
+        self.framebuffer.fill_rect(bar_x, bar_y, bar_w, bar_h, bg);
+
+        // Border.
+        let border = Color { r: 0.7, g: 0.7, b: 0.7, a: 1.0 };
+        self.framebuffer.stroke_rect(bar_x, bar_y, bar_w, bar_h, border, 1.0);
+
+        // Query text.
+        let text_color = Color { r: 0.1, g: 0.1, b: 0.1, a: 1.0 };
+        let text_x = bar_x + 6.0;
+        let text_y = bar_y + (bar_h - 12.0) / 2.0;
+        self.framebuffer.draw_text(
+            text_x,
+            text_y,
+            &self.find_query,
+            12.0,
+            text_color,
+            None,
+            None,
+            None,
+        );
+
+        // Match count.
+        let count_text = if self.find_matches.is_empty() {
+            if self.find_query.is_empty() {
+                String::new()
+            } else {
+                "0 matches".to_string()
+            }
+        } else {
+            format!("{} of {}", self.find_current + 1, self.find_matches.len())
+        };
+
+        if !count_text.is_empty() {
+            let count_x = bar_x + bar_w - 90.0;
+            self.framebuffer.draw_text(
+                count_x,
+                text_y,
+                &count_text,
+                11.0,
+                Color { r: 0.4, g: 0.4, b: 0.4, a: 1.0 },
+                None,
+                None,
+                None,
+            );
+        }
+    }
+
+    /// Draw yellow highlight rectangles for all find matches, and orange for the current one.
+    fn draw_find_highlights(&mut self) {
+        if !self.find_bar_visible || self.find_matches.is_empty() {
+            return;
+        }
+
+        let highlight_color = Color { r: 1.0, g: 1.0, b: 0.0, a: 0.4 };
+        let current_color = Color { r: 1.0, g: 0.65, b: 0.0, a: 0.5 };
+
+        for (i, m) in self.find_matches.iter().enumerate() {
+            let sx = m.x - self.scroll_x;
+            let sy = m.y + URL_BAR_HEIGHT - self.scroll_y;
+            let color = if i == self.find_current {
+                current_color
+            } else {
+                highlight_color
+            };
+            self.framebuffer.fill_rect(sx, sy, m.width, m.height, color);
+        }
+    }
+
+    // -- Zoom ---------------------------------------------------------------
+
+    /// Set the zoom level and re-render.
+    fn set_zoom(&mut self, level: f32) {
+        self.zoom_level = level.clamp(0.25, 5.0);
+        self.zoom_indicator_ticks = 60; // Show indicator for ~60 frames.
+        info!(zoom = self.zoom_level, "zoom level changed");
+
+        // Apply zoom by adjusting viewport dimensions and re-navigating.
+        let effective_width = self.width as f32 / self.zoom_level;
+        let effective_height = self.height as f32 / self.zoom_level;
+        self.viewport = Viewport {
+            width: effective_width,
+            height: effective_height,
+            scale_factor: self.zoom_level,
+        };
+
+        // Re-render the current page at the new zoom level.
+        let url = self.url_bar_text.clone();
+        self.navigate_in_place(&url);
+    }
+
+    /// Draw a zoom indicator overlay at the bottom-right of the window.
+    fn draw_zoom_indicator(&mut self) {
+        if self.zoom_indicator_ticks == 0 || (self.zoom_level - 1.0).abs() < 0.01 {
+            return;
+        }
+
+        let text = format!("{}%", (self.zoom_level * 100.0).round() as u32);
+        let indicator_w = 70.0_f32;
+        let indicator_h = 28.0_f32;
+        let ix = self.width as f32 - indicator_w - 12.0;
+        let iy = self.height as f32 - indicator_h - 12.0;
+
+        // Background.
+        let bg = Color { r: 0.2, g: 0.2, b: 0.2, a: 0.8 };
+        self.framebuffer.fill_rect(ix, iy, indicator_w, indicator_h, bg);
+
+        // Text.
+        let text_x = ix + (indicator_w - text.len() as f32 * 8.0) / 2.0;
+        let text_y = iy + (indicator_h - 13.0) / 2.0;
+        self.framebuffer.draw_text(
+            text_x,
+            text_y,
+            &text,
+            13.0,
+            Color::WHITE,
+            None,
+            None,
+            None,
+        );
+
+        self.zoom_indicator_ticks = self.zoom_indicator_ticks.saturating_sub(1);
+    }
+
+    // -- Bookmark indicator -------------------------------------------------
+
+    /// Draw a star icon in the URL bar (filled if bookmarked, outline otherwise).
+    fn draw_bookmark_star(&mut self) {
+        let star_x = self.width as f32 - URL_BAR_PADDING - 22.0;
+        let star_y = (URL_BAR_HEIGHT - 14.0) / 2.0;
+
+        let is_bookmarked = self.bookmark_store.is_bookmarked(&self.url_bar_text);
+        let star_char = if is_bookmarked { "\u{2605}" } else { "\u{2606}" }; // filled vs outline star
+        let color = if is_bookmarked {
+            Color { r: 1.0, g: 0.8, b: 0.0, a: 1.0 } // gold
+        } else {
+            Color { r: 0.5, g: 0.5, b: 0.5, a: 1.0 } // gray
+        };
+
+        self.framebuffer.draw_text(star_x, star_y, star_char, 16.0, color, None, None, None);
     }
 
     /// Navigate to a new URL without closing the window.
@@ -991,6 +1533,9 @@ impl BrowserWindow {
                 self.url_bar_select_all = false;
                 self.url_bar_text = url.to_string();
                 self.url_bar_cursor = self.url_bar_text.len();
+
+                // Record in persistent history.
+                self.persistent_history.record(url, url);
 
                 // Update window title.
                 if let Some(w) = &self.window {
@@ -1100,6 +1645,155 @@ impl ApplicationHandler for BrowserWindow {
 
             // ── Keyboard input ─────────────────────────────────────
             WindowEvent::KeyboardInput { event, .. } => {
+                // Detect modifier keys from the event.
+                let is_ctrl = event.state == ElementState::Pressed
+                    && (event.logical_key == Key::Named(NamedKey::Control));
+                let _ = is_ctrl; // suppress warning
+
+                // Check for Ctrl+key shortcuts FIRST (global shortcuts).
+                if event.state == ElementState::Pressed {
+                    let key_str = match &event.logical_key {
+                        Key::Character(c) => Some(c.as_str()),
+                        _ => None,
+                    };
+
+                    // Ctrl+F: Find in page.
+                    if key_str == Some("f") && event.repeat == false {
+                        // Check for ctrl via modifiers in the text field.
+                        // winit doesn't give us modifiers directly on KeyboardInput,
+                        // but Ctrl+F produces the character "\x06". Also, the
+                        // `text` field will be empty or control char when Ctrl is held.
+                        let is_ctrl_combo = event
+                            .text
+                            .as_ref()
+                            .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
+                            .unwrap_or(false);
+
+                        if is_ctrl_combo {
+                            self.find_bar_visible = !self.find_bar_visible;
+                            if !self.find_bar_visible {
+                                self.find_query.clear();
+                                self.find_matches.clear();
+                            }
+                            self.request_redraw();
+                            return;
+                        }
+                    }
+
+                    // Ctrl+D: Toggle bookmark.
+                    if key_str == Some("d") {
+                        let is_ctrl_combo = event
+                            .text
+                            .as_ref()
+                            .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
+                            .unwrap_or(false);
+
+                        if is_ctrl_combo {
+                            let url = self.url_bar_text.clone();
+                            self.bookmark_store.toggle(&url, &url);
+                            self.request_redraw();
+                            return;
+                        }
+                    }
+
+                    // Ctrl+H: Log history (future: open history panel).
+                    if key_str == Some("h") {
+                        let is_ctrl_combo = event
+                            .text
+                            .as_ref()
+                            .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
+                            .unwrap_or(false);
+
+                        if is_ctrl_combo {
+                            let entries = self.persistent_history.all();
+                            info!("History ({} entries):", entries.len());
+                            for (i, e) in entries.iter().take(20).enumerate() {
+                                info!("  [{}] {} — {}", i + 1, e.url, e.title);
+                            }
+                            return;
+                        }
+                    }
+
+                    // Ctrl+= or Ctrl++: Zoom in.
+                    if key_str == Some("=") || key_str == Some("+") {
+                        let is_ctrl_combo = event
+                            .text
+                            .as_ref()
+                            .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
+                            .unwrap_or(false);
+
+                        if is_ctrl_combo {
+                            let new_zoom = self.zoom_level + 0.1;
+                            self.set_zoom(new_zoom);
+                            return;
+                        }
+                    }
+
+                    // Ctrl+-: Zoom out.
+                    if key_str == Some("-") {
+                        let is_ctrl_combo = event
+                            .text
+                            .as_ref()
+                            .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
+                            .unwrap_or(false);
+
+                        if is_ctrl_combo {
+                            let new_zoom = self.zoom_level - 0.1;
+                            self.set_zoom(new_zoom);
+                            return;
+                        }
+                    }
+
+                    // Ctrl+0: Reset zoom.
+                    if key_str == Some("0") {
+                        let is_ctrl_combo = event
+                            .text
+                            .as_ref()
+                            .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
+                            .unwrap_or(false);
+
+                        if is_ctrl_combo {
+                            self.set_zoom(1.0);
+                            return;
+                        }
+                    }
+                }
+
+                // Handle find bar input when it's visible.
+                if self.find_bar_visible && event.state == ElementState::Pressed {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            self.find_bar_visible = false;
+                            self.find_query.clear();
+                            self.find_matches.clear();
+                            self.request_redraw();
+                            return;
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            self.find_next();
+                            self.request_redraw();
+                            return;
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            self.find_query.pop();
+                            self.find_in_page();
+                            self.request_redraw();
+                            return;
+                        }
+                        _ => {
+                            if let Some(text) = &event.text {
+                                let s = text.as_str();
+                                if !s.is_empty() && s.chars().all(|c| !c.is_control()) {
+                                    self.find_query.push_str(s);
+                                    self.find_in_page();
+                                    self.request_redraw();
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // First try the URL bar.
                 if self.url_bar_focused {
                     self.handle_url_bar_key(&event);
@@ -1204,13 +1898,66 @@ impl ApplicationHandler for BrowserWindow {
                         }
                     }
                     if let Some(idx) = clicked_field {
-                        // If the clicked field is a submit button, submit the form.
-                        let is_submit = self.form_fields.get(idx)
-                            .is_some_and(|f| matches!(f.field_type.as_str(), "submit" | "button"));
-                        if is_submit {
-                            self.submit_form(idx);
-                        } else {
-                            self.focused_field = Some(idx);
+                        let field_type = self.form_fields.get(idx)
+                            .map(|f| f.field_type.clone())
+                            .unwrap_or_default();
+
+                        match field_type.as_str() {
+                            "submit" | "button" => {
+                                self.submit_form(idx);
+                            }
+                            "checkbox" => {
+                                // Toggle checked state.
+                                if let Some(field) = self.form_fields.get_mut(idx) {
+                                    field.checked = !field.checked;
+                                }
+                                self.request_redraw();
+                            }
+                            "radio" => {
+                                // Select this radio, deselect siblings with same name.
+                                let name = self.form_fields.get(idx)
+                                    .map(|f| f.name.clone())
+                                    .unwrap_or_default();
+                                let form_action = self.form_fields.get(idx)
+                                    .map(|f| f.form_action.clone())
+                                    .unwrap_or_default();
+                                for f in &mut self.form_fields {
+                                    if f.field_type == "radio" && f.name == name
+                                        && f.form_action == form_action
+                                    {
+                                        f.checked = false;
+                                    }
+                                }
+                                if let Some(field) = self.form_fields.get_mut(idx) {
+                                    field.checked = true;
+                                }
+                                self.request_redraw();
+                            }
+                            "select" => {
+                                // Cycle through options on click.
+                                if let Some(field) = self.form_fields.get_mut(idx) {
+                                    if !field.options.is_empty() {
+                                        let current_idx = field.options.iter()
+                                            .position(|(v, _, _)| *v == field.value)
+                                            .unwrap_or(0);
+                                        let next_idx = (current_idx + 1) % field.options.len();
+                                        let new_val = field.options[next_idx].0.clone();
+                                        field.value = new_val;
+                                        let current_val = field.value.clone();
+                                        for opt in &mut field.options {
+                                            opt.2 = opt.0 == current_val;
+                                        }
+                                    }
+                                }
+                                self.focused_field = Some(idx);
+                                self.request_redraw();
+                            }
+                            "hidden" => {
+                                // Hidden fields cannot be focused.
+                            }
+                            _ => {
+                                self.focused_field = Some(idx);
+                            }
                         }
                         self.request_redraw();
                     } else {

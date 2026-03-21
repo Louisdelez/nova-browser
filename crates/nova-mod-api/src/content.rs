@@ -94,6 +94,15 @@ pub enum ContentRequest {
         /// Each entry is `(src_url, decoded_rgba_bytes)` where the bytes use
         /// the mod-image wire format: `[width_u32_le][height_u32_le][rgba…]`.
         images: Vec<(String, Vec<u8>)>,
+        /// Canvas pixel buffers keyed by canvas identifier.
+        /// Each entry is `(canvas_id, width, height, rgba_pixels)`.
+        canvas_pixels: Vec<(String, u32, u32, Vec<u8>)>,
+    },
+
+    /// Retrieve collected console output from the JS engine.
+    GetConsoleOutput {
+        /// The context ID to retrieve output from (0 = all contexts).
+        context_id: u64,
     },
 
     /// Generic capability request (for extension capabilities).
@@ -137,6 +146,11 @@ pub enum TypedData {
         value: JsValue,
         dom: Box<DomNode>,
     },
+
+    /// Console output collected from JS execution.
+    ///
+    /// Each entry is a tagged string like `"[LOG] message"`, `"[WARN] message"`, etc.
+    ConsoleOutput(Vec<String>),
 
     /// Nothing (void response).
     None,
@@ -305,6 +319,41 @@ pub enum LayoutContent {
     Text(String),
     /// An image.
     Image { src: String },
+    /// An inline SVG element, serialized back to SVG markup for rasterization.
+    InlineSvg { markup: String },
+    /// An iframe element.
+    ///
+    /// `src` is the URL to fetch, `srcdoc` is inline HTML content.
+    /// Only one of `src` or `srcdoc` should be set (srcdoc takes priority).
+    Iframe {
+        src: String,
+        srcdoc: Option<String>,
+    },
+    /// A `<video>` element.
+    Video {
+        /// The video source URL (from `src` attribute or first `<source>` child).
+        src: String,
+        /// Optional poster image URL.
+        poster: Option<String>,
+        /// Whether the `controls` attribute is present.
+        controls: bool,
+    },
+    /// An `<audio>` element.
+    Audio {
+        /// The audio source URL.
+        src: String,
+        /// Whether the `controls` attribute is present.
+        controls: bool,
+    },
+    /// A `<canvas>` element with an identifier for looking up its pixel buffer.
+    Canvas {
+        /// Identifier for this canvas (element id attribute or generated key).
+        canvas_id: String,
+        /// Canvas width in pixels.
+        canvas_width: u32,
+        /// Canvas height in pixels.
+        canvas_height: u32,
+    },
     /// A replaced element (video, canvas, etc.).
     Replaced,
 }

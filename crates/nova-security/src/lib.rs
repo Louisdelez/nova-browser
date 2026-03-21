@@ -4,6 +4,8 @@
 //! Every request from a mod passes through the security layer
 //! before being routed by the core.
 
+pub mod csp;
+
 use std::collections::{HashMap, HashSet};
 
 use tracing::{info, warn};

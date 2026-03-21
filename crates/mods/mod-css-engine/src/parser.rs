@@ -992,4 +992,54 @@ mod tests {
         assert_eq!(sheet.font_faces.len(), 2);
         assert_eq!(sheet.rules.len(), 1);
     }
+
+    // ── @supports tests ────────────────────────────────────────────────
+
+    #[test]
+    fn supports_display_flex_included() {
+        let css = r#"
+            body { color: black; }
+            @supports (display: flex) {
+                .flex-container { display: flex; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 2, "display: flex is supported, rule should be included");
+    }
+
+    #[test]
+    fn supports_unknown_property_excluded() {
+        let css = r#"
+            body { color: black; }
+            @supports (container-type: inline-size) {
+                .container { width: 100%; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 1, "unknown property should exclude the @supports block");
+    }
+
+    #[test]
+    fn supports_not_condition() {
+        let css = r#"
+            body { color: black; }
+            @supports not (container-type: inline-size) {
+                .fallback { width: auto; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 2, "not (unknown) should include the block");
+    }
+
+    #[test]
+    fn supports_and_condition() {
+        let css = r#"
+            body { color: black; }
+            @supports (display: grid) and (gap: 10px) {
+                .grid { display: grid; gap: 10px; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 2, "both properties supported, block should be included");
+    }
 }

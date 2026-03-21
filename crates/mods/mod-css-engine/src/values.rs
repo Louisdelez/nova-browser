@@ -305,7 +305,7 @@ fn tokenise_calc_ctx(expr: &str, context_px: f32) -> Option<Vec<CalcToken>> {
             "px" | "" => num,
             "%" => num / 100.0 * context_px,
             "em" | "rem" => num * 16.0,
-            "vw" => num / 100.0 * context_px,
+            "vw" | "vh" => num / 100.0 * context_px,
             "pt" => num * 1.333,
             _ => return None,
         };
@@ -1049,5 +1049,19 @@ mod tests {
         // calc(50vw - 10px) with context 1000 → 490.0
         let result = eval_calc("50vw - 10px", 1000.0);
         assert_eq!(result, Some(490.0));
+    }
+
+    #[test]
+    fn eval_calc_vh() {
+        // calc(100vh - 60px) with context 900 → 840.0
+        let result = eval_calc("100vh - 60px", 900.0);
+        assert_eq!(result, Some(840.0));
+    }
+
+    #[test]
+    fn eval_calc_mixed_percent_and_px() {
+        // calc(50% + 20px) with context 800 → 420.0
+        let result = eval_calc("50% + 20px", 800.0);
+        assert_eq!(result, Some(420.0));
     }
 }

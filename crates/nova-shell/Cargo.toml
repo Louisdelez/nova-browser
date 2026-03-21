@@ -34,3 +34,9 @@ freetype-rs = "0.37"
 rustybuzz = "0.20"
 fontconfig = "0.7"
 url = { workspace = true }
+regex = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+dirs = "6"
+woff2-patched = { workspace = true }
+woff = { workspace = true }

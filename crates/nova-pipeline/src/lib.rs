@@ -23,11 +23,11 @@ use nova_registry::CapabilityRegistry;
 
 /// Maximum number of images to fetch during a navigation.
 /// Pages with more images will have the rest skipped for faster initial display.
-const MAX_IMAGES_TO_FETCH: usize = 20;
+const MAX_IMAGES_TO_FETCH: usize = 50;
 
 /// Timeout for fetching + decoding a single image.
 /// If an image takes longer than this, it is skipped.
-const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Extract a redirect URL from `<noscript><meta http-equiv="refresh" content="...">`.
 ///
@@ -85,6 +85,101 @@ fn extract_noscript_redirect(node: &DomNode, base_url: &Option<Url>) -> Option<S
     }
 }
 
+/// Check if a DOM tree contains a visible `<input name="q">` (search box).
+fn has_search_input(node: &DomNode) -> bool {
+    match node {
+        DomNode::Element { tag, attributes, children, .. } => {
+            if tag == "input" {
+                if attributes.iter().any(|(k, v)| k == "name" && v == "q") {
+                    return true;
+                }
+            }
+            children.iter().any(|c| has_search_input(c))
+        }
+        DomNode::Document { children } => children.iter().any(|c| has_search_input(c)),
+        _ => false,
+    }
+}
+
+/// Check if a URL is a Google homepage (www.google.com, google.com, etc.).
+fn is_google_homepage(url: &str) -> bool {
+    if let Ok(parsed) = Url::parse(url) {
+        if let Some(host) = parsed.host_str() {
+            let is_google = host == "www.google.com"
+                || host == "google.com"
+                || host.ends_with(".google.com");
+            let path = parsed.path();
+            // Only inject on homepage-like paths, not on /search results.
+            let is_homepage = path == "/" || path == "/webhp" || path.is_empty();
+            return is_google && is_homepage;
+        }
+    }
+    false
+}
+
+/// Inject a Google search form into the DOM if no `<input name="q">` exists.
+///
+/// This is a fallback for when Google's noscript content doesn't include a
+/// working search form. Inserts a simple search form into the `<body>`.
+fn inject_google_search_form(node: &mut DomNode) {
+    // Find <body> and append the form.
+    match node {
+        DomNode::Element { tag, children, .. } => {
+            if tag == "body" {
+                // Build the search form as DOM nodes.
+                let form = DomNode::Element {
+                    tag: "form".into(),
+                    attributes: vec![
+                        ("action".into(), "/search".into()),
+                        ("method".into(), "GET".into()),
+                        ("style".into(), "text-align:center;margin:40px auto;max-width:600px".into()),
+                    ],
+                    children: vec![
+                        DomNode::Element {
+                            tag: "input".into(),
+                            attributes: vec![
+                                ("name".into(), "q".into()),
+                                ("type".into(), "text".into()),
+                                ("style".into(), "width:100%;padding:12px 16px;font-size:16px;border:1px solid #dfe1e5;border-radius:24px;outline:none".into()),
+                                ("placeholder".into(), "Google Search".into()),
+                            ],
+                            children: vec![],
+                        },
+                        DomNode::Element {
+                            tag: "div".into(),
+                            attributes: vec![
+                                ("style".into(), "margin-top:16px;text-align:center".into()),
+                            ],
+                            children: vec![
+                                DomNode::Element {
+                                    tag: "input".into(),
+                                    attributes: vec![
+                                        ("type".into(), "submit".into()),
+                                        ("value".into(), "Google Search".into()),
+                                        ("style".into(), "padding:8px 16px;margin:4px;background:#f8f9fa;border:1px solid #dfe1e5;border-radius:4px;font-size:14px;cursor:pointer".into()),
+                                    ],
+                                    children: vec![],
+                                },
+                            ],
+                        },
+                    ],
+                };
+                children.push(form);
+                return;
+            }
+            for child in children.iter_mut() {
+                inject_google_search_form(child);
+            }
+        }
+        DomNode::Document { children } => {
+            for child in children.iter_mut() {
+                inject_google_search_form(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Sub-resources extracted from a parsed DOM tree.
 #[derive(Debug, Default)]
 struct SubResources {
@@ -133,15 +228,32 @@ impl PipelineEngine {
         info!("Pipeline: received response, content-type = '{mime_type}'");
 
         // Step 2: Parse into DOM
-        let dom = self.parse(&response.body, &mime_type).await?;
+        let mut dom = self.parse(&response.body, &mime_type).await?;
 
         // Step 2b: Check for <noscript> meta-refresh redirects.
         // Sites like Google serve a <noscript> block with a meta refresh to a
-        // simpler HTML version when JS is limited. Follow that redirect.
+        // simpler HTML version when JS is limited.  We NO LONGER follow these
+        // redirects because our JS engine is now capable enough to render the
+        // normal page.  Instead, we un-hide <noscript> content as a fallback
+        // (see step 5b below) if JS execution fails to produce interactive
+        // elements like an <input>.
         if let TypedData::Dom(ref node) = dom {
             if let Some(redirect_url) = extract_noscript_redirect(node, &Url::parse(url).ok()) {
-                info!("Pipeline: following noscript redirect to '{redirect_url}'");
-                return Box::pin(self.navigate(&redirect_url, viewport)).await;
+                info!("Pipeline: found noscript redirect to '{redirect_url}' (NOT following — trying JS rendering first)");
+            }
+        }
+
+        // Step 2c: Google search form fallback.
+        // If this is a Google homepage and the DOM doesn't contain a search
+        // input (<input name="q">), inject a simple search form so users can
+        // search even when Google's JS-heavy page doesn't render properly.
+        if is_google_homepage(url) {
+            let needs_injection = matches!(&dom, TypedData::Dom(node) if !has_search_input(node));
+            if needs_injection {
+                info!("Pipeline: Google homepage has no search input, injecting search form");
+                if let TypedData::Dom(ref mut node) = dom {
+                    inject_google_search_form(node);
+                }
             }
         }
 
@@ -195,13 +307,49 @@ impl PipelineEngine {
             );
         }
 
-        // Step 5: Compute styles (with external stylesheets)
-        let styles = self.compute_styles_with(&dom, stylesheets.clone(), &viewport).await?;
+        // Step 5: Execute scripts WITH DOM before style computation.
+        // This lets JS mutations (createElement, appendChild, innerHTML, etc.)
+        // be reflected in the initial render — no re-render pass needed.
+        let final_dom = if let TypedData::Dom(ref node) = dom {
+            if let Some(mutated) = self.execute_scripts_with_dom(
+                node,
+                &sub_resources.scripts,
+                &sub_resources.inline_scripts,
+            ).await {
+                info!("Pipeline: JS modified DOM, using mutated DOM for rendering");
+                TypedData::Dom(mutated)
+            } else {
+                dom.clone()
+            }
+        } else {
+            dom.clone()
+        };
 
-        // Step 6: Layout
+        // Step 5b: Check if the DOM contains interactive elements.
+        // If not, un-hide <noscript> content as a fallback.  Many sites
+        // (including Google) wrap a working HTML form inside <noscript>;
+        // if our JS engine failed to create the dynamic version, showing
+        // the noscript content gives the user a usable page.
+        let final_dom = if let TypedData::Dom(ref node) = final_dom {
+            if !dom_has_interactive_element(node) {
+                info!("Pipeline: DOM lacks interactive elements after JS — un-hiding <noscript> content");
+                let mut unhidden = node.clone();
+                unhide_noscript_content(&mut unhidden);
+                TypedData::Dom(unhidden)
+            } else {
+                final_dom
+            }
+        } else {
+            final_dom
+        };
+
+        // Step 6: Compute styles on the (possibly mutated) DOM
+        let styles = self.compute_styles_with(&final_dom, stylesheets, &viewport).await?;
+
+        // Step 7: Layout
         let layout_tree = self.layout(&styles, viewport).await?;
 
-        // Step 6b: Extract background-image URLs from computed styles.
+        // Step 7b: Extract background-image URLs from computed styles.
         let mut all_images = sub_resources.images.clone();
         if let TypedData::Dom(ref styled_dom) = styles {
             let bg_images = extract_background_image_urls(styled_dom, &base_url);
@@ -231,7 +379,7 @@ impl PipelineEngine {
             all_images.truncate(MAX_IMAGES_TO_FETCH);
         }
 
-        // Step 7: Fetch and decode images (in parallel, with per-image timeout)
+        // Step 8: Fetch and decode images (in parallel, with per-image timeout)
         let images = self.fetch_and_decode_images_parallel(&all_images).await;
         info!(
             "Pipeline: decoded {}/{} images",
@@ -239,37 +387,15 @@ impl PipelineEngine {
             all_images.len()
         );
 
-        // Step 8: Paint (with decoded images)
-        let mut render_commands = self.paint_with_images(&layout_tree, images.clone()).await?;
+        // Step 9: Paint (with decoded images)
+        let mut render_commands = self.paint_with_images(&layout_tree, images).await?;
 
-        // Step 8b: Inject fetched @font-face fonts into the render commands
+        // Step 9b: Inject fetched @font-face fonts into the render commands
         // so the renderer can load and use them.
         if !custom_fonts.is_empty() {
             if let TypedData::RenderCommands(ref mut cmds) = render_commands {
-                cmds.fonts = custom_fonts.clone();
+                cmds.fonts = custom_fonts;
             }
-        }
-
-        // Step 9: Execute scripts
-        self.execute_scripts(&sub_resources.scripts, &sub_resources.inline_scripts)
-            .await;
-
-        // Re-render after JS execution: JS may have modified the DOM (added/removed
-        // elements, changed classes, modified styles). Re-run style computation,
-        // layout, and painting to reflect JS changes.
-        // For now, we only do one re-render pass. A full browser would have a
-        // mutation observer and requestAnimationFrame loop.
-        if !sub_resources.scripts.is_empty() || !sub_resources.inline_scripts.is_empty() {
-            info!("Pipeline: re-rendering after JS execution");
-            let styles2 = self.compute_styles_with(&dom, stylesheets, &viewport).await?;
-            let layout2 = self.layout(&styles2, viewport).await?;
-            let mut render2 = self.paint_with_images(&layout2, images).await?;
-            if !custom_fonts.is_empty() {
-                if let TypedData::RenderCommands(ref mut cmds) = render2 {
-                    cmds.fonts = custom_fonts;
-                }
-            }
-            render_commands = render2;
         }
 
         info!("Pipeline: navigation complete");
@@ -291,6 +417,32 @@ impl PipelineEngine {
         let render = self.paint_with_images(&layout, vec![]).await?;
         info!("Pipeline: re-render complete");
         Ok(render)
+    }
+
+    /// Navigate via POST request (for form submissions).
+    pub async fn navigate_post(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+        content_type: &str,
+        viewport: Viewport,
+    ) -> Result<TypedData, NovaError> {
+        info!(url = %url, body_len = body.len(), "Pipeline: POST navigation");
+        let request = ContentRequest::FetchWithBody {
+            url: url.to_string(),
+            method: "POST".to_string(),
+            headers: vec![("content-type".to_string(), content_type.to_string())],
+            body: Some(body.into()),
+        };
+        let response = match self.registry.route(&CapabilityType::FetchUrl("https".into()), request).await {
+            Ok(TypedData::HttpResponse(r)) => r,
+            Ok(other) => return Err(NovaError::Internal(format!("expected HttpResponse, got {other:?}"))),
+            Err(e) => return Err(e),
+        };
+        let dom = self.parse(&response.body, "text/html").await?;
+        let styles = self.compute_styles_with(&dom, vec![], &viewport).await?;
+        let layout = self.layout(&styles, viewport).await?;
+        self.paint_with_images(&layout, vec![]).await
     }
 
     /// Fetch a URL and parse it, returning the DOM tree without running
@@ -387,6 +539,7 @@ impl PipelineEngine {
         let request = ContentRequest::Paint {
             layout_tree: Box::new(layout_tree.clone()),
             images,
+            canvas_pixels: vec![],
         };
 
         self.registry.route(&cap, request).await
@@ -658,7 +811,12 @@ impl PipelineEngine {
     }
 
     /// Execute external and inline scripts via the JS mod.
-    async fn execute_scripts(&self, external_urls: &[String], inline_scripts: &[String]) {
+    /// Execute scripts without DOM access (fire-and-forget).
+    ///
+    /// Kept as a fallback for cases where DOM mutation is not needed.
+    /// The primary path is [`execute_scripts_with_dom`](Self::execute_scripts_with_dom).
+    #[allow(dead_code)]
+    async fn execute_scripts_fire_and_forget(&self, external_urls: &[String], inline_scripts: &[String]) {
         // Fetch external scripts in parallel.
         let mut scripts: Vec<String> = Vec::new();
         if !external_urls.is_empty() {
@@ -693,6 +851,73 @@ impl PipelineEngine {
                 }
             }
         }
+    }
+
+    /// Execute scripts with a live DOM tree, returning the mutated DOM.
+    ///
+    /// Each script is executed in order within a shared JS context. The DOM
+    /// returned by each script is fed into the next one so that mutations
+    /// accumulate. Returns `None` when there are no scripts to run.
+    async fn execute_scripts_with_dom(
+        &self,
+        dom: &DomNode,
+        external_urls: &[String],
+        inline_scripts: &[String],
+    ) -> Option<DomNode> {
+        if external_urls.is_empty() && inline_scripts.is_empty() {
+            return None;
+        }
+
+        // Fetch external scripts in parallel.
+        let mut scripts: Vec<String> = Vec::new();
+        if !external_urls.is_empty() {
+            let futures: Vec<_> = external_urls
+                .iter()
+                .map(|url| self.fetch_script(url))
+                .collect();
+            let results = futures::future::join_all(futures).await;
+            scripts.extend(results.into_iter().flatten());
+        }
+
+        // Append inline scripts.
+        scripts.extend(inline_scripts.iter().cloned());
+
+        // Execute all scripts with the DOM, using a shared context_id.
+        let mut current_dom = dom.clone();
+        let context_id = 1u64;
+
+        for (i, source) in scripts.iter().enumerate() {
+            if source.trim().is_empty() {
+                continue;
+            }
+            debug!(script_index = i, len = source.len(), "executing script with DOM");
+            let request = ContentRequest::ExecScriptWithDom {
+                source: source.clone(),
+                dom: Box::new(current_dom.clone()),
+                context_id: Some(context_id),
+            };
+            match self
+                .registry
+                .route(&CapabilityType::ExecJavaScript, request)
+                .await
+            {
+                Ok(TypedData::JsResultWithDom { dom, .. }) => {
+                    debug!(script_index = i, "script mutated DOM");
+                    current_dom = *dom;
+                }
+                Ok(TypedData::JsResult(_)) => {
+                    debug!(script_index = i, "script did not return DOM, keeping current");
+                }
+                Ok(other) => {
+                    debug!(script_index = i, result = ?other, "unexpected result type");
+                }
+                Err(e) => {
+                    warn!(script_index = i, error = %e, "script execution failed");
+                }
+            }
+        }
+
+        Some(current_dom)
     }
 
     /// Fetch a single external script, returning None on failure.
@@ -795,6 +1020,77 @@ fn parse_css_import(line: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Check if a DOM tree contains an interactive element (`<input>`, `<textarea>`,
+/// `<select>`, or `<button>`).  Used to decide whether to un-hide `<noscript>`
+/// content as a fallback when JS fails to create the expected dynamic UI.
+fn dom_has_interactive_element(node: &DomNode) -> bool {
+    match node {
+        DomNode::Element { tag, children, .. } => {
+            let t = tag.to_lowercase();
+            if t == "input" || t == "textarea" || t == "select" || t == "button" {
+                return true;
+            }
+            // Skip noscript children — those are the fallback content.
+            if t == "noscript" {
+                return false;
+            }
+            children.iter().any(dom_has_interactive_element)
+        }
+        DomNode::Document { children } => children.iter().any(dom_has_interactive_element),
+        _ => false,
+    }
+}
+
+/// Replace `<noscript>` elements with their children so the content becomes
+/// visible.  This is used as a fallback when JS execution fails to produce
+/// interactive elements.
+///
+/// The function replaces each `<noscript>` tag with a `<div>` tag, keeping
+/// the original children intact.  A `<noscript>` meta-refresh redirect is
+/// removed (its children are dropped) to avoid rendering the redirect URL
+/// as visible text.
+fn unhide_noscript_content(node: &mut DomNode) {
+    match node {
+        DomNode::Element { tag, children, attributes } => {
+            if tag.eq_ignore_ascii_case("noscript") {
+                // Check if this noscript contains a meta-refresh redirect.
+                let has_meta_refresh = children.iter().any(|child| {
+                    if let DomNode::Element { tag: t, attributes: attrs, .. } = child {
+                        t.eq_ignore_ascii_case("meta")
+                            && attrs.iter().any(|(k, v)| {
+                                k.eq_ignore_ascii_case("http-equiv")
+                                    && v.eq_ignore_ascii_case("refresh")
+                            })
+                    } else {
+                        false
+                    }
+                });
+
+                if has_meta_refresh {
+                    // Remove the redirect — don't show it as visible content.
+                    *tag = "div".to_string();
+                    children.clear();
+                    attributes.clear();
+                } else {
+                    // Convert noscript to a visible div, keeping children.
+                    *tag = "div".to_string();
+                    attributes.clear();
+                }
+            }
+            // Recurse.
+            for child in children.iter_mut() {
+                unhide_noscript_content(child);
+            }
+        }
+        DomNode::Document { children } => {
+            for child in children.iter_mut() {
+                unhide_noscript_content(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Walk a DOM tree and extract sub-resource URLs (stylesheets, images, scripts).
@@ -1245,6 +1541,121 @@ mod tests {
     fn image_cap_constant() {
         // Sanity check: the cap should be a reasonable number.
         assert!(MAX_IMAGES_TO_FETCH > 0);
-        assert!(MAX_IMAGES_TO_FETCH <= 50);
+        assert!(MAX_IMAGES_TO_FETCH <= 100);
+    }
+
+    #[test]
+    fn dom_has_interactive_element_finds_input() {
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "body".into(),
+                attributes: vec![],
+                children: vec![DomNode::Element {
+                    tag: "input".into(),
+                    attributes: vec![("type".into(), "text".into())],
+                    children: vec![],
+                }],
+            }],
+        };
+        assert!(dom_has_interactive_element(&dom));
+    }
+
+    #[test]
+    fn dom_has_interactive_element_ignores_noscript_input() {
+        // An <input> inside <noscript> should not count as an interactive
+        // element — it's the fallback content.
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "body".into(),
+                attributes: vec![],
+                children: vec![DomNode::Element {
+                    tag: "noscript".into(),
+                    attributes: vec![],
+                    children: vec![DomNode::Element {
+                        tag: "input".into(),
+                        attributes: vec![],
+                        children: vec![],
+                    }],
+                }],
+            }],
+        };
+        assert!(!dom_has_interactive_element(&dom));
+    }
+
+    #[test]
+    fn dom_has_interactive_element_empty() {
+        let dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "body".into(),
+                attributes: vec![],
+                children: vec![DomNode::Text("Hello".into())],
+            }],
+        };
+        assert!(!dom_has_interactive_element(&dom));
+    }
+
+    #[test]
+    fn unhide_noscript_converts_to_div() {
+        let mut dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "noscript".into(),
+                attributes: vec![],
+                children: vec![DomNode::Element {
+                    tag: "form".into(),
+                    attributes: vec![],
+                    children: vec![DomNode::Element {
+                        tag: "input".into(),
+                        attributes: vec![],
+                        children: vec![],
+                    }],
+                }],
+            }],
+        };
+        unhide_noscript_content(&mut dom);
+        // The <noscript> should now be a <div>.
+        match &dom {
+            DomNode::Document { children } => {
+                match &children[0] {
+                    DomNode::Element { tag, children: inner, .. } => {
+                        assert_eq!(tag, "div");
+                        assert_eq!(inner.len(), 1); // <form> preserved
+                    }
+                    _ => panic!("expected element"),
+                }
+            }
+            _ => panic!("expected document"),
+        }
+    }
+
+    #[test]
+    fn unhide_noscript_removes_meta_refresh() {
+        let mut dom = DomNode::Document {
+            children: vec![DomNode::Element {
+                tag: "noscript".into(),
+                attributes: vec![],
+                children: vec![DomNode::Element {
+                    tag: "meta".into(),
+                    attributes: vec![
+                        ("http-equiv".into(), "refresh".into()),
+                        ("content".into(), "0;url=https://example.com".into()),
+                    ],
+                    children: vec![],
+                }],
+            }],
+        };
+        unhide_noscript_content(&mut dom);
+        // The meta-refresh noscript should be converted to an empty div.
+        match &dom {
+            DomNode::Document { children } => {
+                match &children[0] {
+                    DomNode::Element { tag, children: inner, .. } => {
+                        assert_eq!(tag, "div");
+                        assert!(inner.is_empty(), "meta-refresh noscript should have no children");
+                    }
+                    _ => panic!("expected element"),
+                }
+            }
+            _ => panic!("expected document"),
+        }
     }
 }

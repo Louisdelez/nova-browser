@@ -42,6 +42,7 @@ use nova_mod_api::{
     CoreApi, NovaMod,
 };
 
+pub mod canvas;
 pub mod dom_api;
 pub mod dom_bridge;
 pub mod event_system;
@@ -50,6 +51,10 @@ pub mod quickjs_runtime;
 pub mod shadow_dom;
 pub mod storage;
 pub mod timers;
+pub mod service_worker;
+pub mod web_apis;
+pub mod websocket;
+pub mod xhr;
 
 use dom_api::{JsDomTree, eval_script_with_core, eval_script_with_env_and_core};
 use quickjs_runtime::QuickJsRuntime;
@@ -309,6 +314,27 @@ impl NovaMod for JsMod {
                     value: last,
                     dom: Box::new(mutated_dom),
                 })
+            }
+
+            // ── Retrieve collected console output ─────────────────────────
+            ContentRequest::GetConsoleOutput { context_id } => {
+                let ctxs = self.contexts.lock().unwrap();
+                let mut all_output = Vec::new();
+
+                if context_id == 0 {
+                    // Collect from all contexts.
+                    for ctx in ctxs.values() {
+                        if let Some(ref qjs) = ctx.quickjs {
+                            all_output.extend(qjs.console_output());
+                        }
+                    }
+                } else if let Some(ctx) = ctxs.get(&context_id) {
+                    if let Some(ref qjs) = ctx.quickjs {
+                        all_output = qjs.console_output();
+                    }
+                }
+
+                Ok(TypedData::ConsoleOutput(all_output))
             }
 
             other => Err(NovaError::UnsupportedContent(format!(

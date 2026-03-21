@@ -109,6 +109,8 @@ pub enum PseudoClass {
     Focus,
     /// `:active` — matches when the element is being activated (e.g. mouse down).
     Active,
+    /// `:host` — matches the shadow host element from within a shadow tree.
+    Host,
 }
 
 /// CSS pseudo-element (e.g. `::before`, `::after`).
@@ -283,11 +285,18 @@ impl Selector {
         }
 
         // Detect and strip pseudo-element suffixes (::before, ::after).
+        // Also handle single-colon legacy syntax (:before, :after).
         let mut pseudo_element = None;
         let selector_str = if let Some(base) = input.strip_suffix("::before") {
             pseudo_element = Some(PseudoElement::Before);
             base
         } else if let Some(base) = input.strip_suffix("::after") {
+            pseudo_element = Some(PseudoElement::After);
+            base
+        } else if let Some(base) = input.strip_suffix(":before") {
+            pseudo_element = Some(PseudoElement::Before);
+            base
+        } else if let Some(base) = input.strip_suffix(":after") {
             pseudo_element = Some(PseudoElement::After);
             base
         } else {
@@ -728,6 +737,9 @@ impl CompoundSelector {
                         "active" => {
                             sel.pseudos.push(PseudoClass::Active);
                         }
+                        "host" => {
+                            sel.pseudos.push(PseudoClass::Host);
+                        }
                         "link" | "visited" => {
                             // Treat :link and :visited as always matching for <a> elements.
                             // This is a simplification — we don't track visited links.
@@ -877,6 +889,17 @@ impl CompoundSelector {
                     // Interactive pseudo-classes require interaction state.
                     // Without state, they don't match (safe default).
                     return false;
+                }
+                PseudoClass::Host => {
+                    // :host matches elements that have a `data-nova-shadow-host`
+                    // attribute (i.e. they are shadow host elements).
+                    if let DomNode::Element { attributes, .. } = node {
+                        if !attributes.iter().any(|(k, _)| k == "data-nova-shadow-host") {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
                 }
                 PseudoClass::Not(inner_list) => {
                     // :not() matches if NONE of the inner selectors match.

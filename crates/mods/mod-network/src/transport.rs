@@ -74,6 +74,7 @@ pub async fn connect(host: &str, port: u16, use_tls: bool) -> Result<Transport, 
             .with_no_client_auth();
 
         // Configure ALPN protocols: prefer http/1.1 (h2 framing not yet implemented).
+        // Once full HTTP/2 frame support is added, h2 can be advertised first.
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
         let connector = TlsConnector::from(Arc::new(config));

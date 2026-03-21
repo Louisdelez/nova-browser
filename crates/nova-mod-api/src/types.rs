@@ -128,6 +128,16 @@ pub enum RenderOp {
     Save,
     /// Restore the previous transform state.
     Restore,
+    /// Apply a 2D affine transform.
+    ///
+    /// The matrix is stored as `[a, b, c, d, e, f]` representing:
+    /// ```text
+    /// | a c e |
+    /// | b d f |
+    /// | 0 0 1 |
+    /// ```
+    /// This supports translate, rotate, scale, skew, and arbitrary 2D transforms.
+    Transform { matrix: [f32; 6] },
     /// Mark the start of a sticky-positioned element.
     ///
     /// The renderer should clamp the element's y position so it stays visible
@@ -150,7 +160,8 @@ pub enum RenderOp {
         height: f32,
         /// The current value/text of the field.
         value: String,
-        /// The type of form element ("text", "password", "textarea", "select", "checkbox", "radio").
+        /// The type of form element ("text", "password", "textarea", "select", "checkbox", "radio",
+        /// "email", "number", "date", "file", "hidden", "submit", "button", "reset").
         field_type: String,
         /// The `name` attribute of the form field (used for form submission).
         name: String,
@@ -160,6 +171,24 @@ pub enum RenderOp {
         form_method: String,
         /// The `enctype` of the parent `<form>` element (defaults to "application/x-www-form-urlencoded").
         form_enctype: String,
+        /// The placeholder text for the field.
+        placeholder: String,
+        /// Whether the field is checked (for checkbox/radio).
+        checked: bool,
+        /// Whether the field is required (HTML5 validation).
+        required: bool,
+        /// Options for `<select>` elements: `(value, display_text, selected)`.
+        options: Vec<(String, String, bool)>,
+        /// Validation pattern (regex) from the `pattern` attribute.
+        pattern: String,
+        /// Minimum value for number inputs.
+        min: String,
+        /// Maximum value for number inputs.
+        max: String,
+        /// Maximum character length.
+        maxlength: Option<usize>,
+        /// Minimum character length.
+        minlength: Option<usize>,
     },
     /// A clickable link region (does not render anything visible).
     ///
@@ -206,6 +235,14 @@ pub enum RenderOp {
     },
     /// Pop the current opacity layer, restoring the previous opacity.
     PopOpacity,
+    /// Mark the start of a fixed-position element.
+    ///
+    /// The renderer should ignore scroll offsets for all ops between
+    /// `FixedStart` and `FixedEnd`, painting them at their absolute
+    /// viewport position regardless of scrolling.
+    FixedStart,
+    /// End of a fixed-position element region.
+    FixedEnd,
 }
 
 /// RGBA color.

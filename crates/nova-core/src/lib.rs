@@ -121,6 +121,19 @@ impl NovaCore {
         self.pipeline.navigate(url, viewport).await
     }
 
+    /// Navigate using POST method with a request body.
+    ///
+    /// Used for `<form method="POST">` submissions.
+    pub async fn navigate_post(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+        content_type: &str,
+        viewport: Viewport,
+    ) -> Result<TypedData, NovaError> {
+        self.pipeline.navigate_post(url, body, content_type, viewport).await
+    }
+
     /// Fetch a URL and parse it into a DOM tree (without running the full pipeline).
     ///
     /// This is useful for inspecting the intermediate DOM representation

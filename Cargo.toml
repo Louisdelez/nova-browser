@@ -57,6 +57,10 @@ cssparser = "0.34"
 # Layout
 taffy = "0.7"
 
+# Font decompression
+woff2-patched = "0.4"
+woff = "0.6"
+
 # Internal crates
 nova-mod-api = { path = "crates/nova-mod-api" }
 nova-core = { path = "crates/nova-core" }

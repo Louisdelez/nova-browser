@@ -29,6 +29,16 @@ const MAX_IMAGES_TO_FETCH: usize = 50;
 /// If an image takes longer than this, it is skipped.
 const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Timeout for fetching a single @font-face font file.
+/// Fonts that take longer than this are skipped — the renderer will
+/// fall back to system fonts.
+const FONT_FETCH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Maximum number of external scripts to fetch and execute.
+/// Pages with many external scripts are capped to avoid long JS execution
+/// blocking the initial render.
+const MAX_EXTERNAL_SCRIPTS: usize = 5;
+
 /// Extract a redirect URL from `<noscript><meta http-equiv="refresh" content="...">`.
 ///
 /// Many sites (Google, etc.) include a `<noscript>` block with a meta refresh
@@ -635,17 +645,41 @@ impl PipelineEngine {
 
         let futures: Vec<_> = font_urls
             .iter()
-            .map(|ff| self.fetch_font(&ff.family, &ff.url))
+            .map(|ff| {
+                let family = ff.family.clone();
+                let url = ff.url.clone();
+                async move {
+                    match tokio::time::timeout(
+                        FONT_FETCH_TIMEOUT,
+                        self.fetch_font(&family, &url),
+                    ).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            warn!(
+                                family = %family,
+                                url = %url,
+                                timeout_secs = FONT_FETCH_TIMEOUT.as_secs(),
+                                "font fetch timed out, skipping"
+                            );
+                            None
+                        }
+                    }
+                }
+            })
             .collect();
         let results = futures::future::join_all(futures).await;
 
         results.into_iter().flatten().collect()
     }
 
-    /// Fetch a single font file, returning `None` on failure or unsupported format.
+    /// Fetch a single font file, returning `None` on failure, unsupported format,
+    /// or timeout.
     ///
     /// Supports `.ttf`, `.otf`, `.woff`, and `.woff2`. WOFF/WOFF2 files are
     /// decompressed to raw TTF/OTF bytes after fetching.
+    ///
+    /// Each font fetch is capped at [`FONT_FETCH_TIMEOUT`] to prevent slow
+    /// fonts from blocking the entire page render.
     async fn fetch_font(&self, family: &str, url: &str) -> Option<(String, Vec<u8>)> {
         // Determine the format from the URL extension.
         let path = url.split('?').next().unwrap_or(url);
@@ -868,10 +902,18 @@ impl PipelineEngine {
             return None;
         }
 
-        // Fetch external scripts in parallel.
+        // Fetch external scripts in parallel, capped to MAX_EXTERNAL_SCRIPTS.
         let mut scripts: Vec<String> = Vec::new();
         if !external_urls.is_empty() {
-            let futures: Vec<_> = external_urls
+            let capped_urls: Vec<_> = external_urls.iter().take(MAX_EXTERNAL_SCRIPTS).collect();
+            if external_urls.len() > MAX_EXTERNAL_SCRIPTS {
+                info!(
+                    total = external_urls.len(),
+                    fetched = MAX_EXTERNAL_SCRIPTS,
+                    "capping external scripts for faster initial render"
+                );
+            }
+            let futures: Vec<_> = capped_urls
                 .iter()
                 .map(|url| self.fetch_script(url))
                 .collect();

@@ -368,7 +368,7 @@ fn compute_layout(dom: &DomNode, viewport: &Viewport) -> Result<LayoutBox, NovaE
     let mut taffy = TaffyTree::<NodeContext>::new();
 
     // Build the Taffy tree, returning the root node id.
-    let root_id = add_node(&mut taffy, dom, viewport.width, DEFAULT_FONT_SIZE, &[], viewport)?;
+    let root_id = add_node(&mut taffy, dom, viewport.width, DEFAULT_FONT_SIZE, &[], viewport, 0)?;
 
     // Compute layout at the viewport size.
     taffy
@@ -443,6 +443,11 @@ fn compute_child_available_width(available_width: f32, lp: &LayoutProps) -> f32 
 /// `parent_style_props` carries inheritable style properties (color,
 /// background-color, text-decoration) from the parent element so text nodes
 /// can inherit them.
+/// Maximum DOM depth for layout computation.
+///
+/// Prevents stack overflow and excessive computation on deeply nested DOMs.
+const MAX_LAYOUT_DEPTH: usize = 100;
+
 fn add_node(
     taffy: &mut TaffyTree<NodeContext>,
     node: &DomNode,
@@ -450,13 +455,30 @@ fn add_node(
     parent_font_size: f32,
     parent_style_props: &[(String, StyleValue)],
     viewport: &Viewport,
+    depth: usize,
 ) -> Result<NodeId, NovaError> {
+    // Depth limit: stop recursing beyond MAX_LAYOUT_DEPTH.
+    if depth >= MAX_LAYOUT_DEPTH {
+        let style = Style::DEFAULT;
+        let ctx = NodeContext {
+            content: LayoutContent::Block,
+            style: StyleMap::default(),
+        };
+        return taffy
+            .new_leaf(style)
+            .map(|id| {
+                taffy.set_node_context(id, Some(ctx)).ok();
+                id
+            })
+            .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+    }
+
     match node {
         DomNode::Document { children } => {
             // The document root is a block container spanning the full width.
             let child_ids = children
                 .iter()
-                .map(|c| add_node(taffy, c, available_width, DEFAULT_FONT_SIZE, &[], viewport))
+                .map(|c| add_node(taffy, c, available_width, DEFAULT_FONT_SIZE, &[], viewport, depth + 1))
                 .collect::<Result<Vec<_>, _>>()?;
 
             let style = Style {
@@ -572,7 +594,20 @@ fn add_node(
                 } else {
                     let text_w = if label.is_empty() { 0.0 } else { measure_text_width(&label, font_size) };
                     let pad = 12.0; // horizontal padding
-                    let default_w = lp.width.and_then(|d| match d { Dimension::Length(px) => Some(px), _ => None }).unwrap_or((text_w + pad).max(if tag == "input" { 150.0 } else { 40.0 }));
+                    // Check for HTML `size` attribute on <input> — it specifies
+                    // width in average character widths (approx 0.6 * font_size).
+                    let size_attr_w: Option<f32> = if tag == "input" {
+                        attributes.iter()
+                            .find(|(k, _)| k == "size")
+                            .and_then(|(_, v)| v.parse::<f32>().ok())
+                            .map(|chars| chars * font_size * 0.6)
+                    } else {
+                        None
+                    };
+                    let default_w = lp.width
+                        .and_then(|d| match d { Dimension::Length(px) => Some(px), _ => None })
+                        .or(size_attr_w)
+                        .unwrap_or((text_w + pad).max(if tag == "input" { 150.0 } else { 40.0 }));
                     (default_w, line_height + 6.0)
                 };
 
@@ -600,7 +635,15 @@ fn add_node(
                     }
                 }
 
-                let taffy_style = build_taffy_style(&display, tag, attributes, viewport);
+                let mut taffy_style = build_taffy_style(&display, tag, attributes, viewport);
+                // Override taffy dimensions with the computed form field size.
+                // `build_taffy_style` may leave width/height as Auto for inline
+                // elements, which collapses to zero when there are no children.
+                // Form fields need explicit dimensions to be visible.
+                if taffy_style.display != Display::None {
+                    taffy_style.size.width = Dimension::Length(w);
+                    taffy_style.size.height = Dimension::Length(h);
+                }
 
                 // Create a text child for the label if non-empty.
                 let mut child_ids = Vec::new();
@@ -633,6 +676,14 @@ fn add_node(
                 };
                 props.push(("nova-form-type".into(), StyleValue::Str(form_type)));
                 props.push(("nova-form-value".into(), StyleValue::Str(label.clone())));
+
+                // Forward form-related HTML attributes so the painter can use them.
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "name") {
+                    props.push(("nova-form-name".into(), StyleValue::Str(v.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "placeholder") {
+                    props.push(("nova-form-placeholder".into(), StyleValue::Str(v.clone())));
+                }
 
                 let ctx = NodeContext {
                     content: LayoutContent::Block,
@@ -916,6 +967,31 @@ fn add_node(
                 }
             }
 
+            // For <li> elements, inherit list-style-type and nova-list-index
+            // from parent_style_props (injected by build_children_with_ifc).
+            if tag == "li" {
+                for (k, v) in parent_style_props {
+                    if (k == "list-style-type" || k == "nova-list-index")
+                        && !props.iter().any(|(pk, _)| pk == k)
+                    {
+                        props.push((k.clone(), v.clone()));
+                    }
+                }
+            }
+
+            // Propagate list-style-type from parent <ul>/<ol> to <li> children,
+            // and assign nova-list-index for ordered list numbering.
+            if tag == "ul" || tag == "ol" {
+                let list_style = props.iter()
+                    .find(|(k, _)| k == "list-style-type")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| StyleValue::Keyword(
+                        if tag == "ol" { "decimal".into() } else { "disc".into() }
+                    ));
+                // Store the list style on the parent props so children can inherit it.
+                props.push(("nova-list-style".into(), list_style));
+            }
+
             // ── Compute child available width ─────────────────────
             // The effective width for children accounts for explicit
             // width / max-width / padding on this element.
@@ -927,7 +1003,7 @@ fn add_node(
             if tag == "table" || display == "table" {
                 return layout_table(
                     taffy, tag, attributes, children, available_width,
-                    font_size, &props, viewport,
+                    font_size, &props, viewport, depth,
                 );
             }
 
@@ -949,21 +1025,93 @@ fn add_node(
             // inline children into inline formatting contexts so they
             // flow together, wrap across lines, and share baselines.
             let child_ids = if display == "block" || display == "table-cell" {
-                build_children_with_ifc(taffy, children, child_available, font_size, &props, viewport)?
+                build_children_with_ifc(taffy, children, child_available, font_size, &props, viewport, depth)?
             } else {
                 children
                     .iter()
-                    .map(|c| add_node(taffy, c, child_available, font_size, &props, viewport))
+                    .map(|c| add_node(taffy, c, child_available, font_size, &props, viewport, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?
             };
             let mut taffy_style = build_taffy_style(&display, tag, attributes, viewport);
+
+            // ── Multi-column layout (column-count) ──────────────────
+            // When column-count is set, distribute children across N columns.
+            let column_count = props.iter()
+                .find(|(k, _)| k == "column-count")
+                .and_then(|(_, v)| match v {
+                    StyleValue::Number(n) => Some(*n as u32),
+                    StyleValue::Px(n) => Some(*n as u32),
+                    StyleValue::Keyword(k) | StyleValue::Str(k) => k.parse::<u32>().ok(),
+                    _ => None,
+                })
+                .filter(|&n| n >= 2);
+
+            let child_ids = if let Some(num_cols) = column_count {
+                let column_gap = props.iter()
+                    .find(|(k, _)| k == "column-gap")
+                    .and_then(|(_, v)| match v {
+                        StyleValue::Px(px) => Some(*px),
+                        StyleValue::Keyword(k) | StyleValue::Str(k) => {
+                            k.strip_suffix("px").and_then(|s| s.parse::<f32>().ok())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(16.0); // default column gap
+
+                let total_gap = column_gap * (num_cols - 1) as f32;
+                let col_width = (child_available - total_gap) / num_cols as f32;
+                let col_pct = col_width / child_available;
+
+                // Distribute children roughly evenly across columns.
+                let per_col = (child_ids.len() + num_cols as usize - 1) / num_cols as usize;
+                let mut column_node_ids = Vec::new();
+                for col_idx in 0..num_cols as usize {
+                    let start = col_idx * per_col;
+                    if start >= child_ids.len() { break; }
+                    let end = (start + per_col).min(child_ids.len());
+                    let col_children: Vec<NodeId> = child_ids[start..end].to_vec();
+
+                    let col_style = Style {
+                        display: Display::Flex,
+                        flex_direction: FlexDirection::Column,
+                        size: Size {
+                            width: Dimension::Percent(col_pct),
+                            height: Dimension::Auto,
+                        },
+                        ..Style::DEFAULT
+                    };
+                    let col_ctx = NodeContext {
+                        content: LayoutContent::Block,
+                        style: StyleMap::default(),
+                    };
+                    let col_id = taffy
+                        .new_with_children(col_style, &col_children)
+                        .map(|id| {
+                            taffy.set_node_context(id, Some(col_ctx)).ok();
+                            id
+                        })
+                        .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
+                    column_node_ids.push(col_id);
+                }
+
+                // Switch the parent to a row layout to hold columns.
+                taffy_style.flex_direction = FlexDirection::Row;
+                taffy_style.gap = Size {
+                    width: LengthPercentage::Length(column_gap),
+                    height: LengthPercentage::Length(0.0),
+                };
+
+                column_node_ids
+            } else {
+                child_ids
+            };
 
             // ── Float container adjustment ───────────────────────────
             // When a block container has floated children, switch to
             // row-wrap layout so floated elements flow side-by-side
             // with non-floated content (which uses flex-basis: 100%
             // to force line breaks where needed).
-            if has_floated_children && display == "block" {
+            if has_floated_children && display == "block" && column_count.is_none() {
                 taffy_style.flex_direction = FlexDirection::Row;
                 taffy_style.flex_wrap = FlexWrap::Wrap;
             }
@@ -1236,8 +1384,12 @@ fn build_children_with_ifc(
     parent_font_size: f32,
     parent_style_props: &[(String, StyleValue)],
     viewport: &Viewport,
+    depth: usize,
 ) -> Result<Vec<NodeId>, NovaError> {
     let mut result = Vec::new();
+
+    // Track list item index for <li> children inside <ul>/<ol>.
+    let mut li_counter = 0i32;
 
     // Partition children into inline runs and block items.
     let mut i = 0;
@@ -1281,8 +1433,28 @@ fn build_children_with_ifc(
                 }
             }
 
+            // Track <li> index for list markers.
+            if let DomNode::Element { tag, .. } = &children[i] {
+                if tag == "li" {
+                    li_counter += 1;
+                }
+            }
+
+            // For <li> elements, inject list-style-type and index from parent.
+            let effective_props: Vec<(String, StyleValue)>;
+            let child_parent_props = if let DomNode::Element { tag, .. } = &children[i] {
+                if tag == "li" {
+                    effective_props = inject_list_item_props(parent_style_props, li_counter);
+                    &effective_props[..]
+                } else {
+                    parent_style_props
+                }
+            } else {
+                parent_style_props
+            };
+
             // Block child — process normally, with margin collapsing.
-            let node_id = add_node(taffy, &children[i], available_width, parent_font_size, parent_style_props, viewport)?;
+            let node_id = add_node(taffy, &children[i], available_width, parent_font_size, child_parent_props, viewport, depth + 1)?;
 
             // Margin collapsing: if the previous child was also a block,
             // reduce the current child's top margin to simulate CSS margin collapse.
@@ -1298,6 +1470,25 @@ fn build_children_with_ifc(
     }
 
     Ok(result)
+}
+
+/// Inject list-style-type and nova-list-index into parent style props for `<li>` elements.
+///
+/// Copies the parent props and adds the list marker properties so the painter
+/// can render the appropriate bullet or number.
+fn inject_list_item_props(parent_style_props: &[(String, StyleValue)], li_index: i32) -> Vec<(String, StyleValue)> {
+    let mut props = parent_style_props.to_vec();
+
+    // Get list-style-type from parent (nova-list-style or list-style-type).
+    let list_style = parent_style_props.iter()
+        .find(|(k, _)| k == "nova-list-style" || k == "list-style-type")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| StyleValue::Keyword("disc".into()));
+
+    props.push(("list-style-type".into(), list_style));
+    props.push(("nova-list-index".into(), StyleValue::Number(li_index as f32)));
+
+    props
 }
 
 /// Collapse vertical margins between adjacent block children.
@@ -1613,14 +1804,35 @@ fn layout_inline_run(
         .unwrap_or("normal");
     let no_wrap = white_space == "nowrap" || white_space == "pre";
 
+    // Check word-break and overflow-wrap properties for mid-word breaking.
+    let word_break = parent_style_props.iter()
+        .find(|(k, _)| k == "word-break")
+        .and_then(|(_, v)| match v {
+            StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.as_str()),
+            _ => None,
+        })
+        .unwrap_or("normal");
+    let overflow_wrap = parent_style_props.iter()
+        .find(|(k, _)| k == "overflow-wrap")
+        .and_then(|(_, v)| match v {
+            StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.as_str()),
+            _ => None,
+        })
+        .unwrap_or("normal");
+    let break_all = word_break == "break-all";
+    let break_word = overflow_wrap == "break-word" || overflow_wrap == "anywhere";
+
     // 2. Break items into lines.
     let mut lines: Vec<Vec<&InlineItem>> = Vec::new();
     let mut current_line: Vec<&InlineItem> = Vec::new();
     let mut current_width: f32 = 0.0;
 
+    // Extra items created by mid-word breaking (need to live as long as the loop).
+    let mut extra_items: Vec<InlineItem> = Vec::new();
+
     for item in &items {
         match item {
-            InlineItem::Word { text, width, .. } => {
+            InlineItem::Word { text, width, style } => {
                 if text == "\n" {
                     // Forced line break (<br>).
                     lines.push(std::mem::take(&mut current_line));
@@ -1630,6 +1842,65 @@ fn layout_inline_run(
                 // Check if this word fits on the current line.
                 // When white-space: nowrap, never wrap to a new line.
                 if !no_wrap && current_width + *width > available_width && current_width > 0.0 {
+                    // Word doesn't fit. Check if we should break mid-word.
+                    if (break_all || break_word) && *width > 0.0 {
+                        // Break the word character by character.
+                        let fs = style.iter()
+                            .find(|(k, _)| k == "font-size")
+                            .and_then(|(_, v)| if let StyleValue::Px(px) = v { Some(*px) } else { None })
+                            .unwrap_or(parent_font_size);
+
+                        let mut remaining_text = text.as_str();
+                        while !remaining_text.is_empty() {
+                            // Find how many chars fit on the current line.
+                            let mut fit_end = 0;
+                            let mut fit_width = 0.0;
+                            for (i, ch) in remaining_text.char_indices() {
+                                let ch_w = measure_text_width(&remaining_text[i..i + ch.len_utf8()], fs);
+                                if current_width + fit_width + ch_w > available_width && fit_end > 0 {
+                                    break;
+                                }
+                                fit_end = i + ch.len_utf8();
+                                fit_width += ch_w;
+                            }
+                            if fit_end == 0 && current_width > 0.0 {
+                                // Nothing fits, start a new line.
+                                if let Some(InlineItem::Space { .. }) = current_line.last() {
+                                    current_line.pop();
+                                }
+                                lines.push(std::mem::take(&mut current_line));
+                                current_width = 0.0;
+                                continue;
+                            }
+                            if fit_end == 0 {
+                                fit_end = remaining_text.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                            }
+                            let chunk = &remaining_text[..fit_end];
+                            let chunk_w = measure_text_width(chunk, fs);
+                            let idx = extra_items.len();
+                            extra_items.push(InlineItem::Word {
+                                text: chunk.to_string(),
+                                width: chunk_w,
+                                style: style.clone(),
+                            });
+                            // SAFETY: we push to extra_items and never remove, so the reference
+                            // is valid for the rest of the loop. We use index-based access.
+                            let item_ref: *const InlineItem = &extra_items[idx];
+                            current_line.push(unsafe { &*item_ref });
+                            current_width += chunk_w;
+
+                            remaining_text = &remaining_text[fit_end..];
+                            if !remaining_text.is_empty() {
+                                if let Some(InlineItem::Space { .. }) = current_line.last() {
+                                    current_line.pop();
+                                }
+                                lines.push(std::mem::take(&mut current_line));
+                                current_width = 0.0;
+                            }
+                        }
+                        continue;
+                    }
+
                     // Wrap to new line.
                     // Remove trailing space from current line.
                     if let Some(InlineItem::Space { .. }) = current_line.last() {
@@ -2064,6 +2335,7 @@ fn layout_table(
     parent_font_size: f32,
     parent_style_props: &[(String, StyleValue)],
     viewport: &Viewport,
+    depth: usize,
 ) -> Result<NodeId, NovaError> {
     let cellpadding: f32 = table_attrs
         .iter()
@@ -2416,6 +2688,7 @@ fn layout_table(
                     font_size,
                     &cell_props,
                     viewport,
+                    depth + 1,
                 )?;
 
                 // Map valign to Taffy justify_content (since cells are Column direction).

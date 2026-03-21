@@ -403,6 +403,19 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         return;
     }
 
+    // visibility: hidden — element takes up space but is invisible.
+    // We still recurse into children because a child may have visibility: visible.
+    let is_hidden = is_visibility_hidden(&layout_box.style);
+    if is_hidden {
+        // Still paint children (they may override visibility).
+        let mut child_indices: Vec<usize> = (0..layout_box.children.len()).collect();
+        child_indices.sort_by_key(|&i| layout_box.children[i].z_index);
+        for i in child_indices {
+            paint_box(&layout_box.children[i], ops, images, canvas_map);
+        }
+        return;
+    }
+
     // Check for position: sticky and emit StickyStart/StickyEnd.
     let is_sticky = is_position_sticky(&layout_box.style);
     if is_sticky {
@@ -452,10 +465,40 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     }
 
     // Determine opacity factor for this box (1.0 = fully opaque).
-    let opacity = extract_opacity(&layout_box.style);
+    let mut opacity = extract_opacity(&layout_box.style);
+
+    // CSS filter: extract opacity() and drop-shadow() as approximations.
+    let filter_shadow = extract_filter_effects(&layout_box.style, &mut opacity);
+
     let has_opacity = opacity < 1.0;
     if has_opacity {
         ops.push(RenderOp::PushOpacity { opacity });
+    }
+
+    // CSS clip-path: inset() — clip the element to inset bounds.
+    let clip_inset = extract_clip_path_inset(&layout_box.style, layout_box.width, layout_box.height);
+    if let Some((cx, cy, cw, ch)) = clip_inset {
+        ops.push(RenderOp::PushClip {
+            x: layout_box.x + cx,
+            y: layout_box.y + cy,
+            width: cw,
+            height: ch,
+        });
+    }
+
+    // Emit filter drop-shadow if present (before box-shadow).
+    if let Some((shadow_color, offset_x, offset_y, blur)) = &filter_shadow {
+        let shadow_color = multiply_alpha(*shadow_color, opacity);
+        ops.push(RenderOp::BoxShadow {
+            x: layout_box.x,
+            y: layout_box.y,
+            width: layout_box.width,
+            height: layout_box.height,
+            color: shadow_color,
+            offset_x: *offset_x,
+            offset_y: *offset_y,
+            blur: *blur,
+        });
     }
 
     // Emit box-shadow before the background (painter's order: shadow → bg → content).
@@ -611,11 +654,31 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                 let img_width = u32::from_le_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]);
                 let img_height = u32::from_le_bytes([decoded[4], decoded[5], decoded[6], decoded[7]]);
                 let pixels = decoded[8..].to_vec();
+
+                // Apply object-fit to determine draw dimensions.
+                let (draw_x, draw_y, draw_w, draw_h, needs_clip) = compute_object_fit(
+                    &layout_box.style,
+                    layout_box.x, layout_box.y,
+                    layout_box.width, layout_box.height,
+                    img_width as f32, img_height as f32,
+                );
+
+                if needs_clip {
+                    ops.push(RenderOp::PushClip {
+                        x: layout_box.x, y: layout_box.y,
+                        width: layout_box.width, height: layout_box.height,
+                    });
+                }
+
                 ops.push(RenderOp::DrawImage {
-                    x: layout_box.x, y: layout_box.y,
-                    width: layout_box.width, height: layout_box.height,
+                    x: draw_x, y: draw_y,
+                    width: draw_w, height: draw_h,
                     img_width, img_height, pixels,
                 });
+
+                if needs_clip {
+                    ops.push(RenderOp::PopClip);
+                }
             }
         } else {
             ops.push(RenderOp::FillRect {
@@ -809,6 +872,26 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         ops.push(RenderOp::FillRect { x: bx + bw - w, y: by, width: w, height: bh, color });
     }
 
+    // Paint CSS outline — similar to border but outside the border box, no layout impact.
+    if let Some((outline_w, outline_color)) = extract_outline(&layout_box.style) {
+        let outline_color = multiply_alpha(outline_color, opacity);
+        let ox = layout_box.x - outline_w;
+        let oy = layout_box.y - outline_w;
+        let ow = layout_box.width + outline_w * 2.0;
+        let oh = layout_box.height + outline_w * 2.0;
+        // Top
+        ops.push(RenderOp::FillRect { x: ox, y: oy, width: ow, height: outline_w, color: outline_color });
+        // Bottom
+        ops.push(RenderOp::FillRect { x: ox, y: oy + oh - outline_w, width: ow, height: outline_w, color: outline_color });
+        // Left
+        ops.push(RenderOp::FillRect { x: ox, y: oy, width: outline_w, height: oh, color: outline_color });
+        // Right
+        ops.push(RenderOp::FillRect { x: ox + ow - outline_w, y: oy, width: outline_w, height: oh, color: outline_color });
+    }
+
+    // Paint list-style-type markers for list items.
+    paint_list_marker(layout_box, ops, opacity);
+
     // Emit a Link op if this box has an href (i.e., it is an <a> element).
     if let Some(href) = extract_href(&layout_box.style) {
         if layout_box.width > 0.0 && layout_box.height > 0.0 {
@@ -842,6 +925,11 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     }
 
     if clips_overflow {
+        ops.push(RenderOp::PopClip);
+    }
+
+    // Pop clip-path: inset() if it was applied.
+    if clip_inset.is_some() {
         ops.push(RenderOp::PopClip);
     }
 
@@ -910,6 +998,382 @@ fn extract_opacity(style: &nova_mod_api::content::StyleMap) -> f32 {
         }
     }
     1.0
+}
+
+/// Check if `visibility: hidden` is set on an element.
+///
+/// Returns `true` when the element should be invisible but still occupy space.
+fn is_visibility_hidden(style: &nova_mod_api::content::StyleMap) -> bool {
+    for (key, value) in &style.properties {
+        if key == "visibility" {
+            let val_str = match value {
+                StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
+                _ => continue,
+            };
+            return val_str == "hidden" || val_str == "collapse";
+        }
+    }
+    false
+}
+
+/// Extract filter effects from the CSS `filter` property.
+///
+/// Since we cannot do real image processing in the software renderer, this
+/// extracts only the effects we can approximate:
+/// - `opacity(n)` -- modifies the opacity parameter (passed by mutable ref)
+/// - `drop-shadow(x y blur color)` -- returns as a BoxShadow tuple
+///
+/// `blur()`, `brightness()`, `grayscale()`, etc. are parsed but skipped.
+fn extract_filter_effects(
+    style: &nova_mod_api::content::StyleMap,
+    opacity: &mut f32,
+) -> Option<(Color, f32, f32, f32)> {
+    let mut shadow = None;
+    for (key, value) in &style.properties {
+        if key == "filter" {
+            let s = match value {
+                StyleValue::Str(s) | StyleValue::Keyword(s) => s.as_str(),
+                _ => continue,
+            };
+            if s == "none" {
+                return None;
+            }
+            // Parse individual filter functions.
+            let mut remaining = s;
+            while let Some(paren_start) = remaining.find('(') {
+                let func_name = remaining[..paren_start].trim();
+                // Extract the name (last whitespace-separated token before paren).
+                let func_name = func_name.rsplit_once(|c: char| c.is_whitespace())
+                    .map(|(_, name)| name)
+                    .unwrap_or(func_name);
+                if let Some(paren_end) = remaining[paren_start..].find(')') {
+                    let args = &remaining[paren_start + 1..paren_start + paren_end];
+                    match func_name {
+                        "opacity" => {
+                            if let Some(val) = parse_filter_number(args) {
+                                *opacity *= val.clamp(0.0, 1.0);
+                            }
+                        }
+                        "drop-shadow" => {
+                            shadow = parse_drop_shadow(args);
+                        }
+                        // blur, brightness, grayscale, etc. -- skip (too expensive for CPU).
+                        _ => {}
+                    }
+                    remaining = &remaining[paren_start + paren_end + 1..];
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    shadow
+}
+
+/// Parse a filter number value (e.g. "0.8", "80%").
+fn parse_filter_number(s: &str) -> Option<f32> {
+    let s = s.trim();
+    if let Some(pct) = s.strip_suffix('%') {
+        pct.trim().parse::<f32>().ok().map(|v| v / 100.0)
+    } else {
+        s.parse::<f32>().ok()
+    }
+}
+
+/// Parse a `drop-shadow(x y blur color)` argument string.
+fn parse_drop_shadow(args: &str) -> Option<(Color, f32, f32, f32)> {
+    let tokens: Vec<&str> = args.trim().split_whitespace().collect();
+    if tokens.len() < 2 {
+        return None;
+    }
+    let offset_x = parse_length_px(tokens[0])?;
+    let offset_y = parse_length_px(tokens[1])?;
+    let mut blur = 0.0_f32;
+    let mut color = Color::rgba(0.0, 0.0, 0.0, 0.5);
+    let mut color_start = 2;
+    if tokens.len() > 2 {
+        if let Some(b) = parse_length_px(tokens[2]) {
+            blur = b;
+            color_start = 3;
+        }
+    }
+    if color_start < tokens.len() {
+        let color_str = tokens[color_start..].join(" ");
+        if let Some(c) = parse_color_string(&color_str) {
+            color = c;
+        }
+    }
+    Some((color, offset_x, offset_y, blur))
+}
+
+/// Extract `clip-path: inset(...)` values.
+///
+/// Returns `Some((x_offset, y_offset, clipped_width, clipped_height))` relative
+/// to the element's position. Only `inset()` is supported.
+fn extract_clip_path_inset(
+    style: &nova_mod_api::content::StyleMap,
+    box_width: f32,
+    box_height: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    for (key, value) in &style.properties {
+        if key == "clip-path" {
+            let s = match value {
+                StyleValue::Str(s) | StyleValue::Keyword(s) => s.as_str(),
+                _ => continue,
+            };
+            let s = s.trim();
+            if s == "none" {
+                return None;
+            }
+            if let Some(inset_args) = s.strip_prefix("inset(").and_then(|s| s.strip_suffix(')')) {
+                let parts: Vec<&str> = inset_args.split_whitespace().collect();
+                let (top, right, bottom, left) = match parts.len() {
+                    1 => {
+                        let v = parse_length_px(parts[0]).unwrap_or(0.0);
+                        (v, v, v, v)
+                    }
+                    2 => {
+                        let tb = parse_length_px(parts[0]).unwrap_or(0.0);
+                        let lr = parse_length_px(parts[1]).unwrap_or(0.0);
+                        (tb, lr, tb, lr)
+                    }
+                    3 => {
+                        let t = parse_length_px(parts[0]).unwrap_or(0.0);
+                        let lr = parse_length_px(parts[1]).unwrap_or(0.0);
+                        let b = parse_length_px(parts[2]).unwrap_or(0.0);
+                        (t, lr, b, lr)
+                    }
+                    _ => {
+                        let t = parse_length_px(parts[0]).unwrap_or(0.0);
+                        let r = parse_length_px(parts[1]).unwrap_or(0.0);
+                        let b = parse_length_px(parts[2]).unwrap_or(0.0);
+                        let l = parse_length_px(parts[3]).unwrap_or(0.0);
+                        (t, r, b, l)
+                    }
+                };
+                let clip_x = left;
+                let clip_y = top;
+                let clip_w = (box_width - left - right).max(0.0);
+                let clip_h = (box_height - top - bottom).max(0.0);
+                return Some((clip_x, clip_y, clip_w, clip_h));
+            }
+        }
+    }
+    None
+}
+
+/// Compute draw position and size for an image based on the CSS `object-fit` property.
+///
+/// Returns `(draw_x, draw_y, draw_width, draw_height, needs_clip)`.
+/// `needs_clip` is true for `cover` mode where the image overflows the container.
+fn compute_object_fit(
+    style: &nova_mod_api::content::StyleMap,
+    box_x: f32,
+    box_y: f32,
+    box_w: f32,
+    box_h: f32,
+    img_w: f32,
+    img_h: f32,
+) -> (f32, f32, f32, f32, bool) {
+    let fit = style.properties.iter()
+        .find(|(k, _)| k == "object-fit")
+        .and_then(|(_, v)| match v {
+            StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.as_str()),
+            _ => None,
+        })
+        .unwrap_or("fill");
+
+    match fit {
+        "contain" => {
+            // Scale to fit within the box, preserving aspect ratio (letterbox).
+            if img_w <= 0.0 || img_h <= 0.0 {
+                return (box_x, box_y, box_w, box_h, false);
+            }
+            let scale = (box_w / img_w).min(box_h / img_h);
+            let draw_w = img_w * scale;
+            let draw_h = img_h * scale;
+            let draw_x = box_x + (box_w - draw_w) / 2.0;
+            let draw_y = box_y + (box_h - draw_h) / 2.0;
+            (draw_x, draw_y, draw_w, draw_h, false)
+        }
+        "cover" => {
+            // Scale to fill the box, preserving aspect ratio (clip overflow).
+            if img_w <= 0.0 || img_h <= 0.0 {
+                return (box_x, box_y, box_w, box_h, false);
+            }
+            let scale = (box_w / img_w).max(box_h / img_h);
+            let draw_w = img_w * scale;
+            let draw_h = img_h * scale;
+            let draw_x = box_x + (box_w - draw_w) / 2.0;
+            let draw_y = box_y + (box_h - draw_h) / 2.0;
+            (draw_x, draw_y, draw_w, draw_h, true)
+        }
+        "none" => {
+            // No scaling — draw at natural size, centered.
+            let draw_x = box_x + (box_w - img_w) / 2.0;
+            let draw_y = box_y + (box_h - img_h) / 2.0;
+            (draw_x, draw_y, img_w, img_h, true)
+        }
+        "scale-down" => {
+            // Like contain, but never scale up.
+            if img_w <= 0.0 || img_h <= 0.0 {
+                return (box_x, box_y, box_w, box_h, false);
+            }
+            let scale = (box_w / img_w).min(box_h / img_h).min(1.0);
+            let draw_w = img_w * scale;
+            let draw_h = img_h * scale;
+            let draw_x = box_x + (box_w - draw_w) / 2.0;
+            let draw_y = box_y + (box_h - draw_h) / 2.0;
+            (draw_x, draw_y, draw_w, draw_h, false)
+        }
+        // "fill" is default — stretch to fill.
+        _ => (box_x, box_y, box_w, box_h, false),
+    }
+}
+
+/// Extract the CSS `outline` property (outline-width, outline-style, outline-color).
+///
+/// Returns `Some((width_px, color))` if a visible outline is specified.
+fn extract_outline(style: &nova_mod_api::content::StyleMap) -> Option<(f32, Color)> {
+    let mut width = None;
+    let mut color = None;
+    let mut style_val = None;
+
+    for (key, value) in &style.properties {
+        match key.as_str() {
+            "outline-width" => {
+                let s = match value {
+                    StyleValue::Px(px) => { width = Some(*px); continue; }
+                    StyleValue::Str(s) | StyleValue::Keyword(s) => s.as_str(),
+                    _ => continue,
+                };
+                width = match s.trim() {
+                    "thin" => Some(1.0),
+                    "medium" => Some(3.0),
+                    "thick" => Some(5.0),
+                    _ => parse_length_px(s),
+                };
+            }
+            "outline-style" => {
+                let s = match value {
+                    StyleValue::Keyword(k) | StyleValue::Str(k) => k.as_str(),
+                    _ => continue,
+                };
+                style_val = Some(s.to_string());
+            }
+            "outline-color" => {
+                if let Some(c) = style_value_to_color(value) {
+                    color = Some(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Only paint if there's a visible style.
+    let s = style_val.as_deref().unwrap_or("none");
+    if s == "none" || s == "hidden" {
+        return None;
+    }
+    let w = width.unwrap_or(3.0); // "medium" default
+    if w <= 0.0 {
+        return None;
+    }
+    let c = color.unwrap_or(Color::BLACK);
+    Some((w, c))
+}
+
+/// Paint list-style-type markers (bullets or numbers) for list items.
+///
+/// Looks for `list-style-type` and `nova-list-index` properties in the style
+/// map and prepends the appropriate marker character before the content.
+fn paint_list_marker(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, opacity: f32) {
+    let mut list_style = None;
+    let mut list_index = None;
+
+    for (key, value) in &layout_box.style.properties {
+        match key.as_str() {
+            "list-style-type" => {
+                list_style = match value {
+                    StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.clone()),
+                    _ => None,
+                };
+            }
+            "nova-list-index" => {
+                list_index = match value {
+                    StyleValue::Number(n) => Some(*n as i32),
+                    StyleValue::Px(n) => Some(*n as i32),
+                    StyleValue::Keyword(k) | StyleValue::Str(k) => k.parse::<i32>().ok(),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    let style_type = match list_style.as_deref() {
+        Some(s) if s != "none" => s,
+        _ => return,
+    };
+
+    let font_size = extract_font_size(&layout_box.style);
+    let text_color = multiply_alpha(extract_text_color(&layout_box.style), opacity);
+    let marker_x = layout_box.x - 20.0; // Position marker in the padding-left area.
+
+    let marker_text = match style_type {
+        "disc" => "\u{2022}".to_string(),       // bullet
+        "circle" => "\u{25E6}".to_string(),      // white bullet
+        "square" => "\u{25AA}".to_string(),      // black small square
+        "decimal" => {
+            let idx = list_index.unwrap_or(1);
+            format!("{idx}.")
+        }
+        "lower-alpha" | "lower-latin" => {
+            let idx = list_index.unwrap_or(1).max(1) as u32;
+            let ch = char::from_u32('a' as u32 + (idx - 1) % 26).unwrap_or('a');
+            format!("{ch}.")
+        }
+        "upper-alpha" | "upper-latin" => {
+            let idx = list_index.unwrap_or(1).max(1) as u32;
+            let ch = char::from_u32('A' as u32 + (idx - 1) % 26).unwrap_or('A');
+            format!("{ch}.")
+        }
+        "lower-roman" => {
+            let idx = list_index.unwrap_or(1).max(1);
+            format!("{}.", to_roman_lower(idx))
+        }
+        "upper-roman" => {
+            let idx = list_index.unwrap_or(1).max(1);
+            format!("{}.", to_roman_lower(idx).to_uppercase())
+        }
+        _ => return,
+    };
+
+    ops.push(RenderOp::DrawText {
+        x: marker_x,
+        y: layout_box.y + font_size,
+        text: marker_text,
+        font_size,
+        color: text_color,
+        font_weight: None,
+        font_style: None,
+        font_family: None,
+    });
+}
+
+/// Convert a number to lowercase Roman numerals (simple, up to ~3999).
+fn to_roman_lower(mut n: i32) -> String {
+    let values = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"),
+                  (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
+                  (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")];
+    let mut result = String::new();
+    for (val, sym) in &values {
+        while n >= *val {
+            result.push_str(sym);
+            n -= val;
+        }
+    }
+    result
 }
 
 /// Parse a CSS `box-shadow` value and return `(color, offset_x, offset_y, blur)`.

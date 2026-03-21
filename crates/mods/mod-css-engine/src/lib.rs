@@ -227,7 +227,9 @@ impl NovaMod for CssEngineMod {
                 // Run the cascade: extract <style> elements, parse CSS, match
                 // selectors, apply specificity ordering, and write computed
                 // styles as data-nova-style attributes.
-                let styled_dom = cascade::compute_styles(dom_node, &extra_css, viewport_width);
+                // Use the parallel cascade for large DOMs (it falls back to
+                // sequential for small DOMs internally).
+                let styled_dom = parallel::parallel_compute_styles(dom_node, &extra_css, viewport_width);
 
                 Ok(TypedData::Dom(styled_dom))
             }

@@ -20,7 +20,7 @@ use crate::values;
 ///
 /// Rules are bucketed by the rightmost compound selector's ID, class, or tag.
 /// When matching an element, only relevant buckets are checked instead of all rules.
-struct RuleIndex {
+pub struct RuleIndex {
     by_id: HashMap<String, Vec<usize>>,
     by_class: HashMap<String, Vec<usize>>,
     by_tag: HashMap<String, Vec<usize>>,
@@ -28,7 +28,7 @@ struct RuleIndex {
 }
 
 impl RuleIndex {
-    fn build(rules: &[CssRule]) -> Self {
+    pub fn build(rules: &[CssRule]) -> Self {
         let mut by_id: HashMap<String, Vec<usize>> = HashMap::new();
         let mut by_class: HashMap<String, Vec<usize>> = HashMap::new();
         let mut by_tag: HashMap<String, Vec<usize>> = HashMap::new();
@@ -58,7 +58,7 @@ impl RuleIndex {
         RuleIndex { by_id, by_class, by_tag, universal }
     }
 
-    fn candidates_for(&self, tag: &str, attributes: &[(String, String)]) -> Vec<usize> {
+    pub fn candidates_for(&self, tag: &str, attributes: &[(String, String)]) -> Vec<usize> {
         let mut seen = HashSet::new();
         let mut result = Vec::new();
 
@@ -223,7 +223,7 @@ pub fn compute_styles(dom: DomNode, extra_css: &[String], viewport_width: f32) -
 /// author-specified background, the body's `background-color` is used
 /// as the canvas background (covering the entire viewport).  We detect
 /// this by checking if html's background is the UA-default white.
-fn propagate_body_background(dom: DomNode) -> DomNode {
+pub fn propagate_body_background(dom: DomNode) -> DomNode {
     // Only applies to Document root.
     let DomNode::Document { children } = dom else {
         return dom;
@@ -341,6 +341,12 @@ fn propagate_body_background(dom: DomNode) -> DomNode {
     DomNode::Document { children }
 }
 
+/// Maximum DOM depth for style computation.
+///
+/// Some pages have very deeply nested DOMs (50+ levels). Beyond this depth
+/// the cascade is skipped to prevent stack overflow and improve performance.
+const MAX_CASCADE_DEPTH: usize = 100;
+
 /// Recursively apply styles to a DOM node.
 fn apply_styles_recursive(
     node: DomNode,
@@ -348,6 +354,11 @@ fn apply_styles_recursive(
     index: &RuleIndex,
     ancestors: &[&DomNode],
 ) -> DomNode {
+    // Depth limit: ancestors.len() approximates the current depth.
+    if ancestors.len() >= MAX_CASCADE_DEPTH {
+        return node;
+    }
+
     match node {
         DomNode::Element {
             tag,
@@ -369,7 +380,18 @@ fn apply_styles_recursive(
             // Remove old data-nova-style if present.
             new_attributes.retain(|(k, _)| k != "data-nova-style");
             if !style_str.is_empty() {
-                new_attributes.push(("data-nova-style".into(), style_str));
+                new_attributes.push(("data-nova-style".into(), style_str.clone()));
+            }
+
+            // ── Skip hidden subtrees ─────────────────────────────────
+            // If the element has `display: none`, none of its children
+            // are visible. Skip the entire subtree for performance.
+            if style_str.contains("display: none") {
+                return DomNode::Element {
+                    tag,
+                    attributes: new_attributes,
+                    children: vec![],
+                };
             }
 
             // Build the full node for ancestor tracking.
@@ -488,6 +510,21 @@ fn apply_styles_recursive_with_siblings(
     ancestors: &[&DomNode],
     siblings: Option<SiblingContext<'_>>,
 ) -> DomNode {
+    if ancestors.len() >= MAX_CASCADE_DEPTH {
+        return node;
+    }
+
+    apply_styles_recursive_with_siblings_inner(node, rules, index, ancestors, siblings)
+}
+
+/// Inner implementation with sibling context (after depth check).
+fn apply_styles_recursive_with_siblings_inner(
+    node: DomNode,
+    rules: &[CssRule],
+    index: &RuleIndex,
+    ancestors: &[&DomNode],
+    siblings: Option<SiblingContext<'_>>,
+) -> DomNode {
     match node {
         DomNode::Element {
             tag,
@@ -507,7 +544,16 @@ fn apply_styles_recursive_with_siblings(
             let mut new_attributes = attributes;
             new_attributes.retain(|(k, _)| k != "data-nova-style");
             if !style_str.is_empty() {
-                new_attributes.push(("data-nova-style".into(), style_str));
+                new_attributes.push(("data-nova-style".into(), style_str.clone()));
+            }
+
+            // ── Skip hidden subtrees ─────────────────────────────────
+            if style_str.contains("display: none") {
+                return DomNode::Element {
+                    tag,
+                    attributes: new_attributes,
+                    children: vec![],
+                };
             }
 
             let this_node = DomNode::Element {
@@ -589,6 +635,21 @@ fn compute_element_style(
     compute_element_style_impl(tag, attributes, node, rules, index, ancestors, None)
 }
 
+/// Public wrapper for computing a single element's style.
+///
+/// Used by the parallel cascade engine to compute per-element styles
+/// while reusing the full cascade logic (inheritance, specificity, etc.).
+pub fn compute_element_style_public(
+    tag: &str,
+    attributes: &[(String, String)],
+    node: &DomNode,
+    rules: &[CssRule],
+    index: &RuleIndex,
+    ancestors: &[&DomNode],
+) -> String {
+    compute_element_style_impl(tag, attributes, node, rules, index, ancestors, None)
+}
+
 /// Internal implementation that supports optional sibling context.
 fn compute_element_style_impl(
     tag: &str,
@@ -623,6 +684,10 @@ fn compute_element_style_impl(
         "direction",
         "list-style-type",
         "list-style-position",
+        "word-break",
+        "overflow-wrap",
+        "word-wrap",
+        "writing-mode",
     ];
 
     // Track which inherited properties we've already found (from a closer
@@ -1188,6 +1253,72 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
             // Pass through as-is; values like `underline`, `none`, `line-through` are used directly.
             out.push(decl);
         }
+        "outline" => {
+            // outline: <width> <style> <color>
+            let parts: Vec<&str> = split_shorthand(&decl.value);
+            let mut width = "medium";
+            let mut style = "none";
+            let mut color = "currentcolor";
+            static OUTLINE_STYLES: &[&str] = &[
+                "none", "hidden", "dotted", "dashed", "solid", "double",
+                "groove", "ridge", "inset", "outset",
+            ];
+            for part in &parts {
+                if OUTLINE_STYLES.contains(part) {
+                    style = part;
+                } else if parse_length_token(part) {
+                    width = part;
+                } else {
+                    color = part;
+                }
+            }
+            for (prop, val) in [
+                ("outline-width", width),
+                ("outline-style", style),
+                ("outline-color", color),
+            ] {
+                out.push(CascadedDeclaration {
+                    property: prop.into(),
+                    value: val.to_string(),
+                    specificity: decl.specificity,
+                    origin: decl.origin,
+                    important: decl.important,
+                });
+            }
+        }
+        "columns" => {
+            // columns: <column-count> <column-width> (order doesn't matter)
+            let parts: Vec<&str> = split_shorthand(&decl.value);
+            for part in &parts {
+                if part.parse::<u32>().is_ok() {
+                    out.push(CascadedDeclaration {
+                        property: "column-count".into(),
+                        value: part.to_string(),
+                        specificity: decl.specificity,
+                        origin: decl.origin,
+                        important: decl.important,
+                    });
+                } else {
+                    out.push(CascadedDeclaration {
+                        property: "column-width".into(),
+                        value: part.to_string(),
+                        specificity: decl.specificity,
+                        origin: decl.origin,
+                        important: decl.important,
+                    });
+                }
+            }
+        }
+        "word-wrap" => {
+            // word-wrap is the legacy name for overflow-wrap.
+            out.push(CascadedDeclaration {
+                property: "overflow-wrap".into(),
+                value: decl.value,
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        }
         _ => {
             // Not a shorthand; pass through.
             out.push(decl);
@@ -1257,6 +1388,17 @@ fn expand_border_shorthand(prefix: &str, decl: &CascadedDeclaration, out: &mut V
 /// Split a shorthand value into whitespace-separated parts.
 fn split_shorthand(value: &str) -> Vec<&str> {
     value.split_whitespace().collect()
+}
+
+/// Check if a token looks like a CSS length value (e.g. `2px`, `1em`, `3`, `medium`).
+fn parse_length_token(s: &str) -> bool {
+    let s = s.trim();
+    matches!(s, "thin" | "medium" | "thick")
+        || s.ends_with("px")
+        || s.ends_with("em")
+        || s.ends_with("rem")
+        || s.ends_with("pt")
+        || s.parse::<f32>().is_ok()
 }
 
 /// Expand 1-4 values into top/right/bottom/left (CSS TRBL pattern).
@@ -2224,6 +2366,38 @@ mod tests {
     fn text_decoration_none_passes_through() {
         let m = expand("text-decoration", "none");
         assert_eq!(m.get("text-decoration").map(String::as_str), Some("none"));
+    }
+
+    // ── outline shorthand ────────────────────────────────────────────────────
+
+    #[test]
+    fn outline_shorthand_full() {
+        let m = expand("outline", "2px solid blue");
+        assert_eq!(m.get("outline-width").map(String::as_str), Some("2px"));
+        assert_eq!(m.get("outline-style").map(String::as_str), Some("solid"));
+        assert_eq!(m.get("outline-color").map(String::as_str), Some("blue"));
+    }
+
+    #[test]
+    fn outline_shorthand_none() {
+        let m = expand("outline", "none");
+        assert_eq!(m.get("outline-style").map(String::as_str), Some("none"));
+    }
+
+    // ── columns shorthand ────────────────────────────────────────────────────
+
+    #[test]
+    fn columns_shorthand_count() {
+        let m = expand("columns", "3");
+        assert_eq!(m.get("column-count").map(String::as_str), Some("3"));
+    }
+
+    // ── word-wrap alias ──────────────────────────────────────────────────────
+
+    #[test]
+    fn word_wrap_maps_to_overflow_wrap() {
+        let m = expand("word-wrap", "break-word");
+        assert_eq!(m.get("overflow-wrap").map(String::as_str), Some("break-word"));
     }
 }
 

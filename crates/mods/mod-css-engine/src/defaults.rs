@@ -109,10 +109,17 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
             props.push(("margin-bottom".into(), StyleValue::Px(8.0)));
             props.push(("margin-left".into(), StyleValue::Px(8.0)));
         }
-        "ul" | "ol" => {
+        "ul" => {
             props.push(("margin-top".into(), StyleValue::Px(16.0)));
             props.push(("margin-bottom".into(), StyleValue::Px(16.0)));
             props.push(("padding-left".into(), StyleValue::Px(40.0)));
+            props.push(("list-style-type".into(), StyleValue::Keyword("disc".into())));
+        }
+        "ol" => {
+            props.push(("margin-top".into(), StyleValue::Px(16.0)));
+            props.push(("margin-bottom".into(), StyleValue::Px(16.0)));
+            props.push(("padding-left".into(), StyleValue::Px(40.0)));
+            props.push(("list-style-type".into(), StyleValue::Keyword("decimal".into())));
         }
         _ => {}
     }

@@ -5,6 +5,7 @@
 //! Includes an interactive URL bar for navigation.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use tracing::{debug, error, info, warn};
 use wgpu::util::DeviceExt;
@@ -216,6 +217,20 @@ pub struct BrowserWindow {
     form_fields: Vec<FormFieldRegion>,
     /// Index of the currently focused form field, or None.
     focused_field: Option<usize>,
+    /// Cursor position (character index) within the focused text field.
+    form_cursor_pos: usize,
+    /// Timestamp when the cursor last toggled visibility (for blinking).
+    cursor_blink_time: Instant,
+    /// Whether the cursor is currently visible (toggles every 500ms).
+    cursor_visible: bool,
+
+    // -- Select dropdown state --
+    /// Whether a dropdown is open for a `<select>` field.
+    dropdown_open: bool,
+    /// Index of the form field whose dropdown is open.
+    dropdown_field_idx: usize,
+    /// Index of the currently hovered option in the dropdown.
+    dropdown_hover_idx: Option<usize>,
 
     // -- Link interaction state --
     /// Clickable link regions extracted from `RenderOp::Link` ops.
@@ -340,6 +355,12 @@ impl BrowserWindow {
             content_width,
             form_fields,
             focused_field: None,
+            form_cursor_pos: 0,
+            cursor_blink_time: Instant::now(),
+            cursor_visible: true,
+            dropdown_open: false,
+            dropdown_field_idx: 0,
+            dropdown_hover_idx: None,
             hit_regions,
             last_clicked_url: None,
             core,
@@ -486,11 +507,28 @@ impl BrowserWindow {
         None
     }
 
-    /// Update the cursor icon based on whether the cursor is over a link.
+    /// Update the cursor icon based on whether the cursor is over a link or form field.
     fn update_cursor(&self) {
         if let Some(w) = &self.window {
             if self.hit_test(self.cursor_x, self.cursor_y).is_some() {
                 w.set_cursor(CursorIcon::Pointer);
+            } else if (self.cursor_y as f32) > URL_BAR_HEIGHT {
+                // Check if cursor is over a text-like form field.
+                let page_x = self.cursor_x as f32 + self.scroll_x;
+                let page_y = (self.cursor_y as f32 - URL_BAR_HEIGHT) + self.scroll_y;
+                let over_text_field = self.form_fields.iter().any(|f| {
+                    f.contains(page_x, page_y)
+                        && matches!(
+                            f.field_type.as_str(),
+                            "text" | "password" | "email" | "number" | "search"
+                                | "tel" | "url" | "date" | "textarea"
+                        )
+                });
+                if over_text_field {
+                    w.set_cursor(CursorIcon::Text);
+                } else {
+                    w.set_cursor(CursorIcon::Default);
+                }
             } else {
                 w.set_cursor(CursorIcon::Default);
             }
@@ -503,6 +541,8 @@ impl BrowserWindow {
     /// or `Ok(None)` if the window was closed normally.
     pub fn run(mut self) -> anyhow::Result<Option<String>> {
         let event_loop = EventLoop::new()?;
+        // Use WaitUntil for cursor blinking when a form field is focused;
+        // otherwise fall back to Wait via the about_to_wait handler.
         event_loop.set_control_flow(ControlFlow::Wait);
         event_loop.run_app(&mut self)?;
         Ok(self.pending_navigation)
@@ -686,6 +726,9 @@ impl BrowserWindow {
             );
         }
 
+        // Redraw form fields whose values have changed (user typed into them).
+        self.draw_form_field_overlays();
+
         // Draw focus ring on the focused form field (if any).
         if let Some(idx) = self.focused_field {
             if let Some(field) = self.form_fields.get(idx) {
@@ -695,6 +738,12 @@ impl BrowserWindow {
                 self.framebuffer.stroke_rect(fx - 1.0, fy - 1.0, field.width + 2.0, field.height + 2.0, focus_color, 2.0);
             }
         }
+
+        // Draw text cursor in the focused text field.
+        self.draw_form_field_cursor();
+
+        // Draw select dropdown overlay (on top of everything except URL bar).
+        self.draw_select_dropdown();
 
         // Draw find-in-page highlights (before URL bar so they appear under it).
         self.draw_find_highlights();
@@ -710,6 +759,281 @@ impl BrowserWindow {
 
         // Draw zoom indicator.
         self.draw_zoom_indicator();
+    }
+
+    /// Redraw form fields that the user has modified (typed text into).
+    ///
+    /// Since the original `RenderOp::FormField` ops contain the initial value
+    /// from the HTML, we overlay the current value on top of the field's
+    /// background when it has been edited.
+    fn draw_form_field_overlays(&mut self) {
+        // Collect field data first to avoid borrowing issues.
+        let fields: Vec<_> = self.form_fields.iter().enumerate().map(|(i, f)| {
+            (i, f.x, f.y, f.width, f.height, f.field_type.clone(), f.value.clone(),
+             f.placeholder.clone(), f.checked, f.options.clone())
+        }).collect();
+
+        for (idx, x, y, w, h, field_type, value, placeholder, checked, options) in fields {
+            let fx = x - self.scroll_x;
+            let fy = y + URL_BAR_HEIGHT - self.scroll_y;
+            let font_size = 14.0_f32; // Default form field font size.
+
+            match field_type.as_str() {
+                "text" | "email" | "number" | "search" | "tel" | "url" | "date" => {
+                    // Redraw the field background + border + current text.
+                    let border_color = Color::rgb(0.6, 0.6, 0.6);
+                    self.framebuffer.fill_rect(fx, fy, w, h, Color::WHITE);
+                    // Border (top, bottom, left, right).
+                    self.framebuffer.fill_rect(fx, fy, w, 1.0, border_color);
+                    self.framebuffer.fill_rect(fx, fy + h - 1.0, w, 1.0, border_color);
+                    self.framebuffer.fill_rect(fx, fy, 1.0, h, border_color);
+                    self.framebuffer.fill_rect(fx + w - 1.0, fy, 1.0, h, border_color);
+
+                    let (display_text, text_color) = if value.is_empty() {
+                        (placeholder.clone(), Color::rgb(0.6, 0.6, 0.6))
+                    } else {
+                        (value.clone(), Color::BLACK)
+                    };
+
+                    if !display_text.is_empty() {
+                        let text_y = fy + font_size + (h - font_size) / 2.0 - 2.0;
+                        self.framebuffer.draw_text(
+                            fx + 4.0, text_y, &display_text, font_size, text_color,
+                            None, None, None,
+                        );
+                    }
+                }
+                "password" => {
+                    let border_color = Color::rgb(0.6, 0.6, 0.6);
+                    self.framebuffer.fill_rect(fx, fy, w, h, Color::WHITE);
+                    self.framebuffer.fill_rect(fx, fy, w, 1.0, border_color);
+                    self.framebuffer.fill_rect(fx, fy + h - 1.0, w, 1.0, border_color);
+                    self.framebuffer.fill_rect(fx, fy, 1.0, h, border_color);
+                    self.framebuffer.fill_rect(fx + w - 1.0, fy, 1.0, h, border_color);
+
+                    let (display_text, text_color) = if value.is_empty() {
+                        (placeholder.clone(), Color::rgb(0.6, 0.6, 0.6))
+                    } else {
+                        ("\u{2022}".repeat(value.len()), Color::BLACK)
+                    };
+
+                    if !display_text.is_empty() {
+                        let text_y = fy + font_size + (h - font_size) / 2.0 - 2.0;
+                        self.framebuffer.draw_text(
+                            fx + 4.0, text_y, &display_text, font_size, text_color,
+                            None, None, None,
+                        );
+                    }
+                }
+                "textarea" => {
+                    let border_color = Color::rgb(0.6, 0.6, 0.6);
+                    self.framebuffer.fill_rect(fx, fy, w, h, Color::WHITE);
+                    self.framebuffer.fill_rect(fx, fy, w, 1.0, border_color);
+                    self.framebuffer.fill_rect(fx, fy + h - 1.0, w, 1.0, border_color);
+                    self.framebuffer.fill_rect(fx, fy, 1.0, h, border_color);
+                    self.framebuffer.fill_rect(fx + w - 1.0, fy, 1.0, h, border_color);
+
+                    let (display_text, text_color) = if value.is_empty() {
+                        (placeholder.clone(), Color::rgb(0.6, 0.6, 0.6))
+                    } else {
+                        (value.clone(), Color::BLACK)
+                    };
+
+                    if !display_text.is_empty() {
+                        let text_y = fy + font_size + 2.0;
+                        self.framebuffer.draw_text(
+                            fx + 4.0, text_y, &display_text, font_size, text_color,
+                            None, None, None,
+                        );
+                    }
+                }
+                "checkbox" => {
+                    // Redraw checkbox with current checked state.
+                    let box_size = h.min(w).min(13.0);
+                    let bx = fx + (w - box_size) / 2.0;
+                    let by = fy + (h - box_size) / 2.0;
+                    let border_color = Color::rgb(0.6, 0.6, 0.6);
+                    self.framebuffer.fill_rect(bx, by, box_size, 1.0, border_color);
+                    self.framebuffer.fill_rect(bx, by + box_size - 1.0, box_size, 1.0, border_color);
+                    self.framebuffer.fill_rect(bx, by, 1.0, box_size, border_color);
+                    self.framebuffer.fill_rect(bx + box_size - 1.0, by, 1.0, box_size, border_color);
+                    let bg = if checked { Color::rgb(0.26, 0.52, 0.96) } else { Color::WHITE };
+                    self.framebuffer.fill_rect(bx + 1.0, by + 1.0, box_size - 2.0, box_size - 2.0, bg);
+                    if checked {
+                        self.framebuffer.draw_text(
+                            bx + 1.0, by + box_size - 2.0,
+                            "\u{2713}", box_size - 2.0, Color::WHITE,
+                            Some(700), None, None,
+                        );
+                    }
+                }
+                "select" => {
+                    // Redraw select with current value.
+                    let border_color = Color::rgb(0.6, 0.6, 0.6);
+                    self.framebuffer.fill_rect(fx, fy, w, h, Color::WHITE);
+                    self.framebuffer.fill_rect(fx, fy, w, 1.0, border_color);
+                    self.framebuffer.fill_rect(fx, fy + h - 1.0, w, 1.0, border_color);
+                    self.framebuffer.fill_rect(fx, fy, 1.0, h, border_color);
+                    self.framebuffer.fill_rect(fx + w - 1.0, fy, 1.0, h, border_color);
+                    let arrow_w = 20.0_f32.min(w * 0.15);
+                    self.framebuffer.fill_rect(
+                        fx + w - arrow_w, fy, arrow_w, h,
+                        Color::rgb(0.93, 0.93, 0.93),
+                    );
+                    self.framebuffer.draw_text(
+                        fx + w - arrow_w + 4.0,
+                        fy + font_size + (h - font_size) / 2.0 - 2.0,
+                        "\u{25BC}", font_size * 0.6,
+                        Color::rgb(0.3, 0.3, 0.3),
+                        None, None, None,
+                    );
+                    // Display the selected option's label, or the value.
+                    let display_text = if !value.is_empty() {
+                        options.iter()
+                            .find(|(v, _, _)| *v == value)
+                            .map(|(_, label, _)| label.clone())
+                            .unwrap_or(value.clone())
+                    } else if !placeholder.is_empty() {
+                        placeholder.clone()
+                    } else {
+                        "Select".to_string()
+                    };
+                    self.framebuffer.draw_text(
+                        fx + 6.0,
+                        fy + font_size + (h - font_size) / 2.0 - 2.0,
+                        &display_text, font_size, Color::BLACK,
+                        None, None, None,
+                    );
+                }
+                _ => {
+                    // Other field types (radio, submit, etc.) don't need overlay redraw.
+                }
+            }
+        }
+    }
+
+    /// Draw a blinking text cursor in the currently focused text field.
+    fn draw_form_field_cursor(&mut self) {
+        let idx = match self.focused_field {
+            Some(i) => i,
+            None => return,
+        };
+
+        let field = match self.form_fields.get(idx) {
+            Some(f) => f,
+            None => return,
+        };
+
+        // Only draw cursor for text-like fields.
+        let is_text_field = matches!(
+            field.field_type.as_str(),
+            "text" | "password" | "email" | "number" | "search" | "tel" | "url" | "date" | "textarea"
+        );
+        if !is_text_field {
+            return;
+        }
+
+        // Toggle cursor visibility every 500ms.
+        let elapsed = self.cursor_blink_time.elapsed();
+        if elapsed.as_millis() >= 500 {
+            self.cursor_visible = !self.cursor_visible;
+            self.cursor_blink_time = Instant::now();
+        }
+
+        if !self.cursor_visible {
+            return;
+        }
+
+        let fx = field.x - self.scroll_x;
+        let fy = field.y + URL_BAR_HEIGHT - self.scroll_y;
+        let h = field.height;
+        let font_size = 14.0_f32;
+
+        // Compute cursor x position based on character count.
+        let approx_char_w = font_size * 0.6;
+        let display_len = if field.field_type == "password" {
+            field.value.len() // Each char is one bullet
+        } else {
+            field.value.len()
+        };
+        let cursor_char_pos = self.form_cursor_pos.min(display_len);
+        let cursor_x = fx + 4.0 + cursor_char_pos as f32 * approx_char_w;
+        let cursor_y = fy + (h - font_size) / 2.0;
+
+        let cursor_color = Color::BLACK;
+        self.framebuffer.fill_rect(cursor_x, cursor_y, 1.5, font_size, cursor_color);
+    }
+
+    /// Draw a dropdown overlay for the currently open `<select>` field.
+    fn draw_select_dropdown(&mut self) {
+        if !self.dropdown_open {
+            return;
+        }
+
+        let field = match self.form_fields.get(self.dropdown_field_idx) {
+            Some(f) => f,
+            None => {
+                self.dropdown_open = false;
+                return;
+            }
+        };
+
+        let options = field.options.clone();
+        if options.is_empty() {
+            return;
+        }
+
+        let fx = field.x - self.scroll_x;
+        let fy = field.y + URL_BAR_HEIGHT - self.scroll_y + field.height;
+        let w = field.width;
+        let option_h = 24.0_f32;
+        let total_h = option_h * options.len() as f32;
+        let font_size = 13.0_f32;
+        let current_value = field.value.clone();
+
+        // Dropdown background.
+        let bg = Color::WHITE;
+        self.framebuffer.fill_rect(fx, fy, w, total_h, bg);
+
+        // Dropdown border.
+        let border = Color::rgb(0.6, 0.6, 0.6);
+        self.framebuffer.fill_rect(fx, fy, w, 1.0, border);
+        self.framebuffer.fill_rect(fx, fy + total_h - 1.0, w, 1.0, border);
+        self.framebuffer.fill_rect(fx, fy, 1.0, total_h, border);
+        self.framebuffer.fill_rect(fx + w - 1.0, fy, 1.0, total_h, border);
+
+        // Draw each option.
+        for (i, (val, label, _selected)) in options.iter().enumerate() {
+            let oy = fy + i as f32 * option_h;
+
+            // Hover highlight.
+            if Some(i) == self.dropdown_hover_idx {
+                let hover_bg = Color::rgb(0.26, 0.52, 0.96);
+                self.framebuffer.fill_rect(fx + 1.0, oy, w - 2.0, option_h, hover_bg);
+            } else if *val == current_value {
+                // Selected item highlight.
+                let sel_bg = Color::rgb(0.9, 0.93, 1.0);
+                self.framebuffer.fill_rect(fx + 1.0, oy, w - 2.0, option_h, sel_bg);
+            }
+
+            // Option text.
+            let text_color = if Some(i) == self.dropdown_hover_idx {
+                Color::WHITE
+            } else {
+                Color::BLACK
+            };
+            let text_y = oy + font_size + (option_h - font_size) / 2.0 - 2.0;
+            self.framebuffer.draw_text(
+                fx + 6.0, text_y, label, font_size, text_color,
+                None, None, None,
+            );
+
+            // Separator line between options.
+            if i < options.len() - 1 {
+                let sep_color = Color::rgb(0.9, 0.9, 0.9);
+                self.framebuffer.fill_rect(fx + 1.0, oy + option_h - 1.0, w - 2.0, 1.0, sep_color);
+            }
+        }
     }
 
     /// Draw the URL bar chrome at the top of the framebuffer.
@@ -1050,6 +1374,10 @@ impl BrowserWindow {
             None => return false,
         };
 
+        // Reset cursor blink on any keypress.
+        self.cursor_visible = true;
+        self.cursor_blink_time = Instant::now();
+
         match &event.logical_key {
             Key::Named(NamedKey::Enter) => {
                 // Submit the form when Enter is pressed in a text field.
@@ -1058,18 +1386,83 @@ impl BrowserWindow {
             }
             Key::Named(NamedKey::Escape) => {
                 self.focused_field = None;
+                self.dropdown_open = false;
                 return true;
             }
             Key::Named(NamedKey::Backspace) => {
                 if let Some(field) = self.form_fields.get_mut(idx) {
-                    field.value.pop();
+                    if self.form_cursor_pos > 0 && !field.value.is_empty() {
+                        // Find the char boundary before cursor_pos.
+                        let prev = field.value[..self.form_cursor_pos]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        field.value.remove(prev);
+                        self.form_cursor_pos = prev;
+                    }
+                }
+                return true;
+            }
+            Key::Named(NamedKey::Delete) => {
+                if let Some(field) = self.form_fields.get_mut(idx) {
+                    if self.form_cursor_pos < field.value.len() {
+                        field.value.remove(self.form_cursor_pos);
+                    }
+                }
+                return true;
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                if self.form_cursor_pos > 0 {
+                    if let Some(field) = self.form_fields.get(idx) {
+                        self.form_cursor_pos = field.value[..self.form_cursor_pos]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                    }
+                }
+                return true;
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                if let Some(field) = self.form_fields.get(idx) {
+                    if self.form_cursor_pos < field.value.len() {
+                        self.form_cursor_pos = field.value[self.form_cursor_pos..]
+                            .char_indices()
+                            .nth(1)
+                            .map(|(i, _)| self.form_cursor_pos + i)
+                            .unwrap_or(field.value.len());
+                    }
+                }
+                return true;
+            }
+            Key::Named(NamedKey::Home) => {
+                self.form_cursor_pos = 0;
+                return true;
+            }
+            Key::Named(NamedKey::End) => {
+                if let Some(field) = self.form_fields.get(idx) {
+                    self.form_cursor_pos = field.value.len();
                 }
                 return true;
             }
             Key::Named(NamedKey::Tab) => {
-                // Move focus to the next form field.
-                let next = (idx + 1) % self.form_fields.len().max(1);
-                self.focused_field = Some(next);
+                // Move focus to the next focusable form field (skip hidden, submit, button).
+                if !self.form_fields.is_empty() {
+                    let total = self.form_fields.len();
+                    let mut next = (idx + 1) % total;
+                    let mut attempts = 0;
+                    while attempts < total {
+                        let ft = self.form_fields[next].field_type.as_str();
+                        if !matches!(ft, "hidden" | "submit" | "button" | "reset") {
+                            break;
+                        }
+                        next = (next + 1) % total;
+                        attempts += 1;
+                    }
+                    self.focused_field = Some(next);
+                    self.form_cursor_pos = self.form_fields[next].value.len();
+                }
                 return true;
             }
             _ => {
@@ -1083,7 +1476,8 @@ impl BrowserWindow {
                                     return true; // don't add more text
                                 }
                             }
-                            field.value.push_str(s);
+                            field.value.insert_str(self.form_cursor_pos, s);
+                            self.form_cursor_pos += s.len();
                         }
                         return true;
                     }
@@ -1229,6 +1623,9 @@ impl BrowserWindow {
                 self.hit_regions = Self::extract_hit_regions(&cmds);
                 self.form_fields = Self::extract_form_fields(&cmds);
                 self.focused_field = None;
+                self.form_cursor_pos = 0;
+                self.dropdown_open = false;
+                self.dropdown_hover_idx = None;
                 self.content_height = Self::compute_content_height(&cmds);
                 self.content_width = Self::compute_content_width(&cmds);
                 self.render_commands = cmds;
@@ -1524,6 +1921,9 @@ impl BrowserWindow {
                 self.hit_regions = Self::extract_hit_regions(&cmds);
                 self.form_fields = Self::extract_form_fields(&cmds);
                 self.focused_field = None;
+                self.form_cursor_pos = 0;
+                self.dropdown_open = false;
+                self.dropdown_hover_idx = None;
                 self.content_height = Self::compute_content_height(&cmds);
                 self.content_width = Self::compute_content_width(&cmds);
                 self.render_commands = cmds;
@@ -1557,6 +1957,27 @@ impl BrowserWindow {
 }
 
 impl ApplicationHandler for BrowserWindow {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // When a text field is focused, schedule periodic redraws for cursor blinking.
+        if self.focused_field.is_some() {
+            let elapsed = self.cursor_blink_time.elapsed();
+            if elapsed.as_millis() >= 500 {
+                self.cursor_visible = !self.cursor_visible;
+                self.cursor_blink_time = Instant::now();
+                self.rebuild_framebuffer();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            // Wake up again in 500ms for the next blink toggle.
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + std::time::Duration::from_millis(500),
+            ));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -1864,6 +2285,31 @@ impl ApplicationHandler for BrowserWindow {
                 self.cursor_x = position.x;
                 self.cursor_y = position.y;
                 self.update_cursor();
+
+                // Update dropdown hover index if dropdown is open.
+                if self.dropdown_open {
+                    if let Some(field) = self.form_fields.get(self.dropdown_field_idx) {
+                        let fx = field.x - self.scroll_x;
+                        let fy = field.y + URL_BAR_HEIGHT - self.scroll_y + field.height;
+                        let w = field.width;
+                        let option_h = 24.0_f32;
+                        let total_h = option_h * field.options.len() as f32;
+
+                        let mx = position.x as f32;
+                        let my = position.y as f32;
+
+                        if mx >= fx && mx < fx + w && my >= fy && my < fy + total_h {
+                            let new_hover = ((my - fy) / option_h) as usize;
+                            if self.dropdown_hover_idx != Some(new_hover) {
+                                self.dropdown_hover_idx = Some(new_hover);
+                                self.request_redraw();
+                            }
+                        } else if self.dropdown_hover_idx.is_some() {
+                            self.dropdown_hover_idx = None;
+                            self.request_redraw();
+                        }
+                    }
+                }
             }
 
             // ── Mouse click ────────────────────────────────────────
@@ -1887,9 +2333,48 @@ impl ApplicationHandler for BrowserWindow {
                         self.request_redraw();
                     }
 
-                    // Check for form field clicks — focus the field.
                     let page_x = cx as f32 + self.scroll_x;
                     let page_y = (cy as f32 - URL_BAR_HEIGHT) + self.scroll_y;
+
+                    // Check if click is inside an open dropdown first.
+                    if self.dropdown_open {
+                        if let Some(field) = self.form_fields.get(self.dropdown_field_idx) {
+                            let fx = field.x - self.scroll_x;
+                            let fy = field.y + URL_BAR_HEIGHT - self.scroll_y + field.height;
+                            let w = field.width;
+                            let option_h = 24.0_f32;
+                            let total_h = option_h * field.options.len() as f32;
+
+                            let win_x = cx as f32;
+                            let win_y = cy as f32;
+
+                            if win_x >= fx && win_x < fx + w && win_y >= fy && win_y < fy + total_h {
+                                // Clicked inside the dropdown — select the option.
+                                let option_idx = ((win_y - fy) / option_h) as usize;
+                                let dd_idx = self.dropdown_field_idx;
+                                if let Some(field) = self.form_fields.get_mut(dd_idx) {
+                                    if option_idx < field.options.len() {
+                                        let new_val = field.options[option_idx].0.clone();
+                                        field.value = new_val.clone();
+                                        for opt in &mut field.options {
+                                            opt.2 = opt.0 == new_val;
+                                        }
+                                        debug!(value = %new_val, "Select option chosen");
+                                    }
+                                }
+                                self.dropdown_open = false;
+                                self.dropdown_hover_idx = None;
+                                self.request_redraw();
+                                return; // Don't process further clicks
+                            }
+                        }
+                        // Clicked outside the dropdown — close it.
+                        self.dropdown_open = false;
+                        self.dropdown_hover_idx = None;
+                        self.request_redraw();
+                    }
+
+                    // Check for form field clicks — focus the field.
                     let mut clicked_field = None;
                     for (i, field) in self.form_fields.iter().enumerate() {
                         if field.contains(page_x, page_y) {
@@ -1934,20 +2419,15 @@ impl ApplicationHandler for BrowserWindow {
                                 self.request_redraw();
                             }
                             "select" => {
-                                // Cycle through options on click.
-                                if let Some(field) = self.form_fields.get_mut(idx) {
-                                    if !field.options.is_empty() {
-                                        let current_idx = field.options.iter()
-                                            .position(|(v, _, _)| *v == field.value)
-                                            .unwrap_or(0);
-                                        let next_idx = (current_idx + 1) % field.options.len();
-                                        let new_val = field.options[next_idx].0.clone();
-                                        field.value = new_val;
-                                        let current_val = field.value.clone();
-                                        for opt in &mut field.options {
-                                            opt.2 = opt.0 == current_val;
-                                        }
-                                    }
+                                // Open the dropdown overlay.
+                                if self.dropdown_open && self.dropdown_field_idx == idx {
+                                    // Already open — close it.
+                                    self.dropdown_open = false;
+                                    self.dropdown_hover_idx = None;
+                                } else {
+                                    self.dropdown_open = true;
+                                    self.dropdown_field_idx = idx;
+                                    self.dropdown_hover_idx = None;
                                 }
                                 self.focused_field = Some(idx);
                                 self.request_redraw();
@@ -1956,13 +2436,25 @@ impl ApplicationHandler for BrowserWindow {
                                 // Hidden fields cannot be focused.
                             }
                             _ => {
+                                // Focus the text field and position cursor.
                                 self.focused_field = Some(idx);
+                                self.cursor_visible = true;
+                                self.cursor_blink_time = Instant::now();
+                                // Position cursor based on click x within the field.
+                                let field_screen_x = self.form_fields[idx].x - self.scroll_x + 4.0;
+                                let approx_char_w = 14.0_f32 * 0.6;
+                                let click_offset = (cx as f32 - field_screen_x).max(0.0);
+                                let char_pos = (click_offset / approx_char_w).round() as usize;
+                                self.form_cursor_pos = char_pos.min(self.form_fields[idx].value.len());
+                                self.dropdown_open = false;
                             }
                         }
                         self.request_redraw();
                     } else {
-                        if self.focused_field.is_some() {
+                        if self.focused_field.is_some() || self.dropdown_open {
                             self.focused_field = None;
+                            self.dropdown_open = false;
+                            self.dropdown_hover_idx = None;
                             self.request_redraw();
                         }
                     }

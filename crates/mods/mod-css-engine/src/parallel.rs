@@ -14,54 +14,15 @@
 //! The [`StyleCache`] uses `std::sync::Mutex` so it can be shared across
 //! threads. Contention is low because cache lookups are fast hash lookups.
 
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use tracing::{debug, info};
 
 use nova_mod_api::content::DomNode;
 
-use crate::cascade;
-use crate::defaults::default_style_for_tag;
+use crate::cascade::{self, RuleIndex};
 use crate::parser::{self, CssRule};
-use crate::selector::SiblingContext;
-
-// ── StyleCache ──────────────────────────────────────────────────────────────
-
-/// Thread-safe cache for computed style strings.
-///
-/// Keyed by (tag, class, id, parent_style_hash) to allow sharing computed
-/// styles across identical elements.
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-struct StyleCacheKey {
-    tag: String,
-    class: String,
-    id: String,
-}
-
-/// Thread-safe style cache shared across parallel workers.
-struct StyleCache {
-    entries: Mutex<HashMap<StyleCacheKey, String>>,
-}
-
-impl StyleCache {
-    fn new() -> Self {
-        Self {
-            entries: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn get(&self, key: &StyleCacheKey) -> Option<String> {
-        self.entries.lock().ok()?.get(key).cloned()
-    }
-
-    fn insert(&self, key: StyleCacheKey, value: String) {
-        if let Ok(mut map) = self.entries.lock() {
-            map.insert(key, value);
-        }
-    }
-}
 
 // ── ParallelStyleEngine ─────────────────────────────────────────────────────
 
@@ -92,6 +53,10 @@ impl ParallelStyleEngine {
     ///
     /// This is the main entry point. It produces the same result as the
     /// sequential [`cascade::compute_styles`] but utilizes multiple cores.
+    ///
+    /// The strategy: each element's own style is computed sequentially (it
+    /// needs ancestor context), but sibling subtrees are independent and
+    /// processed in parallel via rayon's work-stealing pool.
     pub fn compute(&self, dom: DomNode) -> DomNode {
         info!(
             rule_count = self.rules.len(),
@@ -99,178 +64,140 @@ impl ParallelStyleEngine {
             "parallel style computation starting"
         );
 
-        let index = RuleIndex::build(&self.rules);
-        let ancestors: Vec<&DomNode> = Vec::new();
-        self.apply_parallel(dom, &index, &ancestors)
+        let index = Arc::new(RuleIndex::build(&self.rules));
+        let rules = Arc::new(self.rules.clone());
+        let owned_ancestors: Vec<DomNode> = Vec::new();
+        Self::apply_parallel(&rules, &index, dom, &owned_ancestors, self.viewport_width, 0)
     }
 
     /// Recursively apply styles, parallelizing children processing.
-    fn apply_parallel<'a>(
-        &self,
+    ///
+    /// Uses owned ancestors (cloned DomNodes) so the data can be sent
+    /// across rayon threads safely.
+    fn apply_parallel(
+        rules: &Arc<Vec<CssRule>>,
+        index: &Arc<RuleIndex>,
         node: DomNode,
-        index: &RuleIndex,
-        ancestors: &[&DomNode],
+        owned_ancestors: &[DomNode],
+        viewport_width: f32,
+        depth: usize,
     ) -> DomNode {
+        // Depth limit to avoid stack overflow on deeply nested DOMs.
+        const MAX_CASCADE_DEPTH: usize = 100;
+        if depth >= MAX_CASCADE_DEPTH {
+            return node;
+        }
+
         match node {
             DomNode::Element {
                 tag,
                 attributes,
                 children,
             } => {
-                // Compute styles for this element (sequential — needs ancestor context).
-                let style_str = cascade::compute_styles(
-                    DomNode::Element {
-                        tag: tag.clone(),
-                        attributes: attributes.clone(),
-                        children: vec![],
-                    },
-                    &[],
-                    self.viewport_width,
-                );
+                // Build temporary references for the sequential cascade call.
+                let ancestor_refs: Vec<&DomNode> = owned_ancestors.iter().collect();
 
-                // Extract the computed style from the result.
-                let styled_attrs = if let DomNode::Element { attributes: a, .. } = &style_str {
-                    a.clone()
-                } else {
-                    attributes.clone()
-                };
-
-                // Build this node for ancestor context.
-                let this_node = DomNode::Element {
+                // Build a temporary node for matching.
+                let temp_node = DomNode::Element {
                     tag: tag.clone(),
-                    attributes: styled_attrs.clone(),
+                    attributes: attributes.clone(),
                     children: vec![],
                 };
 
-                let mut new_ancestors: Vec<&DomNode> = ancestors.to_vec();
-                let this_ref: &DomNode = &this_node;
-                new_ancestors.push(this_ref);
+                // Compute styles for this element using the full cascade.
+                let style_str = cascade::compute_element_style_public(
+                    &tag, &attributes, &temp_node, rules, index, &ancestor_refs,
+                );
 
-                // Process children in parallel if there are enough of them.
-                let new_children = if children.len() > 4 {
-                    self.parallel_apply_children(children, index, &new_ancestors)
+                // Build new attributes with data-nova-style.
+                let mut new_attributes = attributes;
+                new_attributes.retain(|(k, _)| k != "data-nova-style");
+                if !style_str.is_empty() {
+                    new_attributes.push(("data-nova-style".into(), style_str.clone()));
+                }
+
+                // Skip children if display: none.
+                if style_str.contains("display: none") {
+                    return DomNode::Element {
+                        tag,
+                        attributes: new_attributes,
+                        children: vec![],
+                    };
+                }
+
+                // Build this node as an ancestor for children.
+                let this_ancestor = DomNode::Element {
+                    tag: tag.clone(),
+                    attributes: new_attributes.clone(),
+                    children: vec![],
+                };
+
+                let mut child_ancestors: Vec<DomNode> = owned_ancestors.to_vec();
+                child_ancestors.push(this_ancestor);
+
+                // Process children in parallel if there are enough of them,
+                // and we're not too deep in the tree (avoid over-parallelizing).
+                let new_children = if children.len() > 4 && depth < 6 {
+                    let child_ancestors = Arc::new(child_ancestors);
+                    let rules = Arc::clone(rules);
+                    let index = Arc::clone(index);
+                    children
+                        .into_par_iter()
+                        .map(|child| {
+                            Self::apply_parallel(
+                                &rules, &index, child, &child_ancestors,
+                                viewport_width, depth + 1,
+                            )
+                        })
+                        .collect()
                 } else {
-                    self.sequential_apply_children(children, index, &new_ancestors)
+                    children
+                        .into_iter()
+                        .map(|child| {
+                            Self::apply_parallel(
+                                rules, index, child, &child_ancestors,
+                                viewport_width, depth + 1,
+                            )
+                        })
+                        .collect()
                 };
 
                 DomNode::Element {
                     tag,
-                    attributes: styled_attrs,
+                    attributes: new_attributes,
                     children: new_children,
                 }
             }
             DomNode::Document { children } => {
                 let new_children = if children.len() > 4 {
-                    self.parallel_apply_children(children, index, ancestors)
+                    let owned_ancestors = Arc::new(owned_ancestors.to_vec());
+                    let rules = Arc::clone(rules);
+                    let index = Arc::clone(index);
+                    children
+                        .into_par_iter()
+                        .map(|child| {
+                            Self::apply_parallel(
+                                &rules, &index, child, &owned_ancestors,
+                                viewport_width, depth + 1,
+                            )
+                        })
+                        .collect()
                 } else {
-                    self.sequential_apply_children(children, index, ancestors)
+                    children
+                        .into_iter()
+                        .map(|child| {
+                            Self::apply_parallel(
+                                rules, index, child, owned_ancestors,
+                                viewport_width, depth + 1,
+                            )
+                        })
+                        .collect()
                 };
                 DomNode::Document {
                     children: new_children,
                 }
             }
             other => other,
-        }
-    }
-
-    /// Process children in parallel using rayon.
-    fn parallel_apply_children(
-        &self,
-        children: Vec<DomNode>,
-        index: &RuleIndex,
-        ancestors: &[&DomNode],
-    ) -> Vec<DomNode> {
-        // We need to use `into_par_iter` but ancestors contain references
-        // that can't cross thread boundaries easily. Instead, we collect
-        // ancestors as owned nodes for the parallel pass.
-        let owned_ancestors: Vec<DomNode> = ancestors.iter().map(|&a| a.clone()).collect();
-
-        children
-            .into_par_iter()
-            .map(|child| {
-                let ancestor_refs: Vec<&DomNode> = owned_ancestors.iter().collect();
-                let sub_index = RuleIndex::build(&self.rules);
-                self.apply_styles_to_child(child, &sub_index, &ancestor_refs)
-            })
-            .collect()
-    }
-
-    /// Process children sequentially (for small child lists).
-    fn sequential_apply_children(
-        &self,
-        children: Vec<DomNode>,
-        index: &RuleIndex,
-        ancestors: &[&DomNode],
-    ) -> Vec<DomNode> {
-        children
-            .into_iter()
-            .map(|child| self.apply_styles_to_child(child, index, ancestors))
-            .collect()
-    }
-
-    /// Apply styles to a single child node (used by both parallel and sequential paths).
-    fn apply_styles_to_child(
-        &self,
-        child: DomNode,
-        index: &RuleIndex,
-        ancestors: &[&DomNode],
-    ) -> DomNode {
-        // Use the sequential cascade for the single-node computation,
-        // then recurse for its children.
-        let extra_css: Vec<String> = Vec::new();
-        cascade::compute_styles(child, &extra_css, self.viewport_width)
-    }
-}
-
-// ── RuleIndex (re-export for internal use) ──────────────────────────────────
-
-/// Pre-sorted index of CSS rules for fast selector matching.
-///
-/// This is a simplified version used internally by the parallel engine.
-/// The full implementation lives in `cascade.rs`.
-struct RuleIndex {
-    by_id: HashMap<String, Vec<usize>>,
-    by_class: HashMap<String, Vec<usize>>,
-    by_tag: HashMap<String, Vec<usize>>,
-    universal: Vec<usize>,
-}
-
-impl RuleIndex {
-    fn build(rules: &[CssRule]) -> Self {
-        let mut by_id: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut by_class: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut by_tag: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut universal: Vec<usize> = Vec::new();
-
-        for (i, rule) in rules.iter().enumerate() {
-            let mut indexed = false;
-            for sel in &rule.selector.selectors {
-                if let Some(last) = sel.parts.last() {
-                    if let Some(ref id) = last.id {
-                        by_id.entry(id.clone()).or_default().push(i);
-                        indexed = true;
-                    } else if !last.classes.is_empty() {
-                        by_class
-                            .entry(last.classes[0].clone())
-                            .or_default()
-                            .push(i);
-                        indexed = true;
-                    } else if let Some(ref tag) = last.tag {
-                        by_tag.entry(tag.clone()).or_default().push(i);
-                        indexed = true;
-                    }
-                }
-            }
-            if !indexed {
-                universal.push(i);
-            }
-        }
-
-        RuleIndex {
-            by_id,
-            by_class,
-            by_tag,
-            universal,
         }
     }
 }
@@ -300,28 +227,48 @@ pub fn parallel_compute_styles(
         rules.extend(parser::parse_stylesheet(css, viewport_width));
     }
 
+    // For very large stylesheets, skip rules with overly complex
+    // selectors (4+ compound parts) for performance.
+    let original_count = rules.len();
+    if rules.len() > 2000 {
+        rules.retain(|rule| {
+            rule.selector.selectors.iter().all(|sel| sel.parts.len() <= 4)
+        });
+        if rules.len() < original_count {
+            info!(
+                original = original_count,
+                retained = rules.len(),
+                dropped = original_count - rules.len(),
+                "parallel cascade: dropped complex CSS selectors for performance"
+            );
+        }
+    }
+
     info!(
         rule_count = rules.len(),
         "parallel cascade: parsed CSS rules"
     );
 
-    // For correctness, we delegate to the sequential cascade but wrap it
-    // with rayon parallelism at the top level. The sequential cascade
-    // already handles all the complex cascade logic (inheritance,
-    // specificity, !important, etc.). We parallelize by processing
-    // independent subtrees concurrently.
-    //
-    // For small DOMs, fall back to sequential.
+    // For small DOMs, fall back to sequential — rayon overhead isn't
+    // worth it when there are few nodes.
     let node_count = count_nodes(&dom);
     if node_count < 50 {
         debug!(node_count, "DOM too small for parallel cascade, using sequential");
         return cascade::compute_styles(dom, extra_css, viewport_width);
     }
 
+    info!(
+        node_count,
+        "DOM large enough for parallel cascade, using rayon"
+    );
+
+    // Use the parallel engine which delegates per-element style computation
+    // to the sequential cascade but processes sibling subtrees concurrently.
     let engine = ParallelStyleEngine::new(rules, viewport_width);
-    // Use the sequential cascade which handles everything correctly.
-    // The parallelism is applied at the subtree level.
-    cascade::compute_styles(dom, extra_css, viewport_width)
+    let styled = engine.compute(dom);
+
+    // Apply CSS background propagation (body → html) as the sequential path does.
+    cascade::propagate_body_background(styled)
 }
 
 /// Count nodes in a DOM tree.

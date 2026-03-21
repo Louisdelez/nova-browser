@@ -295,7 +295,7 @@ pub fn display_for_tag(tag: &str) -> &'static str {
         | "cite" | "dfn" | "kbd" | "mark" | "q" | "s" | "samp" | "time" | "var" | "wbr" => {
             "inline"
         }
-        "head" | "title" | "meta" | "link" | "style" | "script" | "noscript" | "template" => "none",
+        "head" | "title" | "meta" | "link" | "style" | "script" | "template" => "none",
         _ => "block",
     }
 }

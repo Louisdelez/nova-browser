@@ -3231,7 +3231,7 @@ fn display_for_tag(tag: &str) -> &'static str {
         "td" | "th" => "table-cell",
         "span" | "a" | "em" | "strong" | "b" | "i" | "u" | "code" | "small" | "br" | "img"
         | "input" | "label" | "select" | "button" | "textarea" => "inline",
-        "head" | "title" | "meta" | "link" | "style" | "script" | "noscript" => "none",
+        "head" | "title" | "meta" | "link" | "style" | "script" => "none",
         _ => "block",
     }
 }

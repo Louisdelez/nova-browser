@@ -29,6 +29,62 @@ const MAX_IMAGES_TO_FETCH: usize = 20;
 /// If an image takes longer than this, it is skipped.
 const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Extract a redirect URL from `<noscript><meta http-equiv="refresh" content="...">`.
+///
+/// Many sites (Google, etc.) include a `<noscript>` block with a meta refresh
+/// that redirects to a simpler, JS-free version of the page. Since NOVA's JS
+/// engine is limited, following this redirect gives a much better rendering.
+fn extract_noscript_redirect(node: &DomNode, base_url: &Option<Url>) -> Option<String> {
+    match node {
+        DomNode::Element { tag, children, .. } => {
+            if tag == "noscript" {
+                // Look for <meta http-equiv="refresh"> inside noscript.
+                for child in children {
+                    if let DomNode::Element { tag: t, attributes, .. } = child {
+                        if t == "meta" {
+                            let is_refresh = attributes.iter().any(|(k, v)| {
+                                k.eq_ignore_ascii_case("http-equiv")
+                                    && v.eq_ignore_ascii_case("refresh")
+                            });
+                            if is_refresh {
+                                if let Some((_, content)) = attributes.iter().find(|(k, _)| k.eq_ignore_ascii_case("content")) {
+                                    // Parse "0;url=..." or "0; url=..."
+                                    if let Some(url_part) = content.split("url=").nth(1).or_else(|| content.split("URL=").nth(1)) {
+                                        let raw_url = url_part.trim().trim_matches('"').trim_matches('\'');
+                                        // Resolve relative URL.
+                                        let resolved = if let Some(base) = base_url {
+                                            base.join(raw_url).map(|u| u.to_string()).unwrap_or_else(|_| raw_url.to_string())
+                                        } else {
+                                            raw_url.to_string()
+                                        };
+                                        return Some(resolved);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Recurse into children.
+            for child in children {
+                if let Some(url) = extract_noscript_redirect(child, base_url) {
+                    return Some(url);
+                }
+            }
+            None
+        }
+        DomNode::Document { children } => {
+            for child in children {
+                if let Some(url) = extract_noscript_redirect(child, base_url) {
+                    return Some(url);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Sub-resources extracted from a parsed DOM tree.
 #[derive(Debug, Default)]
 struct SubResources {
@@ -78,6 +134,16 @@ impl PipelineEngine {
 
         // Step 2: Parse into DOM
         let dom = self.parse(&response.body, &mime_type).await?;
+
+        // Step 2b: Check for <noscript> meta-refresh redirects.
+        // Sites like Google serve a <noscript> block with a meta refresh to a
+        // simpler HTML version when JS is limited. Follow that redirect.
+        if let TypedData::Dom(ref node) = dom {
+            if let Some(redirect_url) = extract_noscript_redirect(node, &Url::parse(url).ok()) {
+                info!("Pipeline: following noscript redirect to '{redirect_url}'");
+                return Box::pin(self.navigate(&redirect_url, viewport)).await;
+            }
+        }
 
         // Step 3: Extract sub-resources and resolve URLs
         let base_url = Url::parse(url).ok();

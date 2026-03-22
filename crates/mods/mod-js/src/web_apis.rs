@@ -596,6 +596,136 @@ pub const JS_WEB_APIS_SHIM: &str = r#"
         };
     }
 
+    // ── navigator.clipboard (Promise-based) ───────────────────────────────
+    // Some sites check for navigator.clipboard as a Promise-based API.
+    // The Rust-side sets a synchronous stub; here we wrap with Promises.
+    if (typeof navigator !== 'undefined' && navigator.clipboard) {
+        var _origWriteText = navigator.clipboard.writeText;
+        var _origReadText = navigator.clipboard.readText;
+        navigator.clipboard.writeText = function(text) {
+            try { if (_origWriteText) _origWriteText(text); } catch(e) {}
+            return Promise.resolve();
+        };
+        navigator.clipboard.readText = function() {
+            var result = '';
+            try { if (_origReadText) result = _origReadText(); } catch(e) {}
+            return Promise.resolve(result || '');
+        };
+        navigator.clipboard.write = function() { return Promise.resolve(); };
+        navigator.clipboard.read = function() { return Promise.resolve([]); };
+    }
+
+    // ── window.print stub ───────────────────────────────────────────────
+    if (typeof window !== 'undefined' && !window.print) {
+        window.print = function() {};
+    }
+
+    // ── window.open / window.close stubs ────────────────────────────────
+    if (typeof window !== 'undefined') {
+        if (!window.open) {
+            window.open = function(url) {
+                // For now, navigate in the current tab via location.href.
+                if (url && typeof window.location !== 'undefined') {
+                    try { window.location.href = url; } catch(e) {}
+                }
+                return window;
+            };
+        }
+        if (!window.close) {
+            window.close = function() { /* no-op — cannot close the window */ };
+        }
+    }
+
+    // ── localStorage / sessionStorage error resilience ──────────────────
+    // Wrap setItem to catch QuotaExceededError and other failures.
+    if (typeof localStorage !== 'undefined') {
+        var _origSetItem = localStorage.setItem;
+        localStorage.setItem = function(key, val) {
+            try {
+                _origSetItem.call(localStorage, key, val);
+            } catch(e) {
+                // Swallow storage errors (quota exceeded, security, etc.)
+            }
+        };
+    }
+    if (typeof sessionStorage !== 'undefined') {
+        var _origSessionSetItem = sessionStorage.setItem;
+        sessionStorage.setItem = function(key, val) {
+            try {
+                _origSessionSetItem.call(sessionStorage, key, val);
+            } catch(e) {
+                // Swallow storage errors
+            }
+        };
+    }
+
+    // ── console method completeness check ───────────────────────────────
+    // Ensure all standard console methods exist even if the Rust-side
+    // missed any (e.g., if called before the bridge sets them up).
+    if (typeof console !== 'undefined') {
+        var _noopFn = function() {};
+        var _consoleMethods = ['log','warn','error','info','debug','trace','table',
+            'group','groupEnd','groupCollapsed','time','timeEnd','timeLog',
+            'count','countReset','clear','assert','dir','dirxml','profile',
+            'profileEnd'];
+        for (var _i = 0; _i < _consoleMethods.length; _i++) {
+            if (typeof console[_consoleMethods[_i]] !== 'function') {
+                console[_consoleMethods[_i]] = _noopFn;
+            }
+        }
+    }
+
+    // ── Fetch API stub ──────────────────────────────────────────────────
+    // Minimal stub so sites probing for fetch don't crash.
+    if (typeof globalThis.fetch === 'undefined') {
+        globalThis.fetch = function(url, options) {
+            return Promise.reject(new Error('fetch not supported'));
+        };
+    }
+
+    // ── Headers / Request / Response stubs ──────────────────────────────
+    if (typeof globalThis.Headers === 'undefined') {
+        globalThis.Headers = function(init) {
+            this._headers = {};
+            if (init && typeof init === 'object') {
+                var keys = Object.keys(init);
+                for (var i = 0; i < keys.length; i++) {
+                    this._headers[keys[i].toLowerCase()] = String(init[keys[i]]);
+                }
+            }
+        };
+        Headers.prototype.get = function(name) { return this._headers[name.toLowerCase()] || null; };
+        Headers.prototype.set = function(name, value) { this._headers[name.toLowerCase()] = String(value); };
+        Headers.prototype.has = function(name) { return name.toLowerCase() in this._headers; };
+        Headers.prototype.append = function(name, value) { this._headers[name.toLowerCase()] = String(value); };
+        Headers.prototype['delete'] = function(name) { delete this._headers[name.toLowerCase()]; };
+    }
+
+    if (typeof globalThis.Request === 'undefined') {
+        globalThis.Request = function(input, init) {
+            this.url = typeof input === 'string' ? input : (input && input.url) || '';
+            this.method = (init && init.method) || 'GET';
+            this.headers = new Headers((init && init.headers) || {});
+            this.body = (init && init.body) || null;
+        };
+    }
+
+    if (typeof globalThis.Response === 'undefined') {
+        globalThis.Response = function(body, init) {
+            this.body = body || null;
+            this.status = (init && init.status) || 200;
+            this.statusText = (init && init.statusText) || 'OK';
+            this.ok = this.status >= 200 && this.status < 300;
+            this.headers = new Headers((init && init.headers) || {});
+        };
+        Response.prototype.text = function() { return Promise.resolve(String(this.body || '')); };
+        Response.prototype.json = function() {
+            try { return Promise.resolve(JSON.parse(this.body || '{}')); }
+            catch(e) { return Promise.reject(e); }
+        };
+        Response.prototype.clone = function() { return new Response(this.body, { status: this.status }); };
+    }
+
 })();
 "#;
 

@@ -183,27 +183,38 @@ impl StorageManager {
 }
 
 /// JavaScript shim code for the Storage constructor and localStorage/sessionStorage globals.
+///
+/// All methods are wrapped in try/catch to prevent storage errors (quota
+/// exceeded, security restrictions, etc.) from crashing the page.
 pub const JS_STORAGE_SHIM: &str = r#"
 function Storage(type) {
     this._type = type;
 }
 Storage.prototype.getItem = function(key) {
-    return __nova.__storageGetItem(this._type, key);
+    try { return __nova.__storageGetItem(this._type, key); }
+    catch(e) { return null; }
 };
 Storage.prototype.setItem = function(key, val) {
-    __nova.__storageSetItem(this._type, key, String(val));
+    try { __nova.__storageSetItem(this._type, key, String(val)); }
+    catch(e) { /* swallow quota/security errors */ }
 };
 Storage.prototype.removeItem = function(key) {
-    __nova.__storageRemoveItem(this._type, key);
+    try { __nova.__storageRemoveItem(this._type, key); }
+    catch(e) { /* swallow errors */ }
 };
 Storage.prototype.clear = function() {
-    __nova.__storageClear(this._type);
+    try { __nova.__storageClear(this._type); }
+    catch(e) { /* swallow errors */ }
 };
 Object.defineProperty(Storage.prototype, 'length', {
-    get: function() { return __nova.__storageLength(this._type); }
+    get: function() {
+        try { return __nova.__storageLength(this._type); }
+        catch(e) { return 0; }
+    }
 });
 Storage.prototype.key = function(i) {
-    return __nova.__storageKey(this._type, i);
+    try { return __nova.__storageKey(this._type, i); }
+    catch(e) { return null; }
 };
 
 var localStorage = new Storage('local');

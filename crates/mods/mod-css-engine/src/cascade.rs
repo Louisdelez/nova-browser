@@ -672,7 +672,6 @@ fn compute_element_style_impl(
         "font-style",
         "font-family",
         "text-align",
-        "text-decoration",
         "text-transform",
         "text-indent",
         "text-shadow",
@@ -745,6 +744,41 @@ fn compute_element_style_impl(
             origin: CascadeOrigin::AuthorStylesheet,
             important: false,
         });
+    }
+
+    // 1c. Table border propagation: when a `<td>` or `<th>` is inside a
+    //     `<table border="N">` (N > 0), inherit a 1px solid border on the
+    //     cell. This matches browser behaviour where `border="1"` on a table
+    //     gives all cells visible borders.
+    if matches!(tag, "td" | "th") {
+        for ancestor in ancestors.iter().rev() {
+            if let DomNode::Element { tag: atag, attributes: aattrs, .. } = ancestor {
+                if atag == "table" {
+                    if let Some((_, bval)) = aattrs.iter().find(|(k, _)| k == "border") {
+                        let num = bval.trim_end_matches("px");
+                        if let Ok(w) = num.parse::<f32>() {
+                            if w > 0.0 {
+                                declarations.push(CascadedDeclaration {
+                                    property: "border-width".into(),
+                                    value: "1px".into(),
+                                    specificity: Specificity(0, 0, 0),
+                                    origin: CascadeOrigin::UserAgent,
+                                    important: false,
+                                });
+                                declarations.push(CascadedDeclaration {
+                                    property: "border-style".into(),
+                                    value: "solid".into(),
+                                    specificity: Specificity(0, 0, 0),
+                                    origin: CascadeOrigin::UserAgent,
+                                    important: false,
+                                });
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     // 2. Stylesheet rules — use the index to only check candidate rules.

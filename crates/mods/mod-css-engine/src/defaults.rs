@@ -202,6 +202,17 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
             props.push(("padding-right".into(), StyleValue::Px(4.0)));
             props.push(("padding-bottom".into(), StyleValue::Px(1.0)));
             props.push(("padding-left".into(), StyleValue::Px(4.0)));
+            // <th> is bold and centered by default per the HTML spec.
+            if tag == "th" {
+                if let Some(fw) = props.iter_mut().find(|(k, _)| k == "font-weight") {
+                    fw.1 = StyleValue::Keyword("bold".into());
+                }
+                props.push(("text-align".into(), StyleValue::Keyword("center".into())));
+            }
+        }
+        "caption" => {
+            // <caption> is centered above/below the table by default.
+            props.push(("text-align".into(), StyleValue::Keyword("center".into())));
         }
         _ => {}
     }
@@ -399,7 +410,7 @@ pub fn display_for_tag(tag: &str) -> &'static str {
         | "details" | "summary" | "dialog" | "address" | "fieldset" | "legend" | "dd" | "dt"
         | "dl" | "hgroup" | "search" => "block",
         // Table elements
-        "table" | "thead" | "tbody" | "tfoot" => "block",
+        "table" | "thead" | "tbody" | "tfoot" | "caption" => "block",
         "tr" => "table-row",
         "td" | "th" => "table-cell",
         "span" | "a" | "em" | "strong" | "b" | "i" | "u" | "code" | "small" | "sub" | "sup"

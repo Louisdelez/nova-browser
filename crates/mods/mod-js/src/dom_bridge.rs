@@ -31,7 +31,10 @@ use crate::dom_api::{ElementHandle, JsDomTree};
 /// Collected console output lines.
 pub type ConsoleLog = Arc<Mutex<Vec<String>>>;
 
-/// Create a `console` JS object with `log`, `warn`, `error` methods.
+/// Create a `console` JS object with all standard methods.
+///
+/// Supports: `log`, `warn`, `error`, `info`, `debug`, `trace`, `table`,
+/// `group`, `groupEnd`, `time`, `timeEnd`, `count`, `clear`, `assert`, `dir`.
 pub fn create_console<'js>(ctx: &Ctx<'js>, log_store: ConsoleLog) -> Result<Object<'js>> {
     let console = Object::new(ctx.clone())?;
 
@@ -52,6 +55,87 @@ pub fn create_console<'js>(ctx: &Ctx<'js>, log_store: ConsoleLog) -> Result<Obje
         tracing::error!(msg = %msg, "console.error");
         store.lock().unwrap().push(format!("[ERROR] {msg}"));
     })))?;
+
+    let store = log_store.clone();
+    console.set("info", Func::from(MutFn::new(move |msg: String| {
+        tracing::info!(msg = %msg, "console.info");
+        store.lock().unwrap().push(format!("[INFO] {msg}"));
+    })))?;
+
+    let store = log_store.clone();
+    console.set("debug", Func::from(MutFn::new(move |msg: String| {
+        tracing::debug!(msg = %msg, "console.debug");
+        store.lock().unwrap().push(format!("[DEBUG] {msg}"));
+    })))?;
+
+    let store = log_store.clone();
+    console.set("trace", Func::from(MutFn::new(move |msg: String| {
+        tracing::trace!(msg = %msg, "console.trace");
+        store.lock().unwrap().push(format!("[TRACE] {msg}"));
+    })))?;
+
+    let store = log_store.clone();
+    console.set("table", Func::from(MutFn::new(move |msg: String| {
+        tracing::debug!(msg = %msg, "console.table");
+        store.lock().unwrap().push(format!("[TABLE] {msg}"));
+    })))?;
+
+    let store = log_store.clone();
+    console.set("group", Func::from(MutFn::new(move |msg: String| {
+        tracing::debug!(msg = %msg, "console.group");
+        store.lock().unwrap().push(format!("[GROUP] {msg}"));
+    })))?;
+
+    console.set("groupEnd", Func::from(|| {}))?;
+    console.set("groupCollapsed", Func::from(|_msg: String| {}))?;
+
+    let store = log_store.clone();
+    console.set("time", Func::from(MutFn::new(move |label: String| {
+        tracing::debug!(label = %label, "console.time");
+        store.lock().unwrap().push(format!("[TIME] {label}: start"));
+    })))?;
+
+    let store = log_store.clone();
+    console.set("timeEnd", Func::from(MutFn::new(move |label: String| {
+        tracing::debug!(label = %label, "console.timeEnd");
+        store.lock().unwrap().push(format!("[TIME] {label}: end"));
+    })))?;
+
+    let store = log_store.clone();
+    console.set("timeLog", Func::from(MutFn::new(move |label: String| {
+        tracing::debug!(label = %label, "console.timeLog");
+        store.lock().unwrap().push(format!("[TIME] {label}: log"));
+    })))?;
+
+    let store = log_store.clone();
+    console.set("count", Func::from(MutFn::new(move |label: String| {
+        tracing::debug!(label = %label, "console.count");
+        store.lock().unwrap().push(format!("[COUNT] {label}"));
+    })))?;
+
+    console.set("countReset", Func::from(|_label: String| {}))?;
+
+    let store = log_store.clone();
+    console.set("clear", Func::from(MutFn::new(move || {
+        tracing::debug!("console.clear");
+        store.lock().unwrap().clear();
+    })))?;
+
+    let store = log_store.clone();
+    console.set("assert", Func::from(MutFn::new(move |condition: bool, msg: String| {
+        if !condition {
+            tracing::error!(msg = %msg, "console.assert failed");
+            store.lock().unwrap().push(format!("[ASSERT] Assertion failed: {msg}"));
+        }
+    })))?;
+
+    let store = log_store.clone();
+    console.set("dir", Func::from(MutFn::new(move |msg: String| {
+        tracing::debug!(msg = %msg, "console.dir");
+        store.lock().unwrap().push(format!("[DIR] {msg}"));
+    })))?;
+
+    console.set("dirxml", Func::from(|_msg: String| {}))?;
 
     Ok(console)
 }
@@ -103,6 +187,18 @@ pub fn create_window<'js>(ctx: &Ctx<'js>, url: &str) -> Result<Object<'js>> {
     navigator.set("maxTouchPoints", 0)?;
     navigator.set("hardwareConcurrency", 4)?;
     navigator.set("doNotTrack", rquickjs::Null)?;
+
+    // ── navigator.clipboard stub ────────────────────────────────
+    let clipboard = Object::new(ctx.clone())?;
+    clipboard.set("writeText", Func::from(|_text: String| {
+        tracing::debug!("navigator.clipboard.writeText() — stub");
+    }))?;
+    clipboard.set("readText", Func::from(|| -> String {
+        tracing::debug!("navigator.clipboard.readText() — stub");
+        String::new()
+    }))?;
+    navigator.set("clipboard", clipboard)?;
+
     window.set("navigator", navigator)?;
 
     // ── dimensions ───────────────────────────────────────────────────
@@ -168,6 +264,27 @@ pub fn create_window<'js>(ctx: &Ctx<'js>, url: &str) -> Result<Object<'js>> {
     window.set("cancelAnimationFrame", Func::from(|_id: f64| {}))?;
     window.set("atob", Func::from(|_s: String| -> String { String::new() }))?;
     window.set("btoa", Func::from(|_s: String| -> String { String::new() }))?;
+
+    // ── window.open / window.close / window.print stubs ─────────
+    window.set("open", Func::from(|url: String| {
+        tracing::warn!(url = %url, "window.open() called — navigation not supported from JS, ignoring");
+    }))?;
+    window.set("close", Func::from(|| {
+        tracing::warn!("window.close() called — not supported, ignoring");
+    }))?;
+    window.set("print", Func::from(|| {
+        tracing::warn!("window.print() called — not supported, ignoring");
+    }))?;
+    window.set("stop", Func::from(|| {
+        tracing::debug!("window.stop() called — no-op");
+    }))?;
+    window.set("focus", Func::from(|| {}))?;
+    window.set("blur", Func::from(|| {}))?;
+    window.set("alert", Func::from(|msg: String| {
+        tracing::warn!(msg = %msg, "window.alert() called — not supported");
+    }))?;
+    window.set("confirm", Func::from(|_msg: String| -> bool { false }))?;
+    window.set("prompt", Func::from(|_msg: String| -> Option<String> { None }))?;
 
     Ok(window)
 }
@@ -2423,6 +2540,69 @@ pub const JS_DOM_SHIM: &str = r#"
         },
         configurable: true
     });
+
+    // ── document.write / document.writeln ────────────────────────
+    // During initial page load, append content to the body.
+    // After load, this is a no-op to avoid clearing the page.
+    document.write = function() {
+        var html = Array.prototype.slice.call(arguments).join('');
+        // Try to append to body immediately.
+        try {
+            var body = document.body;
+            if (body) {
+                var temp = document.createElement('div');
+                temp.innerHTML = html;
+                var children = temp.childNodes;
+                for (var ci = 0; ci < children.length; ci++) {
+                    body.appendChild(children[ci]);
+                }
+            }
+        } catch(e) { /* silently ignore errors */ }
+    };
+    document.writeln = function() {
+        var html = Array.prototype.slice.call(arguments).join('') + "\n";
+        document.write(html);
+    };
+
+    // ── document.execCommand() ──────────────────────────────────
+    // Stub all commands — returns false (not supported).
+    document.execCommand = function(command, showUI, value) {
+        if (typeof console !== 'undefined') console.debug("[NOVA] document.execCommand('" + command + "') — not supported");
+        return false;
+    };
+    document.queryCommandEnabled = function(command) { return false; };
+    document.queryCommandSupported = function(command) { return false; };
+    document.queryCommandState = function(command) { return false; };
+    document.queryCommandValue = function(command) { return ''; };
+
+    // ── document.createNodeIterator stub ─────────────────────────
+    document.createNodeIterator = function(root, whatToShow, filter) {
+        return {
+            root: root, referenceNode: root, pointerBeforeReferenceNode: true,
+            whatToShow: whatToShow || 0xFFFFFFFF, filter: filter || null,
+            nextNode: function() { return null; },
+            previousNode: function() { return null; },
+            detach: function() {}
+        };
+    };
+
+    // ── document.createRange (if not already defined) ────────────
+    if (!document.createRange) {
+        document.createRange = function() {
+            return {
+                startContainer: null, startOffset: 0, endContainer: null, endOffset: 0,
+                collapsed: true, setStart: function(n, o) { this.startContainer = n; this.startOffset = o; },
+                setEnd: function(n, o) { this.endContainer = n; this.endOffset = o; },
+                collapse: function() { this.collapsed = true; }, selectNode: function() {},
+                selectNodeContents: function() {}, cloneRange: function() { return document.createRange(); },
+                detach: function() {}, getBoundingClientRect: function() {
+                    return { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, bottom: 0, right: 0 };
+                },
+                getClientRects: function() { return []; },
+                createContextualFragment: function(html) { var d = document.createElement('div'); d.innerHTML = html; return d; }
+            };
+        };
+    }
 
     // ── Canvas 2D Context ──────────────────────────────────────────────
 

@@ -64,6 +64,12 @@ pub struct Tab {
     /// Index of the currently hovered option in the dropdown.
     pub dropdown_hover_idx: Option<usize>,
 
+    // -- Smooth scrolling --
+    /// Target vertical scroll offset for smooth scroll animation.
+    pub scroll_target_y: f32,
+    /// Target horizontal scroll offset for smooth scroll animation.
+    pub scroll_target_x: f32,
+
     // -- Find in Page (Ctrl+F) --
     /// Whether the find bar is visible.
     pub find_bar_visible: bool,
@@ -111,6 +117,8 @@ impl Tab {
             field_click_count: 0,
             cursor_blink_time: Instant::now(),
             cursor_visible: true,
+            scroll_target_y: 0.0,
+            scroll_target_x: 0.0,
             dropdown_open: false,
             dropdown_field_idx: 0,
             dropdown_hover_idx: None,

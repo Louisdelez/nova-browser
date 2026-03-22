@@ -140,6 +140,11 @@ impl QuickJsRuntime {
     ///
     /// Re-registers the bridge functions before evaluation to ensure
     /// the document object reflects the current tree state.
+    ///
+    /// Scripts are wrapped in a try/catch at the JS level so that
+    /// unhandled exceptions do not crash the browser or prevent the
+    /// page from rendering. Errors are logged and the best DOM state
+    /// is preserved.
     pub fn eval_with_dom(&self, source: &str) -> JsValue {
         let tree_ref = self.tree.clone();
         self.context.with(|ctx| {
@@ -150,7 +155,14 @@ impl QuickJsRuntime {
             // Re-install the DOM shim.
             let _ = ctx.eval::<(), _>(dom_bridge::JS_DOM_SHIM);
 
-            match ctx.eval::<Value<'_>, _>(source) {
+            // Wrap the script in a try/catch so that unhandled errors
+            // do not prevent subsequent scripts from running or the
+            // DOM from being returned in its current (partial) state.
+            let wrapped = format!(
+                "try {{ {source}\n}} catch(__nova_err) {{ console.error('[NOVA] Script error: ' + __nova_err); undefined; }}"
+            );
+
+            match ctx.eval::<Value<'_>, _>(wrapped.as_str()) {
                 Ok(val) => convert_value(&val),
                 Err(e) => {
                     warn!(error = %e, "QuickJS eval error");

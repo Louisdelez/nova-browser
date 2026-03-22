@@ -50,6 +50,12 @@ const SCROLL_STEP: f32 = 40.0;
 const ARROW_SCROLL_STEP: f32 = 40.0;
 /// Fraction of viewport height scrolled per Page Up/Down press.
 const PAGE_SCROLL_FRACTION: f32 = 0.9;
+/// Interpolation factor for smooth scrolling (0.0 = no movement, 1.0 = instant).
+/// Higher values make scrolling snappier; lower values make it smoother.
+const SMOOTH_SCROLL_FACTOR: f32 = 0.25;
+/// When the remaining scroll distance is below this threshold (in pixels),
+/// snap directly to the target to avoid sub-pixel drifting.
+const SMOOTH_SCROLL_SNAP_THRESHOLD: f32 = 0.5;
 
 // ---------------------------------------------------------------------------
 // Hit regions (clickable links)
@@ -568,15 +574,44 @@ impl BrowserWindow {
         max_x
     }
 
-    /// Clamp `scroll_y` to the valid range `[0, max_scroll]`.
+    /// Advance smooth scroll animation by one step.
+    ///
+    /// Returns `true` if the scroll is still animating (i.e. scroll_y or
+    /// scroll_x have not yet reached their targets).
+    fn tick_smooth_scroll(&mut self) -> bool {
+        let tab = self.tabs.active_tab_mut();
+        let mut animating = false;
+
+        let dy = tab.scroll_target_y - tab.scroll_y;
+        if dy.abs() > SMOOTH_SCROLL_SNAP_THRESHOLD {
+            tab.scroll_y += dy * SMOOTH_SCROLL_FACTOR;
+            animating = true;
+        } else if dy.abs() > 0.0 {
+            tab.scroll_y = tab.scroll_target_y;
+        }
+
+        let dx = tab.scroll_target_x - tab.scroll_x;
+        if dx.abs() > SMOOTH_SCROLL_SNAP_THRESHOLD {
+            tab.scroll_x += dx * SMOOTH_SCROLL_FACTOR;
+            animating = true;
+        } else if dx.abs() > 0.0 {
+            tab.scroll_x = tab.scroll_target_x;
+        }
+
+        animating
+    }
+
+    /// Clamp `scroll_y` and `scroll_target_y` to the valid range `[0, max_scroll]`.
     fn clamp_scroll(&mut self) {
         let page_viewport = (self.height as f32 - CHROME_HEIGHT).max(0.0);
         let tab = self.tabs.active_tab_mut();
         let max_scroll = (tab.content_height - page_viewport).max(0.0);
         tab.scroll_y = tab.scroll_y.clamp(0.0, max_scroll);
+        tab.scroll_target_y = tab.scroll_target_y.clamp(0.0, max_scroll);
         // Clamp horizontal scroll.
         let max_scroll_x = (tab.content_width - self.width as f32).max(0.0);
         tab.scroll_x = tab.scroll_x.clamp(0.0, max_scroll_x);
+        tab.scroll_target_x = tab.scroll_target_x.clamp(0.0, max_scroll_x);
     }
 
     // -- Link interaction helpers -------------------------------------------
@@ -2208,6 +2243,8 @@ impl BrowserWindow {
                 tab.render_commands = cmds;
                 tab.scroll_y = 0.0;
                 tab.scroll_x = 0.0;
+                tab.scroll_target_y = 0.0;
+                tab.scroll_target_x = 0.0;
                 tab.url = url.to_string();
                 tab.title = url.to_string();
 
@@ -2321,8 +2358,8 @@ impl BrowserWindow {
         let find_current = tab.find_current;
         if let Some(m) = tab.find_matches.get(find_current) {
             let page_viewport = (self.height as f32 - CHROME_HEIGHT).max(0.0);
-            // Center the match vertically in the viewport.
-            tab.scroll_y = (m.y - page_viewport / 2.0).max(0.0);
+            // Center the match vertically in the viewport (smooth scroll).
+            tab.scroll_target_y = (m.y - page_viewport / 2.0).max(0.0);
         }
         self.clamp_scroll();
     }
@@ -2744,6 +2781,8 @@ impl BrowserWindow {
                 tab.render_commands = cmds;
                 tab.scroll_y = 0.0;
                 tab.scroll_x = 0.0;
+                tab.scroll_target_y = 0.0;
+                tab.scroll_target_x = 0.0;
                 tab.url = effective_url.to_string();
                 tab.title = effective_url.to_string();
 
@@ -2851,6 +2890,8 @@ impl BrowserWindow {
                 tab.render_commands = cmds;
                 tab.scroll_y = 0.0;
                 tab.scroll_x = 0.0;
+                tab.scroll_target_y = 0.0;
+                tab.scroll_target_x = 0.0;
                 tab.url = url.to_string();
                 tab.title = url.to_string();
 
@@ -3009,7 +3050,9 @@ pre {{ font-family: monospace; font-size: 13px; white-space: pre-wrap; word-wrap
     fn scroll_to_anchor(&mut self, anchor_id: &str) {
         if anchor_id.is_empty() {
             // Empty fragment = scroll to top.
-            self.tabs.active_tab_mut().scroll_y = 0.0;
+            let tab = self.tabs.active_tab_mut();
+            tab.scroll_target_y = 0.0;
+            tab.scroll_y = 0.0;
             self.clamp_scroll();
             return;
         }
@@ -3018,7 +3061,7 @@ pre {{ font-family: monospace; font-size: 13px; white-space: pre-wrap; word-wrap
             if anchor.id == anchor_id {
                 info!("Scrolling to anchor '{}' at y={}", anchor_id, anchor.y);
                 let y = anchor.y;
-                self.tabs.active_tab_mut().scroll_y = y;
+                self.tabs.active_tab_mut().scroll_target_y = y;
                 self.clamp_scroll();
                 return;
             }
@@ -3039,6 +3082,22 @@ impl ApplicationHandler for BrowserWindow {
         let notification_active = self.notification_time
             .map(|t| t.elapsed().as_millis() < 2000)
             .unwrap_or(false);
+
+        // Smooth scroll animation: interpolate scroll_y/scroll_x toward
+        // their targets each frame.
+        let scroll_animating = self.tick_smooth_scroll();
+        if scroll_animating {
+            self.clamp_scroll();
+            self.rebuild_framebuffer();
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            // Keep waking up for the next animation frame (~60fps).
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + std::time::Duration::from_millis(16),
+            ));
+            return;
+        }
 
         // When a text field is focused, schedule periodic redraws for cursor blinking.
         if self.tabs.active_tab().focused_field.is_some() {
@@ -3140,11 +3199,11 @@ impl ApplicationHandler for BrowserWindow {
                 let tab = self.tabs.active_tab_mut();
                 let mut changed = false;
                 if dy.abs() > 0.01 {
-                    tab.scroll_y += dy;
+                    tab.scroll_target_y += dy;
                     changed = true;
                 }
                 if dx.abs() > 0.01 {
-                    tab.scroll_x += dx;
+                    tab.scroll_target_x += dx;
                     changed = true;
                 }
                 if changed {
@@ -3445,44 +3504,46 @@ impl ApplicationHandler for BrowserWindow {
                 }
 
                 // Page scrolling (only when URL bar is not focused).
+                // Updates scroll_target for smooth interpolation; the actual
+                // scroll_y/scroll_x values are advanced in tick_smooth_scroll.
                 if event.state == ElementState::Pressed {
                     let page_viewport = (self.height as f32 - CHROME_HEIGHT).max(0.0);
                     let tab = self.tabs.active_tab_mut();
                     let scrolled = match event.logical_key {
                         Key::Named(NamedKey::ArrowDown) => {
-                            tab.scroll_y += ARROW_SCROLL_STEP;
+                            tab.scroll_target_y += ARROW_SCROLL_STEP;
                             true
                         }
                         Key::Named(NamedKey::ArrowUp) => {
-                            tab.scroll_y -= ARROW_SCROLL_STEP;
+                            tab.scroll_target_y -= ARROW_SCROLL_STEP;
                             true
                         }
                         Key::Named(NamedKey::ArrowRight) => {
-                            tab.scroll_x += ARROW_SCROLL_STEP;
+                            tab.scroll_target_x += ARROW_SCROLL_STEP;
                             true
                         }
                         Key::Named(NamedKey::ArrowLeft) => {
-                            tab.scroll_x -= ARROW_SCROLL_STEP;
+                            tab.scroll_target_x -= ARROW_SCROLL_STEP;
                             true
                         }
                         Key::Named(NamedKey::PageDown) => {
-                            tab.scroll_y += page_viewport * PAGE_SCROLL_FRACTION;
+                            tab.scroll_target_y += page_viewport * PAGE_SCROLL_FRACTION;
                             true
                         }
                         Key::Named(NamedKey::PageUp) => {
-                            tab.scroll_y -= page_viewport * PAGE_SCROLL_FRACTION;
+                            tab.scroll_target_y -= page_viewport * PAGE_SCROLL_FRACTION;
                             true
                         }
                         Key::Named(NamedKey::Home) => {
-                            tab.scroll_y = 0.0;
+                            tab.scroll_target_y = 0.0;
                             true
                         }
                         Key::Named(NamedKey::End) => {
-                            tab.scroll_y = tab.content_height;
+                            tab.scroll_target_y = tab.content_height;
                             true
                         }
                         Key::Named(NamedKey::Space) => {
-                            tab.scroll_y += page_viewport * PAGE_SCROLL_FRACTION;
+                            tab.scroll_target_y += page_viewport * PAGE_SCROLL_FRACTION;
                             true
                         }
                         _ => false,

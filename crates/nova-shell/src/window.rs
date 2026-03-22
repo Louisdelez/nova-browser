@@ -56,6 +56,8 @@ pub struct HitRegion {
     pub width: f32,
     pub height: f32,
     pub url: String,
+    /// The `title` attribute text (for tooltip).
+    pub title: String,
 }
 
 impl HitRegion {
@@ -100,6 +102,14 @@ pub struct FormFieldRegion {
     pub maxlength: Option<usize>,
     /// Min character length.
     pub minlength: Option<usize>,
+    /// Whether this field has the `autofocus` attribute.
+    pub autofocus: bool,
+    /// The `tabindex` attribute value (None = not specified).
+    pub tabindex: Option<i32>,
+    /// The `title` attribute text (for tooltip).
+    pub title: String,
+    /// Whether `pointer-events: none` is set on this element.
+    pub pointer_events_none: bool,
 }
 
 impl FormFieldRegion {
@@ -287,6 +297,15 @@ pub struct BrowserWindow {
     vello_backend: VelloBackend,
     /// Whether to attempt GPU rendering (disabled if GPU init fails).
     use_gpu_rendering: bool,
+
+    // -- Tooltip state --
+    /// Text to display as a tooltip (from `title` attribute).
+    tooltip_text: String,
+    /// Position of the tooltip in window coordinates.
+    tooltip_x: f32,
+    tooltip_y: f32,
+    /// Time when the cursor started hovering over the element with a title.
+    tooltip_hover_start: Option<Instant>,
 }
 
 /// A match found during Find in Page.
@@ -334,7 +353,7 @@ impl BrowserWindow {
         let mut vello_backend = VelloBackend::new();
         vello_backend.init(1.0);
 
-        Self {
+        let mut browser = Self {
             window: None,
             gpu: None,
             framebuffer: fb,
@@ -379,6 +398,81 @@ impl BrowserWindow {
             downloads_manager: DownloadsManager::new(),
             vello_backend,
             use_gpu_rendering: false, // Disabled: Vello text rendering not yet complete; software FreeType renderer used.
+            tooltip_text: String::new(),
+            tooltip_x: 0.0,
+            tooltip_y: 0.0,
+            tooltip_hover_start: None,
+        };
+
+        // Autofocus: find the first form field with autofocus and set it as focused.
+        browser.apply_autofocus();
+
+        browser
+    }
+
+    /// Set focus to the first form field with the `autofocus` attribute.
+    fn apply_autofocus(&mut self) {
+        if self.focused_field.is_some() {
+            return;
+        }
+        for (i, field) in self.form_fields.iter().enumerate() {
+            if field.autofocus && !matches!(field.field_type.as_str(), "hidden") {
+                self.focused_field = Some(i);
+                self.form_cursor_pos = field.value.len();
+                break;
+            }
+        }
+    }
+
+    /// Find the next focusable form field index after `current_idx`, respecting `tabindex`.
+    ///
+    /// Elements with `tabindex=-1` are skipped. Positive tabindex values are visited
+    /// first in ascending order, then `tabindex=0` and unspecified follow in document order.
+    fn next_tab_field(&self, current_idx: usize) -> Option<usize> {
+        let total = self.form_fields.len();
+        if total == 0 {
+            return None;
+        }
+
+        // Build a tab-order sorted list of focusable field indices.
+        let mut tab_order: Vec<usize> = Vec::new();
+
+        // First: positive tabindex fields in ascending order.
+        let mut positive: Vec<(i32, usize)> = Vec::new();
+        // Then: tabindex=0 or unspecified in document order.
+        let mut natural: Vec<usize> = Vec::new();
+
+        for (i, field) in self.form_fields.iter().enumerate() {
+            // Skip non-tabbable fields.
+            if field.tabindex == Some(-1) {
+                continue;
+            }
+            if matches!(field.field_type.as_str(), "hidden") {
+                continue;
+            }
+            match field.tabindex {
+                Some(ti) if ti > 0 => positive.push((ti, i)),
+                _ => natural.push(i), // 0 or None
+            }
+        }
+
+        positive.sort_by_key(|(ti, _)| *ti);
+        for (_, idx) in &positive {
+            tab_order.push(*idx);
+        }
+        tab_order.extend(natural);
+
+        if tab_order.is_empty() {
+            return None;
+        }
+
+        // Find where current_idx is in the tab order and return the next one.
+        if let Some(pos) = tab_order.iter().position(|&i| i == current_idx) {
+            let next_pos = (pos + 1) % tab_order.len();
+            Some(tab_order[next_pos])
+        } else {
+            // Current field not in tab order; return first tabbable field.
+            Some(tab_order[0])
         }
     }
 
@@ -390,13 +484,14 @@ impl BrowserWindow {
             .ops
             .iter()
             .filter_map(|op| {
-                if let RenderOp::Link { x, y, width, height, url } = op {
+                if let RenderOp::Link { x, y, width, height, url, title } = op {
                     Some(HitRegion {
                         x: *x,
                         y: *y,
                         width: *width,
                         height: *height,
                         url: url.clone(),
+                        title: title.clone(),
                     })
                 } else {
                     None
@@ -413,6 +508,7 @@ impl BrowserWindow {
                 name, form_action, form_method, form_enctype,
                 placeholder, checked, required, options,
                 pattern, min, max, maxlength, minlength,
+                autofocus, tabindex, title, pointer_events_none,
             } = op {
                 Some(FormFieldRegion {
                     x: *x, y: *y, width: *width, height: *height,
@@ -423,6 +519,8 @@ impl BrowserWindow {
                     required: *required, options: options.clone(),
                     pattern: pattern.clone(), min: min.clone(), max: max.clone(),
                     maxlength: *maxlength, minlength: *minlength,
+                    autofocus: *autofocus, tabindex: *tabindex,
+                    title: title.clone(), pointer_events_none: *pointer_events_none,
                 })
             } else {
                 None
@@ -508,16 +606,57 @@ impl BrowserWindow {
     }
 
     /// Update the cursor icon based on whether the cursor is over a link or form field.
-    fn update_cursor(&self) {
+    /// Also updates tooltip state based on `title` attributes.
+    fn update_cursor(&mut self) {
+        let win_x = self.cursor_x;
+        let win_y = self.cursor_y;
+
+        // Determine tooltip text from hovered element.
+        let mut new_tooltip = String::new();
+        if (win_y as f32) > URL_BAR_HEIGHT {
+            let page_x = win_x as f32 + self.scroll_x;
+            let page_y = (win_y as f32 - URL_BAR_HEIGHT) + self.scroll_y;
+
+            // Check links for title.
+            for region in &self.hit_regions {
+                if region.contains(page_x, page_y) && !region.title.is_empty() {
+                    new_tooltip = region.title.clone();
+                    break;
+                }
+            }
+            // Check form fields for title.
+            if new_tooltip.is_empty() {
+                for field in &self.form_fields {
+                    if field.contains(page_x, page_y) && !field.title.is_empty() {
+                        new_tooltip = field.title.clone();
+                        break;
+                    }
+                }
+            }
+        }
+
+        if new_tooltip != self.tooltip_text {
+            if new_tooltip.is_empty() {
+                self.tooltip_text.clear();
+                self.tooltip_hover_start = None;
+            } else {
+                self.tooltip_text = new_tooltip;
+                self.tooltip_hover_start = Some(Instant::now());
+                self.tooltip_x = win_x as f32 + 12.0;
+                self.tooltip_y = win_y as f32 + 20.0;
+            }
+        }
+
         if let Some(w) = &self.window {
-            if self.hit_test(self.cursor_x, self.cursor_y).is_some() {
+            if self.hit_test_no_pointer_events(win_x, win_y).is_some() {
                 w.set_cursor(CursorIcon::Pointer);
-            } else if (self.cursor_y as f32) > URL_BAR_HEIGHT {
+            } else if (win_y as f32) > URL_BAR_HEIGHT {
                 // Check if cursor is over a text-like form field.
-                let page_x = self.cursor_x as f32 + self.scroll_x;
-                let page_y = (self.cursor_y as f32 - URL_BAR_HEIGHT) + self.scroll_y;
+                let page_x = win_x as f32 + self.scroll_x;
+                let page_y = (win_y as f32 - URL_BAR_HEIGHT) + self.scroll_y;
                 let over_text_field = self.form_fields.iter().any(|f| {
                     f.contains(page_x, page_y)
+                        && !f.pointer_events_none
                         && matches!(
                             f.field_type.as_str(),
                             "text" | "password" | "email" | "number" | "search"
@@ -533,6 +672,11 @@ impl BrowserWindow {
                 w.set_cursor(CursorIcon::Default);
             }
         }
+    }
+
+    /// Hit test for links, but also considering pointer-events on form fields.
+    fn hit_test_no_pointer_events(&self, win_x: f64, win_y: f64) -> Option<&str> {
+        self.hit_test(win_x, win_y)
     }
 
     /// Run the window event loop (blocking).
@@ -759,6 +903,50 @@ impl BrowserWindow {
 
         // Draw zoom indicator.
         self.draw_zoom_indicator();
+
+        // Draw tooltip overlay (after a 500ms hover delay).
+        self.draw_tooltip();
+    }
+
+    /// Draw a tooltip overlay if hovering over an element with a `title` attribute.
+    fn draw_tooltip(&mut self) {
+        if self.tooltip_text.is_empty() {
+            return;
+        }
+        // Show tooltip only after 500ms of hovering.
+        if let Some(start) = self.tooltip_hover_start {
+            if start.elapsed().as_millis() < 500 {
+                return;
+            }
+        } else {
+            return;
+        }
+
+        let text = &self.tooltip_text;
+        let font_size = 12.0_f32;
+        let char_w = font_size * 0.6;
+        let padding = 4.0_f32;
+        let tip_w = (text.len() as f32 * char_w + padding * 2.0).min(self.width as f32 - 10.0);
+        let tip_h = font_size + padding * 2.0;
+
+        // Clamp position so tooltip stays on screen.
+        let tx = self.tooltip_x.min(self.width as f32 - tip_w - 2.0).max(2.0);
+        let ty = self.tooltip_y.min(self.height as f32 - tip_h - 2.0).max(2.0);
+
+        // Background.
+        let bg = Color { r: 1.0, g: 1.0, b: 0.88, a: 1.0 }; // light yellow
+        let border = Color::rgb(0.6, 0.6, 0.6);
+        self.framebuffer.fill_rect(tx, ty, tip_w, tip_h, bg);
+        self.framebuffer.fill_rect(tx, ty, tip_w, 1.0, border);
+        self.framebuffer.fill_rect(tx, ty + tip_h - 1.0, tip_w, 1.0, border);
+        self.framebuffer.fill_rect(tx, ty, 1.0, tip_h, border);
+        self.framebuffer.fill_rect(tx + tip_w - 1.0, ty, 1.0, tip_h, border);
+        // Text.
+        self.framebuffer.draw_text(
+            tx + padding, ty + font_size + padding - 2.0,
+            text, font_size, Color::BLACK,
+            None, None, None, None,
+        );
     }
 
     /// Redraw form fields that the user has modified (typed text into).
@@ -1454,21 +1642,15 @@ impl BrowserWindow {
                 return true;
             }
             Key::Named(NamedKey::Tab) => {
-                // Move focus to the next focusable form field (skip hidden, submit, button).
+                // Move focus to the next focusable form field, respecting tabindex.
+                // tabindex=-1 means not tabbable; positive values are visited first
+                // in ascending order; 0 means natural document order.
                 if !self.form_fields.is_empty() {
-                    let total = self.form_fields.len();
-                    let mut next = (idx + 1) % total;
-                    let mut attempts = 0;
-                    while attempts < total {
-                        let ft = self.form_fields[next].field_type.as_str();
-                        if !matches!(ft, "hidden" | "submit" | "button" | "reset") {
-                            break;
-                        }
-                        next = (next + 1) % total;
-                        attempts += 1;
+                    let next = self.next_tab_field(idx);
+                    if let Some(next_idx) = next {
+                        self.focused_field = Some(next_idx);
+                        self.form_cursor_pos = self.form_fields[next_idx].value.len();
                     }
-                    self.focused_field = Some(next);
-                    self.form_cursor_pos = self.form_fields[next].value.len();
                 }
                 return true;
             }
@@ -1645,6 +1827,7 @@ impl BrowserWindow {
                 if let Some(w) = &self.window {
                     w.set_title(&format!("NOVA - {}", self.url_bar_text));
                 }
+                self.apply_autofocus();
                 self.request_redraw();
             }
             Ok(_) => {
@@ -1952,6 +2135,7 @@ impl BrowserWindow {
                     w.set_title(&format!("NOVA - {}", self.url_bar_text));
                 }
 
+                self.apply_autofocus();
                 self.request_redraw();
             }
             Ok(_) => {
@@ -2385,9 +2569,10 @@ impl ApplicationHandler for BrowserWindow {
                     }
 
                     // Check for form field clicks — focus the field.
+                    // Skip fields with pointer-events: none.
                     let mut clicked_field = None;
                     for (i, field) in self.form_fields.iter().enumerate() {
-                        if field.contains(page_x, page_y) {
+                        if field.contains(page_x, page_y) && !field.pointer_events_none {
                             clicked_field = Some(i);
                             break;
                         }

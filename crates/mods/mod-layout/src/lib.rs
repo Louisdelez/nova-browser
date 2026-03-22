@@ -711,6 +711,16 @@ fn add_node(
                 if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "placeholder") {
                     props.push(("nova-form-placeholder".into(), StyleValue::Str(v.clone())));
                 }
+                // Forward autofocus, tabindex, title, and pointer-events.
+                if attributes.iter().any(|(k, _)| k == "autofocus") {
+                    props.push(("nova-form-autofocus".into(), StyleValue::Str("true".into())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "tabindex") {
+                    props.push(("nova-form-tabindex".into(), StyleValue::Str(v.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "title") {
+                    props.push(("nova-form-title".into(), StyleValue::Str(v.clone())));
+                }
 
                 let ctx = NodeContext {
                     content: LayoutContent::Block,
@@ -722,6 +732,65 @@ fn add_node(
                         taffy.set_node_context(id, Some(ctx)).ok();
                         id
                     })
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+            }
+
+            // ── <progress> and <meter> elements → sized leaf nodes ──────
+            if tag == "progress" || tag == "meter" {
+                let lp = parse_layout_props(attributes, viewport);
+                let w = lp.width
+                    .and_then(|d| match d { Dimension::Length(px) => Some(px), _ => None })
+                    .unwrap_or(160.0);
+                let h = lp.height
+                    .and_then(|d| match d { Dimension::Length(px) => Some(px), _ => None })
+                    .unwrap_or(16.0);
+
+                let value_str = attributes.iter()
+                    .find(|(k, _)| k == "value")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                let max_str = attributes.iter()
+                    .find(|(k, _)| k == "max")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| "1".to_string());
+
+                let mut props = vec![
+                    ("nova-widget-type".into(), StyleValue::Str(tag.clone())),
+                    ("nova-widget-value".into(), StyleValue::Str(value_str)),
+                    ("nova-widget-max".into(), StyleValue::Str(max_str)),
+                ];
+                // <meter> has additional low/high/optimum attributes.
+                if tag == "meter" {
+                    if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "min") {
+                        props.push(("nova-widget-min".into(), StyleValue::Str(v.clone())));
+                    }
+                    if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "low") {
+                        props.push(("nova-widget-low".into(), StyleValue::Str(v.clone())));
+                    }
+                    if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "high") {
+                        props.push(("nova-widget-high".into(), StyleValue::Str(v.clone())));
+                    }
+                    if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "optimum") {
+                        props.push(("nova-widget-optimum".into(), StyleValue::Str(v.clone())));
+                    }
+                }
+
+                let ctx = NodeContext {
+                    content: LayoutContent::Block,
+                    style: StyleMap { properties: props },
+                };
+                return taffy
+                    .new_leaf_with_context(
+                        Style {
+                            display: Display::Flex,
+                            size: Size {
+                                width: Dimension::Length(w),
+                                height: Dimension::Length(h),
+                            },
+                            ..Style::DEFAULT
+                        },
+                        ctx,
+                    )
                     .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
             }
 
@@ -1010,6 +1079,9 @@ fn add_node(
             if tag == "a" {
                 if let Some(href) = attributes.iter().find(|(k, _)| k == "href") {
                     props.push(("href".into(), StyleValue::Str(href.1.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "title") {
+                    props.push(("nova-title".into(), StyleValue::Str(v.clone())));
                 }
             }
 
@@ -1986,13 +2058,30 @@ fn flatten_node_recursive(
                         .unwrap_or((text_w + pad).max(min_w));
                     (default_w, line_height + 6.0)
                 };
+                // Build style props with extra form attributes.
+                let mut field_style = style_props.to_vec();
+                if attributes.iter().any(|(k, _)| k == "autofocus") {
+                    field_style.push(("nova-form-autofocus".into(), StyleValue::Str("true".into())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "tabindex") {
+                    field_style.push(("nova-form-tabindex".into(), StyleValue::Str(v.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "title") {
+                    field_style.push(("nova-form-title".into(), StyleValue::Str(v.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "name") {
+                    field_style.push(("nova-form-name".into(), StyleValue::Str(v.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "placeholder") {
+                    field_style.push(("nova-form-placeholder".into(), StyleValue::Str(v.clone())));
+                }
                 items.push(InlineItem::FormField {
                     tag: tag.clone(),
                     input_type,
                     label,
                     width: w,
                     height: h,
-                    style: style_props.to_vec(),
+                    style: field_style,
                 });
                 return;
             }
@@ -2035,10 +2124,13 @@ fn flatten_node_recursive(
                 }
             }
 
-            // Propagate href for links.
+            // Propagate href and title for links.
             if tag == "a" {
                 if let Some(href) = attributes.iter().find(|(k, _)| k == "href") {
                     child_props.push(("href".into(), StyleValue::Str(href.1.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "title") {
+                    child_props.push(("nova-title".into(), StyleValue::Str(v.clone())));
                 }
             }
 

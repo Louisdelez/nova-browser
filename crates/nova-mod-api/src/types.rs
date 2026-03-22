@@ -203,6 +203,14 @@ pub enum RenderOp {
         maxlength: Option<usize>,
         /// Minimum character length.
         minlength: Option<usize>,
+        /// Whether this field has the `autofocus` attribute.
+        autofocus: bool,
+        /// The `tabindex` attribute value (None = not specified).
+        tabindex: Option<i32>,
+        /// The `title` attribute text (for tooltip).
+        title: String,
+        /// Whether `pointer-events: none` is set on this element.
+        pointer_events_none: bool,
     },
     /// A clickable link region (does not render anything visible).
     ///
@@ -214,6 +222,8 @@ pub enum RenderOp {
         width: f32,
         height: f32,
         url: String,
+        /// The `title` attribute text (for tooltip on links).
+        title: String,
     },
     /// Fill a rectangle with rounded corners using an SDF approach.
     ///

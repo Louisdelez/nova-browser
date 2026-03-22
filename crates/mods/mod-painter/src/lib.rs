@@ -806,29 +806,50 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         }
     }
 
-    // Paint iframe content (placeholder with border).
+    // Paint iframe content (placeholder with inset border).
     if let LayoutContent::Iframe { ref src, ref srcdoc } = layout_box.content {
-        let border_color = Color::rgb(0.75, 0.75, 0.75);
+        // White content area.
+        ops.push(RenderOp::FillRect {
+            x: layout_box.x + 2.0, y: layout_box.y + 2.0,
+            width: layout_box.width - 4.0, height: layout_box.height - 4.0,
+            color: Color::WHITE,
+        });
+        // 2px inset border: top/left darker, bottom/right lighter (like Chrome).
+        let dark = Color::rgb(0.55, 0.55, 0.55);
+        let light = Color::rgb(0.83, 0.83, 0.83);
+        // Outer border.
         ops.push(RenderOp::FillRect {
             x: layout_box.x, y: layout_box.y,
-            width: layout_box.width, height: 1.0, color: border_color,
+            width: layout_box.width, height: 1.0, color: dark,
+        });
+        ops.push(RenderOp::FillRect {
+            x: layout_box.x, y: layout_box.y,
+            width: 1.0, height: layout_box.height, color: dark,
         });
         ops.push(RenderOp::FillRect {
             x: layout_box.x, y: layout_box.y + layout_box.height - 1.0,
-            width: layout_box.width, height: 1.0, color: border_color,
-        });
-        ops.push(RenderOp::FillRect {
-            x: layout_box.x, y: layout_box.y,
-            width: 1.0, height: layout_box.height, color: border_color,
+            width: layout_box.width, height: 1.0, color: light,
         });
         ops.push(RenderOp::FillRect {
             x: layout_box.x + layout_box.width - 1.0, y: layout_box.y,
-            width: 1.0, height: layout_box.height, color: border_color,
+            width: 1.0, height: layout_box.height, color: light,
+        });
+        // Inner border.
+        ops.push(RenderOp::FillRect {
+            x: layout_box.x + 1.0, y: layout_box.y + 1.0,
+            width: layout_box.width - 2.0, height: 1.0, color: Color::rgb(0.65, 0.65, 0.65),
         });
         ops.push(RenderOp::FillRect {
             x: layout_box.x + 1.0, y: layout_box.y + 1.0,
-            width: layout_box.width - 2.0, height: layout_box.height - 2.0,
-            color: Color::WHITE,
+            width: 1.0, height: layout_box.height - 2.0, color: Color::rgb(0.65, 0.65, 0.65),
+        });
+        ops.push(RenderOp::FillRect {
+            x: layout_box.x + 1.0, y: layout_box.y + layout_box.height - 2.0,
+            width: layout_box.width - 2.0, height: 1.0, color: Color::rgb(0.90, 0.90, 0.90),
+        });
+        ops.push(RenderOp::FillRect {
+            x: layout_box.x + layout_box.width - 2.0, y: layout_box.y + 1.0,
+            width: 1.0, height: layout_box.height - 2.0, color: Color::rgb(0.90, 0.90, 0.90),
         });
         let label = if srcdoc.is_some() {
             "[iframe: srcdoc]".to_string()
@@ -890,6 +911,11 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         }
     }
 
+    // Paint <progress> and <meter> widgets.
+    if let Some(widget_type) = extract_widget_type(&layout_box.style) {
+        paint_widget(layout_box, &widget_type, ops);
+    }
+
     // Emit FormField op for interactive form elements.
     if let Some(info) = extract_form_field(&layout_box.style) {
         // Emit visual rendering based on field type.
@@ -915,6 +941,10 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
             max: info.max,
             maxlength: info.maxlength,
             minlength: info.minlength,
+            autofocus: info.autofocus,
+            tabindex: info.tabindex,
+            title: info.title.clone(),
+            pointer_events_none: info.pointer_events_none,
         });
     }
 
@@ -968,12 +998,14 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     // Emit a Link op if this box has an href (i.e., it is an <a> element).
     if let Some(href) = extract_href(&layout_box.style) {
         if layout_box.width > 0.0 && layout_box.height > 0.0 {
+            let link_title = extract_style_str(&layout_box.style, "nova-title");
             ops.push(RenderOp::Link {
                 x: layout_box.x,
                 y: layout_box.y,
                 width: layout_box.width,
                 height: layout_box.height,
                 url: href,
+                title: link_title,
             });
         }
     }
@@ -2085,6 +2117,115 @@ fn extract_px_value(value: &StyleValue) -> Option<f32> {
     }
 }
 
+/// Extract the widget type (progress/meter) from style properties.
+fn extract_widget_type(style: &nova_mod_api::content::StyleMap) -> Option<String> {
+    for (key, val) in &style.properties {
+        if key == "nova-widget-type" {
+            if let StyleValue::Str(s) | StyleValue::Keyword(s) = val {
+                return Some(s.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Extract a string style property by key.
+fn extract_style_str(style: &nova_mod_api::content::StyleMap, prop: &str) -> String {
+    for (key, val) in &style.properties {
+        if key == prop {
+            if let StyleValue::Str(s) | StyleValue::Keyword(s) = val {
+                return s.clone();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Paint a `<progress>` or `<meter>` widget.
+fn paint_widget(layout_box: &LayoutBox, widget_type: &str, ops: &mut Vec<RenderOp>) {
+    let x = layout_box.x;
+    let y = layout_box.y;
+    let w = layout_box.width;
+    let h = layout_box.height;
+    let radius = [h / 2.0; 4];
+
+    match widget_type {
+        "progress" => {
+            let value: f32 = extract_style_str(&layout_box.style, "nova-widget-value")
+                .parse().unwrap_or(0.0);
+            let max: f32 = extract_style_str(&layout_box.style, "nova-widget-max")
+                .parse::<f32>().unwrap_or(1.0).max(0.001);
+            let fraction = (value / max).clamp(0.0, 1.0);
+
+            // Track background.
+            ops.push(RenderOp::FillRoundedRect {
+                x, y, width: w, height: h,
+                color: Color::rgb(0.88, 0.88, 0.88), radius,
+            });
+            // Filled portion.
+            let fill_w = (w * fraction).max(0.0);
+            if fill_w > 0.0 {
+                ops.push(RenderOp::FillRoundedRect {
+                    x, y, width: fill_w, height: h,
+                    color: Color::rgb(0.18, 0.55, 0.89), radius,
+                });
+            }
+        }
+        "meter" => {
+            let value: f32 = extract_style_str(&layout_box.style, "nova-widget-value")
+                .parse().unwrap_or(0.0);
+            let min: f32 = extract_style_str(&layout_box.style, "nova-widget-min")
+                .parse().unwrap_or(0.0);
+            let max: f32 = extract_style_str(&layout_box.style, "nova-widget-max")
+                .parse().unwrap_or(1.0);
+            let low: f32 = extract_style_str(&layout_box.style, "nova-widget-low")
+                .parse().unwrap_or(min);
+            let high: f32 = extract_style_str(&layout_box.style, "nova-widget-high")
+                .parse().unwrap_or(max);
+            let optimum: f32 = extract_style_str(&layout_box.style, "nova-widget-optimum")
+                .parse().unwrap_or((low + high) / 2.0);
+
+            let range = (max - min).max(0.001);
+            let fraction = ((value - min) / range).clamp(0.0, 1.0);
+
+            // Color coding based on value vs low/high/optimum.
+            let fill_color = if optimum >= low && optimum <= high {
+                // Optimum is in the "ok" range.
+                if value >= low && value <= high {
+                    Color::rgb(0.18, 0.73, 0.30) // green — in optimal range
+                } else {
+                    Color::rgb(0.93, 0.79, 0.13) // yellow — outside optimal range
+                }
+            } else if optimum < low {
+                // Lower is better.
+                if value <= low { Color::rgb(0.18, 0.73, 0.30) }
+                else if value <= high { Color::rgb(0.93, 0.79, 0.13) }
+                else { Color::rgb(0.88, 0.22, 0.20) }
+            } else {
+                // Higher is better.
+                if value >= high { Color::rgb(0.18, 0.73, 0.30) }
+                else if value >= low { Color::rgb(0.93, 0.79, 0.13) }
+                else { Color::rgb(0.88, 0.22, 0.20) }
+            };
+
+            // Track background.
+            ops.push(RenderOp::FillRoundedRect {
+                x, y, width: w, height: h,
+                color: Color::rgb(0.88, 0.88, 0.88), radius,
+            });
+            // Filled portion.
+            let fill_w = (w * fraction).max(0.0);
+            if fill_w > 0.0 {
+                ops.push(RenderOp::FillRoundedRect {
+                    x, y, width: fill_w, height: h,
+                    color: fill_color, radius,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Form field info extracted from style properties.
 struct FormFieldInfo {
     field_type: String,
@@ -2102,6 +2243,10 @@ struct FormFieldInfo {
     max: String,
     maxlength: Option<usize>,
     minlength: Option<usize>,
+    autofocus: bool,
+    tabindex: Option<i32>,
+    title: String,
+    pointer_events_none: bool,
 }
 
 /// Extract form field info from style props (set by mod-layout for form elements).
@@ -2121,6 +2266,10 @@ fn extract_form_field(style: &nova_mod_api::content::StyleMap) -> Option<FormFie
     let mut max = String::new();
     let mut maxlength = None;
     let mut minlength = None;
+    let mut autofocus = false;
+    let mut tabindex = None;
+    let mut title = String::new();
+    let mut pointer_events_none = false;
     for (key, val) in &style.properties {
         if let StyleValue::Str(s) | StyleValue::Keyword(s) = val {
             match key.as_str() {
@@ -2139,6 +2288,10 @@ fn extract_form_field(style: &nova_mod_api::content::StyleMap) -> Option<FormFie
                 "nova-form-max" => max = s.clone(),
                 "nova-form-maxlength" => maxlength = s.parse().ok(),
                 "nova-form-minlength" => minlength = s.parse().ok(),
+                "nova-form-autofocus" => autofocus = s == "true",
+                "nova-form-tabindex" => tabindex = s.parse().ok(),
+                "nova-form-title" => title = s.clone(),
+                "pointer-events" => pointer_events_none = s == "none",
                 _ => {}
             }
         }
@@ -2174,6 +2327,10 @@ fn extract_form_field(style: &nova_mod_api::content::StyleMap) -> Option<FormFie
         max,
         maxlength,
         minlength,
+        autofocus,
+        tabindex,
+        title,
+        pointer_events_none,
     })
 }
 
@@ -2344,6 +2501,28 @@ fn paint_form_field_visual(layout_box: &LayoutBox, info: &FormFieldInfo, ops: &m
                 x: x + w - sb_w - 1.0, y: y + 1.0, width: sb_w, height: h - 2.0,
                 color: Color::rgb(0.92, 0.92, 0.92),
             });
+            // Resize grip handle in bottom-right corner (three diagonal lines).
+            let grip_color = Color::rgb(0.6, 0.6, 0.6);
+            let gx = x + w - 2.0;
+            let gy = y + h - 2.0;
+            for i in 0..3 {
+                let offset = (i as f32) * 4.0;
+                // Each grip line is a small 1px diagonal represented as a short rect.
+                ops.push(RenderOp::FillRect {
+                    x: gx - 4.0 - offset, y: gy - 1.0,
+                    width: 2.0, height: 2.0, color: grip_color,
+                });
+                ops.push(RenderOp::FillRect {
+                    x: gx - 1.0, y: gy - 4.0 - offset,
+                    width: 2.0, height: 2.0, color: grip_color,
+                });
+                if i > 0 {
+                    ops.push(RenderOp::FillRect {
+                        x: gx - 4.0 - offset + 4.0, y: gy - 4.0 - offset + 4.0,
+                        width: 2.0, height: 2.0, color: grip_color,
+                    });
+                }
+            }
             let font_size = extract_font_size(&layout_box.style);
             let display_text = if info.value.is_empty() { &info.placeholder } else { &info.value };
             if !display_text.is_empty() {

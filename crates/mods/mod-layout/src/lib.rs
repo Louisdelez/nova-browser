@@ -517,6 +517,7 @@ fn add_node(
             children,
             attributes,
         } => {
+            
             // ── Form elements → sized leaf nodes with placeholder text ──
             if matches!(tag.as_str(), "input" | "button" | "select" | "textarea") {
                 // Hidden inputs are invisible — produce a zero-size node.
@@ -635,6 +636,7 @@ fn add_node(
                     (default_w, line_height + 6.0)
                 };
 
+                
                 // Build style props for the form element.
                 let mut props = vec![
                     ("display".into(), StyleValue::Keyword(display.clone())),

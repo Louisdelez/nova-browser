@@ -620,10 +620,18 @@ fn add_node(
                     } else {
                         None
                     };
+                    // Submit/button/reset inputs use text-based width; text inputs default to 150px min.
+                    let min_w = if tag == "input" && matches!(input_type, "submit" | "button" | "reset") {
+                        40.0 // buttons: just enough for label text + padding
+                    } else if tag == "input" {
+                        150.0 // text/password/email/etc: standard text field width
+                    } else {
+                        40.0  // <button>, <select>
+                    };
                     let default_w = lp.width
                         .and_then(|d| match d { Dimension::Length(px) => Some(px), _ => None })
                         .or(size_attr_w)
-                        .unwrap_or((text_w + pad).max(if tag == "input" { 150.0 } else { 40.0 }));
+                        .unwrap_or((text_w + pad).max(min_w));
                     (default_w, line_height + 6.0)
                 };
 
@@ -1376,6 +1384,15 @@ enum InlineItem {
     Space { width: f32, style: Vec<(String, StyleValue)> },
     /// An inline image.
     Image { src: String, width: f32, height: f32 },
+    /// An inline form field (submit button, checkbox, etc.).
+    FormField {
+        tag: String,
+        input_type: String,
+        label: String,
+        width: f32,
+        height: f32,
+        style: Vec<(String, StyleValue)>,
+    },
 }
 
 /// Check if a DOM node is inline (text, inline element, or <br>).
@@ -1384,12 +1401,22 @@ fn is_inline_node(node: &DomNode) -> bool {
         DomNode::Text(_) => true,
         DomNode::Comment(_) => true,
         DomNode::Element { tag, attributes, .. } => {
-            // Form elements are handled as block-level by add_node (which has
-            // a dedicated form field handler). They must NOT be treated as
-            // inline content here, or they'll get swallowed by the IFC and
-            // never reach the form field code path.
-            if matches!(tag.as_str(), "input" | "button" | "select" | "textarea") {
-                return false;
+            // Form elements that act as inline controls (submit buttons, etc.)
+            // should flow inline so they sit side by side. Only text inputs,
+            // textareas, and selects need block treatment for proper sizing.
+            if tag == "input" {
+                let input_type = attributes.iter()
+                    .find(|(k, _)| k == "type")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("text");
+                // Submit/button inputs are inline; text/password/etc need block treatment
+                return matches!(input_type, "submit" | "button" | "reset" | "checkbox" | "radio" | "image");
+            }
+            if matches!(tag.as_str(), "select" | "textarea") {
+                return false; // These need block treatment for proper sizing
+            }
+            if tag == "button" {
+                return true; // Buttons are inline
             }
             let display = resolve_display(tag, attributes);
             matches!(display.as_str(), "inline" | "inline-block")
@@ -1774,6 +1801,51 @@ fn flatten_node_recursive(
                 items.push(InlineItem::Image { src, width: w, height: h });
                 return;
             }
+            // Inline form fields: submit/button/reset inputs and <button>.
+            if tag == "input" || tag == "button" {
+                let input_type = if tag == "input" {
+                    attributes.iter()
+                        .find(|(k, _)| k == "type")
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| "text".to_string())
+                } else {
+                    "button".to_string()
+                };
+                if matches!(input_type.as_str(), "submit" | "button" | "reset" | "checkbox" | "radio" | "image") {
+                    let label = if matches!(input_type.as_str(), "checkbox" | "radio") {
+                        String::new()
+                    } else if tag == "button" {
+                        let mut text = String::new();
+                        for child in children {
+                            if let DomNode::Text(t) = child { text.push_str(t); }
+                        }
+                        if text.trim().is_empty() { "Button".to_string() } else { text.trim().to_string() }
+                    } else {
+                        attributes.iter()
+                            .find(|(k, _)| k == "value")
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_else(|| {
+                                input_type.chars().next().unwrap().to_uppercase().to_string() + &input_type[1..]
+                            })
+                    };
+                    let (w, h) = if matches!(input_type.as_str(), "checkbox" | "radio") {
+                        (13.0_f32, 13.0_f32)
+                    } else {
+                        let text_w = if label.is_empty() { 0.0 } else { measure_text_width(&label, font_size) };
+                        let pad = 24.0; // horizontal padding for buttons
+                        (text_w + pad, font_size * LINE_HEIGHT_FACTOR + 6.0)
+                    };
+                    items.push(InlineItem::FormField {
+                        tag: tag.clone(),
+                        input_type,
+                        label,
+                        width: w,
+                        height: h,
+                        style: style_props.to_vec(),
+                    });
+                    return;
+                }
+            }
 
             // Inherit style from this inline element.
             let child_font_size = resolve_font_size(tag, attributes, font_size);
@@ -1981,6 +2053,14 @@ fn layout_inline_run(
                 current_line.push(item);
                 current_width += *width;
             }
+            InlineItem::FormField { width, .. } => {
+                if !no_wrap && current_width + *width > available_width && current_width > 0.0 {
+                    lines.push(std::mem::take(&mut current_line));
+                    current_width = 0.0;
+                }
+                current_line.push(item);
+                current_width += *width;
+            }
         }
     }
     if !current_line.is_empty() {
@@ -2157,6 +2237,42 @@ fn layout_inline_run(
                         .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
                     item_ids.push(id);
                 }
+                InlineItem::FormField { tag, input_type, label, width, height, style } => {
+                    max_height = max_height.max(*height);
+                    let mut props = style.clone();
+                    props.push(("display".into(), StyleValue::Keyword("inline-block".into())));
+                    // Tag the form element type so the painter can emit FormField ops.
+                    let form_type = match tag.as_str() {
+                        "input" => input_type.to_string(),
+                        other => other.to_string(),
+                    };
+                    props.push(("nova-form-type".into(), StyleValue::Str(form_type)));
+                    props.push(("nova-form-value".into(), StyleValue::Str(label.clone())));
+                    let ctx = NodeContext {
+                        content: LayoutContent::Block,
+                        style: StyleMap { properties: props },
+                    };
+                    let id = taffy
+                        .new_leaf_with_context(
+                            Style {
+                                display: Display::Flex,
+                                size: Size {
+                                    width: Dimension::Length(*width),
+                                    height: Dimension::Length(*height),
+                                },
+                                margin: Rect {
+                                    left: LengthPercentageAuto::Length(2.0),
+                                    right: LengthPercentageAuto::Length(2.0),
+                                    top: LengthPercentageAuto::Length(0.0),
+                                    bottom: LengthPercentageAuto::Length(0.0),
+                                },
+                                ..Style::DEFAULT
+                            },
+                            ctx,
+                        )
+                        .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
+                    item_ids.push(id);
+                }
             }
             idx += 1;
         }
@@ -2189,6 +2305,13 @@ fn layout_inline_run(
             content: LayoutContent::Inline,
             style: StyleMap::default(),
         };
+        // Empty lines (from <br>) need a minimum height equal to line_height
+        // so they create visible vertical spacing.
+        let min_h = if item_ids.is_empty() {
+            Dimension::Length(line_height)
+        } else {
+            Dimension::Auto
+        };
         let line_id = taffy
             .new_with_children(
                 Style {
@@ -2205,6 +2328,10 @@ fn layout_inline_run(
                     size: Size {
                         width: Dimension::Percent(1.0),
                         height: Dimension::Auto,
+                    },
+                    min_size: Size {
+                        width: Dimension::Auto,
+                        height: min_h,
                     },
                     ..Style::DEFAULT
                 },

@@ -133,7 +133,7 @@ fn inject_google_search_form(node: &mut DomNode) {
                         DomNode::Element {
                             tag: "div".into(),
                             attributes: vec![
-                                ("style".into(), "text-align:center;margin:20px auto;max-width:584px".into()),
+                                ("style".into(), "display:block;text-align:center;margin:20px auto;max-width:584px".into()),
                             ],
                             children: vec![
                                 DomNode::Element {
@@ -265,16 +265,9 @@ impl PipelineEngine {
             }
         }
 
-        // Step 2c: Inject Google search form.
-        // Google's native form uses a <table> inside <form> which our table
-        // layout inside form elements doesn't handle well yet. The injected
-        // form has explicit inline styles and renders correctly.
-        if is_google_homepage(url) {
-            if let TypedData::Dom(ref mut node) = dom {
-                inject_google_search_form(node);
-                info!("Pipeline: injected Google search form");
-            }
-        }
+        // Step 2c: Google search form injection — disabled.
+        // The native Google form now renders correctly with inline submit
+        // buttons and proper table/form layout.
 
         // Step 3: Extract sub-resources and resolve URLs
         let base_url = Url::parse(url).ok();

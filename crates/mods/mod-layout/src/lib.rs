@@ -3817,6 +3817,10 @@ struct LayoutProps {
     flex_wrap: Option<String>,
     /// CSS `flex-direction` property.
     flex_direction: Option<String>,
+    /// CSS `order` property for flex/grid children.
+    order: Option<i32>,
+    /// CSS `aspect-ratio` property (width / height).
+    aspect_ratio: Option<f32>,
 }
 
 /// Parse a CSS value into `LengthPercentageAuto`.
@@ -4465,6 +4469,29 @@ fn parse_layout_props(attributes: &[(String, String)], viewport: &Viewport) -> L
                     props.flex_direction = Some(val.to_string());
                 }
 
+                "order" => {
+                    if let Ok(o) = val.parse::<i32>() {
+                        props.order = Some(o);
+                    }
+                }
+                "aspect-ratio" => {
+                    // Parse `aspect-ratio: 16 / 9` or `aspect-ratio: 1.5` or `aspect-ratio: auto`
+                    let v = val.trim();
+                    if v != "auto" {
+                        if let Some(slash) = v.find('/') {
+                            let num = v[..slash].trim().parse::<f32>().ok();
+                            let den = v[slash + 1..].trim().parse::<f32>().ok();
+                            if let (Some(n), Some(d)) = (num, den) {
+                                if d != 0.0 {
+                                    props.aspect_ratio = Some(n / d);
+                                }
+                            }
+                        } else if let Ok(r) = v.parse::<f32>() {
+                            props.aspect_ratio = Some(r);
+                        }
+                    }
+                }
+
                 _ => {}
             }
         }
@@ -4795,6 +4822,7 @@ fn build_taffy_style(
                 } else {
                     None
                 },
+                aspect_ratio: lp.aspect_ratio,
                 overflow,
                 box_sizing,
                 ..Style::DEFAULT
@@ -4840,6 +4868,13 @@ fn build_taffy_style(
                 },
                 margin,
                 padding,
+                gap: {
+                    let (row_gap, col_gap) = lp.gap.unwrap_or((0.0, 0.0));
+                    Size {
+                        width: LengthPercentage::Length(col_gap),
+                        height: LengthPercentage::Length(row_gap),
+                    }
+                },
                 align_items,
                 justify_content,
                 align_self: if center_via_auto_margin {
@@ -4847,6 +4882,7 @@ fn build_taffy_style(
                 } else {
                     None
                 },
+                aspect_ratio: lp.aspect_ratio,
                 overflow,
                 box_sizing,
                 ..Style::DEFAULT
@@ -5082,6 +5118,7 @@ fn build_taffy_style(
                 } else {
                     None
                 },
+                aspect_ratio: lp.aspect_ratio,
                 overflow,
                 box_sizing,
                 ..Style::DEFAULT

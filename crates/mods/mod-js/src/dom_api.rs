@@ -435,6 +435,8 @@ pub struct JsDomTree {
     values: HashMap<ElementHandle, String>,
     /// Checkbox/radio checked state keyed by handle.
     checked: HashMap<ElementHandle, bool>,
+    /// Pending navigation URL set by `window.location.href = url` or `location.assign()`.
+    pub pending_navigation: Option<String>,
 }
 
 impl JsDomTree {
@@ -451,6 +453,7 @@ impl JsDomTree {
             canvas_contexts: HashMap::new(),
             values: HashMap::new(),
             checked: HashMap::new(),
+            pending_navigation: None,
         };
 
         // Reserve handle 0 for the document root.
@@ -1586,6 +1589,46 @@ impl JsDomTree {
         self.nodes.insert(handle, elem);
         debug!(handle, text, "createTextNode");
         handle
+    }
+
+    /// `document.createComment(data)` — creates an unattached comment node.
+    pub fn create_comment(&mut self, data: &str) -> ElementHandle {
+        let handle = self.alloc_handle();
+        let elem = JsElement {
+            handle,
+            tag: "#comment".into(),
+            attributes: Vec::new(),
+            children: Vec::new(),
+            text: Some(data.to_owned()),
+            inline_styles: Vec::new(),
+        };
+        self.nodes.insert(handle, elem);
+        debug!(handle, data, "createComment");
+        handle
+    }
+
+    /// `el.firstElementChild` — returns the first child that is an Element
+    /// (skipping text and comment nodes).
+    pub fn first_element_child(&self, handle: ElementHandle) -> Option<ElementHandle> {
+        let elem = self.nodes.get(&handle)?;
+        elem.children.iter().copied().find(|&h| {
+            self.nodes
+                .get(&h)
+                .map(|e| e.tag != "#text" && e.tag != "#comment")
+                .unwrap_or(false)
+        })
+    }
+
+    /// `el.lastElementChild` — returns the last child that is an Element
+    /// (skipping text and comment nodes).
+    pub fn last_element_child(&self, handle: ElementHandle) -> Option<ElementHandle> {
+        let elem = self.nodes.get(&handle)?;
+        elem.children.iter().rev().copied().find(|&h| {
+            self.nodes
+                .get(&h)
+                .map(|e| e.tag != "#text" && e.tag != "#comment")
+                .unwrap_or(false)
+        })
     }
 
     /// Remove a child from its parent.

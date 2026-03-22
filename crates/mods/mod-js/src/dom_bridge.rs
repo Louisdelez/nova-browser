@@ -253,6 +253,42 @@ pub fn register_bridge_functions<'js>(
         })))?;
     }
 
+    // createComment(data) -> handle
+    {
+        let t = tree.clone();
+        nova.set("createComment", Func::from(MutFn::new(move |data: String| -> f64 {
+            t.lock().unwrap().create_comment(&data) as f64
+        })))?;
+    }
+
+    // firstElementChild(handle) -> handle or -1
+    {
+        let t = tree.clone();
+        nova.set("firstElementChild", Func::from(move |handle: f64| -> f64 {
+            t.lock().unwrap().first_element_child(handle as ElementHandle)
+                .map(|h| h as f64)
+                .unwrap_or(-1.0)
+        }))?;
+    }
+
+    // lastElementChild(handle) -> handle or -1
+    {
+        let t = tree.clone();
+        nova.set("lastElementChild", Func::from(move |handle: f64| -> f64 {
+            t.lock().unwrap().last_element_child(handle as ElementHandle)
+                .map(|h| h as f64)
+                .unwrap_or(-1.0)
+        }))?;
+    }
+
+    // requestNavigation(url) — store a URL for the shell to navigate to
+    {
+        let t = tree.clone();
+        nova.set("requestNavigation", Func::from(MutFn::new(move |url: String| {
+            t.lock().unwrap().pending_navigation = Some(url);
+        })))?;
+    }
+
     // getTagName(handle) -> string
     {
         let t = tree.clone();
@@ -1469,6 +1505,29 @@ pub const JS_DOM_SHIM: &str = r#"
         configurable: true
     });
 
+    Object.defineProperty(Element.prototype, 'firstElementChild', {
+        get: function() {
+            var h = __nova.firstElementChild(this.__handle);
+            return h < 0 ? null : new Element(h);
+        },
+        configurable: true
+    });
+
+    Object.defineProperty(Element.prototype, 'lastElementChild', {
+        get: function() {
+            var h = __nova.lastElementChild(this.__handle);
+            return h < 0 ? null : new Element(h);
+        },
+        configurable: true
+    });
+
+    Object.defineProperty(Element.prototype, 'childElementCount', {
+        get: function() {
+            return __nova.children(this.__handle).length;
+        },
+        configurable: true
+    });
+
     Object.defineProperty(Element.prototype, 'nextSibling', {
         get: function() {
             var h = __nova.nextSibling(this.__handle);
@@ -1688,22 +1747,43 @@ pub const JS_DOM_SHIM: &str = r#"
         return newChild;
     };
 
-    Element.prototype.addEventListener = function(type, callback) {
+    Element.prototype.addEventListener = function(type, callback, optionsOrCapture) {
+        if (typeof callback !== 'function') return;
+        var once = false;
+        if (optionsOrCapture && typeof optionsOrCapture === 'object') {
+            once = !!optionsOrCapture.once;
+            // passive is accepted but has no effect in our engine (no default to prevent)
+        }
+        var actualCallback = callback;
+        var self = this;
+        if (once) {
+            actualCallback = function __onceWrapper(evt) {
+                self.removeEventListener(type, actualCallback);
+                callback.call(this, evt);
+            };
+            actualCallback.__origCallback = callback;
+        }
         if (!this.__listeners) this.__listeners = {};
         if (!this.__listeners[type]) this.__listeners[type] = [];
-        this.__listeners[type].push(callback);
+        this.__listeners[type].push(actualCallback);
         var h = this.__handle;
         if (!__eventListeners[h]) __eventListeners[h] = {};
         if (!__eventListeners[h][type]) __eventListeners[h][type] = [];
-        __eventListeners[h][type].push(callback);
+        __eventListeners[h][type].push(actualCallback);
         __nova.addEventListener(h, type);
     };
 
     Element.prototype.removeEventListener = function(type, callback) {
         if (!this.__listeners || !this.__listeners[type]) return;
         this.__listeners[type] = this.__listeners[type].filter(function(cb) {
-            return cb !== callback;
+            return cb !== callback && cb.__origCallback !== callback;
         });
+        var h = this.__handle;
+        if (__eventListeners[h] && __eventListeners[h][type]) {
+            __eventListeners[h][type] = __eventListeners[h][type].filter(function(cb) {
+                return cb !== callback && cb.__origCallback !== callback;
+            });
+        }
     };
 
     Element.prototype.querySelector = function(sel) {
@@ -1712,9 +1792,11 @@ pub const JS_DOM_SHIM: &str = r#"
     };
 
     Element.prototype.querySelectorAll = function(sel) {
-        return __nova.querySelectorAllWithin(this.__handle, sel).map(function(h) {
+        var arr = __nova.querySelectorAllWithin(this.__handle, sel).map(function(h) {
             return new Element(h);
         });
+        arr.item = function(i) { return i >= 0 && i < arr.length ? arr[i] : null; };
+        return arr;
     };
 
     Element.prototype.getElementsByClassName = function(name) {
@@ -2117,7 +2199,9 @@ pub const JS_DOM_SHIM: &str = r#"
             return wrapHandle(__nova.querySelector(sel));
         },
         querySelectorAll: function(sel) {
-            return __nova.querySelectorAll(sel).map(function(h) { return new Element(h); });
+            var arr = __nova.querySelectorAll(sel).map(function(h) { return new Element(h); });
+            arr.item = function(i) { return i >= 0 && i < arr.length ? arr[i] : null; };
+            return arr;
         },
         createElement: function(tag) {
             return new Element(__nova.createElement(tag));
@@ -2128,9 +2212,8 @@ pub const JS_DOM_SHIM: &str = r#"
         createDocumentFragment: function() {
             return new Element(__nova.createDocumentFragment());
         },
-        createComment: function(text) {
-            // Stub: return a text node since we do not fully support comment nodes in JS
-            return new Element(__nova.createTextNode(''));
+        createComment: function(data) {
+            return new Element(__nova.createComment(data || ''));
         },
         createEvent: function(type) {
             return {
@@ -2156,20 +2239,38 @@ pub const JS_DOM_SHIM: &str = r#"
             }
             return result;
         },
-        addEventListener: function(type, callback) {
+        addEventListener: function(type, callback, optionsOrCapture) {
+            if (typeof callback !== 'function') return;
+            var once = false;
+            if (optionsOrCapture && typeof optionsOrCapture === 'object') {
+                once = !!optionsOrCapture.once;
+            }
+            var actualCallback = callback;
+            if (once) {
+                actualCallback = function __onceWrapper(evt) {
+                    document.removeEventListener(type, actualCallback);
+                    callback(evt);
+                };
+                actualCallback.__origCallback = callback;
+            }
             if (!document.__listeners) document.__listeners = {};
             if (!document.__listeners[type]) document.__listeners[type] = [];
-            document.__listeners[type].push(callback);
+            document.__listeners[type].push(actualCallback);
             if (!__eventListeners[0]) __eventListeners[0] = {};
             if (!__eventListeners[0][type]) __eventListeners[0][type] = [];
-            __eventListeners[0][type].push(callback);
+            __eventListeners[0][type].push(actualCallback);
             __nova.addEventListener(0, type);
         },
         removeEventListener: function(type, callback) {
             if (!document.__listeners || !document.__listeners[type]) return;
             document.__listeners[type] = document.__listeners[type].filter(function(cb) {
-                return cb !== callback;
+                return cb !== callback && cb.__origCallback !== callback;
             });
+            if (__eventListeners[0] && __eventListeners[0][type]) {
+                __eventListeners[0][type] = __eventListeners[0][type].filter(function(cb) {
+                    return cb !== callback && cb.__origCallback !== callback;
+                });
+            }
         },
         dispatchEvent: function(event) {
             var type = (event && event.type) ? event.type : '';
@@ -2490,7 +2591,8 @@ pub const JS_DOM_SHIM: &str = r#"
                 urlObj.origin = urlObj.protocol + "//" + urlObj.host;
             }
 
-            var location = {
+            var location = {};
+            var __locData = {
                 href: urlObj.href,
                 protocol: urlObj.protocol,
                 hostname: urlObj.hostname,
@@ -2499,12 +2601,73 @@ pub const JS_DOM_SHIM: &str = r#"
                 pathname: urlObj.pathname,
                 search: urlObj.search,
                 hash: urlObj.hash,
-                origin: urlObj.origin,
-                assign: function(url) { /* stub — would navigate */ },
-                replace: function(url) { /* stub — would navigate without history */ },
-                reload: function() { /* stub */ },
-                toString: function() { return urlObj.href; }
+                origin: urlObj.origin
             };
+            Object.defineProperty(location, 'href', {
+                get: function() { return __locData.href; },
+                set: function(url) {
+                    __locData.href = url;
+                    __nova.requestNavigation(url);
+                },
+                configurable: true
+            });
+            Object.defineProperty(location, 'protocol', {
+                get: function() { return __locData.protocol; },
+                configurable: true
+            });
+            Object.defineProperty(location, 'hostname', {
+                get: function() { return __locData.hostname; },
+                configurable: true
+            });
+            Object.defineProperty(location, 'host', {
+                get: function() { return __locData.host; },
+                configurable: true
+            });
+            Object.defineProperty(location, 'port', {
+                get: function() { return __locData.port; },
+                configurable: true
+            });
+            Object.defineProperty(location, 'pathname', {
+                get: function() { return __locData.pathname; },
+                set: function(v) {
+                    __locData.pathname = v;
+                    var newUrl = __locData.protocol + '//' + __locData.host + v + __locData.search + __locData.hash;
+                    __locData.href = newUrl;
+                    __nova.requestNavigation(newUrl);
+                },
+                configurable: true
+            });
+            Object.defineProperty(location, 'search', {
+                get: function() { return __locData.search; },
+                set: function(v) {
+                    __locData.search = v;
+                    var newUrl = __locData.protocol + '//' + __locData.host + __locData.pathname + v + __locData.hash;
+                    __locData.href = newUrl;
+                    __nova.requestNavigation(newUrl);
+                },
+                configurable: true
+            });
+            Object.defineProperty(location, 'hash', {
+                get: function() { return __locData.hash; },
+                set: function(v) {
+                    __locData.hash = v;
+                },
+                configurable: true
+            });
+            Object.defineProperty(location, 'origin', {
+                get: function() { return __locData.origin; },
+                configurable: true
+            });
+            location.assign = function(url) {
+                __nova.requestNavigation(url);
+            };
+            location.replace = function(url) {
+                __nova.requestNavigation(url);
+            };
+            location.reload = function() {
+                __nova.requestNavigation(__locData.href);
+            };
+            location.toString = function() { return __locData.href; };
             window.location = location;
         } catch(e) {}
 
@@ -2565,16 +2728,29 @@ pub const JS_DOM_SHIM: &str = r#"
         // ── window event listeners ──────────────────────────────────────────
         var __windowListeners = {};
 
-        window.addEventListener = function(type, callback) {
+        window.addEventListener = function(type, callback, optionsOrCapture) {
+            if (typeof callback !== 'function') return;
+            var once = false;
+            if (optionsOrCapture && typeof optionsOrCapture === 'object') {
+                once = !!optionsOrCapture.once;
+            }
+            var actualCallback = callback;
+            if (once) {
+                actualCallback = function __onceWrapper(evt) {
+                    window.removeEventListener(type, actualCallback);
+                    callback(evt);
+                };
+                actualCallback.__origCallback = callback;
+            }
             if (!__windowListeners[type]) __windowListeners[type] = [];
-            __windowListeners[type].push(callback);
+            __windowListeners[type].push(actualCallback);
             // For DOMContentLoaded and load, fire immediately since we are already loaded
             if (type === 'DOMContentLoaded' || type === 'load') {
                 try {
                     var evt = { type: type, target: window, bubbles: false, cancelable: false,
                                 defaultPrevented: false, preventDefault: function() {},
                                 stopPropagation: function() {} };
-                    callback(evt);
+                    actualCallback(evt);
                 } catch(e) { /* ignore errors in listener */ }
             }
         };
@@ -2582,7 +2758,7 @@ pub const JS_DOM_SHIM: &str = r#"
         window.removeEventListener = function(type, callback) {
             if (!__windowListeners[type]) return;
             __windowListeners[type] = __windowListeners[type].filter(function(cb) {
-                return cb !== callback;
+                return cb !== callback && cb.__origCallback !== callback;
             });
         };
 

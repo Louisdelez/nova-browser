@@ -290,6 +290,16 @@ fn preprocess_media_queries(
                     result.push_str(&block_content);
                     result.push('\n');
                 }
+            } else if name.eq_ignore_ascii_case("container") {
+                // @container queries: parse and always include the inner rules
+                // (we don't evaluate container size conditions yet).
+                while i < len && bytes[i] != b'{' {
+                    i += 1;
+                }
+                let block_content = read_brace_block(css, &mut i);
+                // Always include — treat as matching.
+                result.push_str(&block_content);
+                result.push('\n');
             } else if name.eq_ignore_ascii_case("keyframes")
                 || name.eq_ignore_ascii_case("charset")
                 || name.eq_ignore_ascii_case("import")
@@ -364,6 +374,9 @@ fn evaluate_supports_single(condition: &str) -> bool {
             "max-width", "min-width", "max-height", "min-height",
             "line-height", "letter-spacing", "word-break", "overflow-wrap",
             "box-sizing", "cursor", "visibility", "white-space",
+            "aspect-ratio", "order", "place-items", "place-content",
+            "backdrop-filter", "isolation", "mix-blend-mode", "will-change",
+            "contain", "container-type", "container-name",
         ];
         supported.contains(&prop)
     } else {
@@ -1012,7 +1025,7 @@ mod tests {
     fn supports_unknown_property_excluded() {
         let css = r#"
             body { color: black; }
-            @supports (container-type: inline-size) {
+            @supports (totally-unknown-property: inline-size) {
                 .container { width: 100%; }
             }
         "#;
@@ -1024,7 +1037,7 @@ mod tests {
     fn supports_not_condition() {
         let css = r#"
             body { color: black; }
-            @supports not (container-type: inline-size) {
+            @supports not (totally-unknown-property: inline-size) {
                 .fallback { width: auto; }
             }
         "#;

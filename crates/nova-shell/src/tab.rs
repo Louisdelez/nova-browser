@@ -42,10 +42,19 @@ pub struct Tab {
     pub focused_field: Option<usize>,
     /// Cursor position (character index) within the focused text field.
     pub form_cursor_pos: usize,
+    /// Text selection range in the focused form field as `(start, end)` byte offsets.
+    /// When `start == end`, there is no selection. The cursor is always at `form_cursor_pos`.
+    pub form_selection: Option<(usize, usize)>,
     /// Timestamp when the cursor last toggled visibility (for blinking).
     pub cursor_blink_time: Instant,
     /// Whether the cursor is currently visible (toggles every 500ms).
     pub cursor_visible: bool,
+
+    // -- Multi-click tracking for form fields --
+    /// Timestamp of the last left-click on a form field (for double/triple-click detection).
+    pub last_field_click_time: Option<Instant>,
+    /// Number of consecutive rapid clicks (1=single, 2=double, 3=triple).
+    pub field_click_count: u32,
 
     // -- Select dropdown state --
     /// Whether a dropdown is open for a `<select>` field.
@@ -97,6 +106,9 @@ impl Tab {
             history: HistoryStack::new(url),
             focused_field: None,
             form_cursor_pos: 0,
+            form_selection: None,
+            last_field_click_time: None,
+            field_click_count: 0,
             cursor_blink_time: Instant::now(),
             cursor_visible: true,
             dropdown_open: false,

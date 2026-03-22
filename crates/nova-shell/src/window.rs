@@ -969,15 +969,28 @@ impl BrowserWindow {
         let tab = self.tabs.active_tab();
         let scroll_x = tab.scroll_x;
         let scroll_y = tab.scroll_y;
+        let focused_field = tab.focused_field;
+        let form_selection = tab.form_selection;
         let fields: Vec<_> = tab.form_fields.iter().enumerate().map(|(i, f)| {
             (i, f.x, f.y, f.width, f.height, f.field_type.clone(), f.value.clone(),
              f.placeholder.clone(), f.checked, f.options.clone())
         }).collect();
 
-        for (_idx, x, y, w, h, field_type, value, placeholder, checked, options) in fields {
+        for (field_idx, x, y, w, h, field_type, value, placeholder, checked, options) in fields {
             let fx = x - scroll_x;
             let fy = y + CHROME_HEIGHT - scroll_y;
             let font_size = 14.0_f32; // Default form field font size.
+            let approx_char_w = font_size * 0.6;
+
+            // Determine if this field has an active selection.
+            let selection_range = if focused_field == Some(field_idx) {
+                form_selection.and_then(|(a, b)| {
+                    let (start, end) = (a.min(b), a.max(b));
+                    if start != end { Some((start, end)) } else { None }
+                })
+            } else {
+                None
+            };
 
             match field_type.as_str() {
                 "text" | "email" | "number" | "search" | "tel" | "url" | "date" => {
@@ -990,19 +1003,60 @@ impl BrowserWindow {
                     self.framebuffer.fill_rect(fx, fy, 1.0, h, border_color);
                     self.framebuffer.fill_rect(fx + w - 1.0, fy, 1.0, h, border_color);
 
+                    // Draw selection highlight (blue background) before the text.
+                    if let Some((sel_start, sel_end)) = selection_range {
+                        let start_chars = value[..sel_start.min(value.len())].chars().count();
+                        let end_chars = value[..sel_end.min(value.len())].chars().count();
+                        let sel_x = fx + 4.0 + start_chars as f32 * approx_char_w;
+                        let sel_w = (end_chars - start_chars) as f32 * approx_char_w;
+                        let sel_y = fy + (h - font_size) / 2.0;
+                        self.framebuffer.fill_rect(sel_x, sel_y, sel_w, font_size, Color::rgb(0.26, 0.52, 0.96));
+                    }
+
                     let (display_text, text_color) = if value.is_empty() {
                         (placeholder.clone(), Color::rgb(0.6, 0.6, 0.6))
+                    } else if selection_range.is_some() {
+                        // Selected text is drawn white on blue.
+                        (value.clone(), Color::BLACK)
                     } else {
                         (value.clone(), Color::BLACK)
                     };
 
                     if !display_text.is_empty() {
                         let text_y = fy + font_size + (h - font_size) / 2.0 - 2.0;
-                        self.framebuffer.draw_text(
-                            fx + 4.0, text_y, &display_text, font_size, text_color,
-                            None, None, None,
-                            None,
-                        );
+                        // If there's a selection, draw text in segments: normal, selected (white), normal.
+                        if let Some((sel_start, sel_end)) = selection_range {
+                            let sel_start = sel_start.min(value.len());
+                            let sel_end = sel_end.min(value.len());
+                            // Before selection.
+                            if sel_start > 0 {
+                                self.framebuffer.draw_text(
+                                    fx + 4.0, text_y, &value[..sel_start], font_size, Color::BLACK,
+                                    None, None, None, None,
+                                );
+                            }
+                            // Selected text (white on blue).
+                            if sel_end > sel_start {
+                                let sel_text_x = fx + 4.0 + value[..sel_start].chars().count() as f32 * approx_char_w;
+                                self.framebuffer.draw_text(
+                                    sel_text_x, text_y, &value[sel_start..sel_end], font_size, Color::WHITE,
+                                    None, None, None, None,
+                                );
+                            }
+                            // After selection.
+                            if sel_end < value.len() {
+                                let after_text_x = fx + 4.0 + value[..sel_end].chars().count() as f32 * approx_char_w;
+                                self.framebuffer.draw_text(
+                                    after_text_x, text_y, &value[sel_end..], font_size, Color::BLACK,
+                                    None, None, None, None,
+                                );
+                            }
+                        } else {
+                            self.framebuffer.draw_text(
+                                fx + 4.0, text_y, &display_text, font_size, text_color,
+                                None, None, None, None,
+                            );
+                        }
                     }
                 }
                 "password" => {
@@ -1012,6 +1066,16 @@ impl BrowserWindow {
                     self.framebuffer.fill_rect(fx, fy + h - 1.0, w, 1.0, border_color);
                     self.framebuffer.fill_rect(fx, fy, 1.0, h, border_color);
                     self.framebuffer.fill_rect(fx + w - 1.0, fy, 1.0, h, border_color);
+
+                    // Draw selection highlight for password fields.
+                    if let Some((sel_start, sel_end)) = selection_range {
+                        let start_chars = value[..sel_start.min(value.len())].chars().count();
+                        let end_chars = value[..sel_end.min(value.len())].chars().count();
+                        let sel_x = fx + 4.0 + start_chars as f32 * approx_char_w;
+                        let sel_w = (end_chars - start_chars) as f32 * approx_char_w;
+                        let sel_y = fy + (h - font_size) / 2.0;
+                        self.framebuffer.fill_rect(sel_x, sel_y, sel_w, font_size, Color::rgb(0.26, 0.52, 0.96));
+                    }
 
                     let (display_text, text_color) = if value.is_empty() {
                         (placeholder.clone(), Color::rgb(0.6, 0.6, 0.6))
@@ -1036,6 +1100,16 @@ impl BrowserWindow {
                     self.framebuffer.fill_rect(fx, fy, 1.0, h, border_color);
                     self.framebuffer.fill_rect(fx + w - 1.0, fy, 1.0, h, border_color);
 
+                    // Draw selection highlight for textarea.
+                    if let Some((sel_start, sel_end)) = selection_range {
+                        let start_chars = value[..sel_start.min(value.len())].chars().count();
+                        let end_chars = value[..sel_end.min(value.len())].chars().count();
+                        let sel_x = fx + 4.0 + start_chars as f32 * approx_char_w;
+                        let sel_w = (end_chars - start_chars) as f32 * approx_char_w;
+                        let sel_y = fy + 2.0;
+                        self.framebuffer.fill_rect(sel_x, sel_y, sel_w, font_size, Color::rgb(0.26, 0.52, 0.96));
+                    }
+
                     let (display_text, text_color) = if value.is_empty() {
                         (placeholder.clone(), Color::rgb(0.6, 0.6, 0.6))
                     } else {
@@ -1050,6 +1124,43 @@ impl BrowserWindow {
                             None,
                         );
                     }
+                }
+                "file" => {
+                    // Render file input: button + filename display.
+                    let border_color = Color::rgb(0.6, 0.6, 0.6);
+                    self.framebuffer.fill_rect(fx, fy, w, h, Color::rgb(0.95, 0.95, 0.95));
+                    // Border.
+                    self.framebuffer.fill_rect(fx, fy, w, 1.0, border_color);
+                    self.framebuffer.fill_rect(fx, fy + h - 1.0, w, 1.0, border_color);
+                    self.framebuffer.fill_rect(fx, fy, 1.0, h, border_color);
+                    self.framebuffer.fill_rect(fx + w - 1.0, fy, 1.0, h, border_color);
+
+                    // "Choose File" button area.
+                    let btn_w = 90.0_f32.min(w * 0.4);
+                    self.framebuffer.fill_rect(fx + 1.0, fy + 1.0, btn_w, h - 2.0, Color::rgb(0.88, 0.88, 0.88));
+                    self.framebuffer.fill_rect(fx + btn_w, fy, 1.0, h, border_color);
+
+                    let text_y = fy + font_size + (h - font_size) / 2.0 - 2.0;
+                    self.framebuffer.draw_text(
+                        fx + 6.0, text_y, "Choose File", font_size * 0.85, Color::BLACK,
+                        None, None, None, None,
+                    );
+
+                    // Display filename or "No file chosen".
+                    let display_text = if value.is_empty() {
+                        "No file chosen".to_string()
+                    } else {
+                        // Show just the filename, not the full path.
+                        std::path::Path::new(&value)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or(value.clone())
+                    };
+                    self.framebuffer.draw_text(
+                        fx + btn_w + 8.0, text_y, &display_text, font_size * 0.85,
+                        Color::rgb(0.3, 0.3, 0.3),
+                        None, None, None, None,
+                    );
                 }
                 "checkbox" => {
                     // Redraw checkbox with current checked state.
@@ -1582,6 +1693,45 @@ impl BrowserWindow {
         }
     }
 
+    /// Get the selected text range in the focused form field, ordered as `(min, max)`.
+    fn form_selection_range(&self) -> Option<(usize, usize)> {
+        let tab = self.tabs.active_tab();
+        tab.form_selection.map(|(a, b)| (a.min(b), a.max(b)))
+    }
+
+    /// Delete the currently selected text in the focused form field.
+    /// Returns `true` if text was deleted.
+    fn delete_form_selection(&mut self) -> bool {
+        let tab = self.tabs.active_tab();
+        let sel = match tab.form_selection {
+            Some((a, b)) if a != b => (a.min(b), a.max(b)),
+            _ => return false,
+        };
+        let idx = match tab.focused_field {
+            Some(i) => i,
+            None => return false,
+        };
+        let tab = self.tabs.active_tab_mut();
+        if let Some(field) = tab.form_fields.get_mut(idx) {
+            field.value.drain(sel.0..sel.1);
+            tab.form_cursor_pos = sel.0;
+            tab.form_selection = None;
+        }
+        true
+    }
+
+    /// Get the text currently selected in the focused form field.
+    fn get_form_selected_text(&self) -> Option<String> {
+        let tab = self.tabs.active_tab();
+        let idx = tab.focused_field?;
+        let (start, end) = tab.form_selection.map(|(a, b)| (a.min(b), a.max(b)))?;
+        if start == end {
+            return None;
+        }
+        let field = tab.form_fields.get(idx)?;
+        Some(field.value[start..end].to_string())
+    }
+
     /// Handle keyboard input when a form field is focused.
     ///
     /// Returns `true` if the event was consumed.
@@ -1596,6 +1746,113 @@ impl BrowserWindow {
         tab.cursor_visible = true;
         tab.cursor_blink_time = Instant::now();
 
+        let shift_held = self.modifiers.state().shift_key();
+
+        // Detect Ctrl modifier from event text (control characters).
+        let is_ctrl_combo = event
+            .text
+            .as_ref()
+            .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
+            .unwrap_or(false);
+        let key_str = match &event.logical_key {
+            Key::Character(c) => Some(c.as_str()),
+            _ => None,
+        };
+
+        // --- Ctrl+A: Select all ---
+        if key_str == Some("a") && is_ctrl_combo {
+            let tab = self.tabs.active_tab_mut();
+            if let Some(field) = tab.form_fields.get(idx) {
+                tab.form_selection = Some((0, field.value.len()));
+                tab.form_cursor_pos = field.value.len();
+            }
+            return true;
+        }
+
+        // --- Ctrl+C: Copy ---
+        if key_str == Some("c") && is_ctrl_combo {
+            let text = self.get_form_selected_text().unwrap_or_else(|| {
+                // If no selection, copy all text.
+                self.tabs.active_tab().form_fields.get(idx)
+                    .map(|f| f.value.clone())
+                    .unwrap_or_default()
+            });
+            if !text.is_empty() {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    if let Err(e) = clipboard.set_text(&text) {
+                        warn!("Clipboard set_text failed: {e}");
+                    }
+                }
+            }
+            return true;
+        }
+
+        // --- Ctrl+X: Cut ---
+        if key_str == Some("x") && is_ctrl_combo {
+            let text = self.get_form_selected_text().unwrap_or_else(|| {
+                // If no selection, cut all text.
+                self.tabs.active_tab().form_fields.get(idx)
+                    .map(|f| f.value.clone())
+                    .unwrap_or_default()
+            });
+            if !text.is_empty() {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    if let Err(e) = clipboard.set_text(&text) {
+                        warn!("Clipboard set_text failed: {e}");
+                    }
+                }
+                // Delete the selected text (or all text if no selection).
+                if !self.delete_form_selection() {
+                    // No selection existed — clear the entire field.
+                    let tab = self.tabs.active_tab_mut();
+                    if let Some(field) = tab.form_fields.get_mut(idx) {
+                        field.value.clear();
+                        tab.form_cursor_pos = 0;
+                    }
+                }
+            }
+            return true;
+        }
+
+        // --- Ctrl+V: Paste ---
+        if key_str == Some("v") && is_ctrl_combo {
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                if let Ok(text) = clipboard.get_text() {
+                    if !text.is_empty() {
+                        // Delete any existing selection first.
+                        self.delete_form_selection();
+                        let tab = self.tabs.active_tab_mut();
+                        if let Some(field) = tab.form_fields.get_mut(idx) {
+                            // Enforce maxlength.
+                            let insert_text = if let Some(maxlen) = field.maxlength {
+                                let remaining = maxlen.saturating_sub(field.value.len());
+                                if remaining == 0 {
+                                    return true;
+                                }
+                                // Truncate paste to fit.
+                                let end = text.char_indices()
+                                    .take(remaining)
+                                    .last()
+                                    .map(|(i, c)| i + c.len_utf8())
+                                    .unwrap_or(0);
+                                &text[..end]
+                            } else {
+                                &text
+                            };
+                            // Filter out control characters except newlines in textarea.
+                            let filtered: String = insert_text.chars()
+                                .filter(|c| !c.is_control() || (field.field_type == "textarea" && *c == '\n'))
+                                .collect();
+                            field.value.insert_str(tab.form_cursor_pos, &filtered);
+                            tab.form_cursor_pos += filtered.len();
+                            tab.form_selection = None;
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
         match &event.logical_key {
             Key::Named(NamedKey::Enter) => {
                 // Submit the form when Enter is pressed in a text field.
@@ -1606,13 +1863,17 @@ impl BrowserWindow {
                 let tab = self.tabs.active_tab_mut();
                 tab.focused_field = None;
                 tab.dropdown_open = false;
+                tab.form_selection = None;
                 return true;
             }
             Key::Named(NamedKey::Backspace) => {
+                // If there's a selection, delete it.
+                if self.delete_form_selection() {
+                    return true;
+                }
                 let tab = self.tabs.active_tab_mut();
                 if let Some(field) = tab.form_fields.get_mut(idx) {
                     if tab.form_cursor_pos > 0 && !field.value.is_empty() {
-                        // Find the char boundary before cursor_pos.
                         let prev = field.value[..tab.form_cursor_pos]
                             .char_indices()
                             .next_back()
@@ -1625,6 +1886,9 @@ impl BrowserWindow {
                 return true;
             }
             Key::Named(NamedKey::Delete) => {
+                if self.delete_form_selection() {
+                    return true;
+                }
                 let tab = self.tabs.active_tab_mut();
                 if let Some(field) = tab.form_fields.get_mut(idx) {
                     if tab.form_cursor_pos < field.value.len() {
@@ -1635,52 +1899,101 @@ impl BrowserWindow {
             }
             Key::Named(NamedKey::ArrowLeft) => {
                 let tab = self.tabs.active_tab_mut();
-                if tab.form_cursor_pos > 0 {
-                    if let Some(field) = tab.form_fields.get(idx) {
-                        tab.form_cursor_pos = field.value[..tab.form_cursor_pos]
+                if let Some(field) = tab.form_fields.get(idx) {
+                    let old_pos = tab.form_cursor_pos;
+                    let new_pos = if old_pos > 0 {
+                        field.value[..old_pos]
                             .char_indices()
                             .next_back()
                             .map(|(i, _)| i)
-                            .unwrap_or(0);
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    if shift_held {
+                        // Extend selection.
+                        let anchor = tab.form_selection.map(|(a, _)| a).unwrap_or(old_pos);
+                        tab.form_selection = Some((anchor, new_pos));
+                    } else {
+                        // If there was a selection, move cursor to start of selection.
+                        if let Some((a, b)) = tab.form_selection {
+                            let min = a.min(b);
+                            tab.form_cursor_pos = min;
+                            tab.form_selection = None;
+                            return true;
+                        }
+                        tab.form_selection = None;
                     }
+                    tab.form_cursor_pos = new_pos;
                 }
                 return true;
             }
             Key::Named(NamedKey::ArrowRight) => {
                 let tab = self.tabs.active_tab_mut();
                 if let Some(field) = tab.form_fields.get(idx) {
-                    if tab.form_cursor_pos < field.value.len() {
-                        tab.form_cursor_pos = field.value[tab.form_cursor_pos..]
+                    let old_pos = tab.form_cursor_pos;
+                    let new_pos = if old_pos < field.value.len() {
+                        field.value[old_pos..]
                             .char_indices()
                             .nth(1)
-                            .map(|(i, _)| tab.form_cursor_pos + i)
-                            .unwrap_or(field.value.len());
+                            .map(|(i, _)| old_pos + i)
+                            .unwrap_or(field.value.len())
+                    } else {
+                        field.value.len()
+                    };
+                    if shift_held {
+                        let anchor = tab.form_selection.map(|(a, _)| a).unwrap_or(old_pos);
+                        tab.form_selection = Some((anchor, new_pos));
+                    } else {
+                        // If there was a selection, move cursor to end of selection.
+                        if let Some((a, b)) = tab.form_selection {
+                            let max = a.max(b);
+                            tab.form_cursor_pos = max;
+                            tab.form_selection = None;
+                            return true;
+                        }
+                        tab.form_selection = None;
                     }
+                    tab.form_cursor_pos = new_pos;
                 }
                 return true;
             }
             Key::Named(NamedKey::Home) => {
                 let tab = self.tabs.active_tab_mut();
+                let old_pos = tab.form_cursor_pos;
+                if shift_held {
+                    let anchor = tab.form_selection.map(|(a, _)| a).unwrap_or(old_pos);
+                    tab.form_selection = Some((anchor, 0));
+                } else {
+                    tab.form_selection = None;
+                }
                 tab.form_cursor_pos = 0;
                 return true;
             }
             Key::Named(NamedKey::End) => {
                 let tab = self.tabs.active_tab_mut();
                 if let Some(field) = tab.form_fields.get(idx) {
-                    tab.form_cursor_pos = field.value.len();
+                    let old_pos = tab.form_cursor_pos;
+                    let end = field.value.len();
+                    if shift_held {
+                        let anchor = tab.form_selection.map(|(a, _)| a).unwrap_or(old_pos);
+                        tab.form_selection = Some((anchor, end));
+                    } else {
+                        tab.form_selection = None;
+                    }
+                    tab.form_cursor_pos = end;
                 }
                 return true;
             }
             Key::Named(NamedKey::Tab) => {
                 // Move focus to the next focusable form field, respecting tabindex.
-                // tabindex=-1 means not tabbable; positive values are visited first
-                // in ascending order; 0 means natural document order.
                 if !self.tabs.active_tab().form_fields.is_empty() {
                     let next = self.next_tab_field(idx);
                     if let Some(next_idx) = next {
                         let tab = self.tabs.active_tab_mut();
                         tab.focused_field = Some(next_idx);
                         tab.form_cursor_pos = tab.form_fields[next_idx].value.len();
+                        tab.form_selection = None;
                     }
                 }
                 return true;
@@ -1689,6 +2002,8 @@ impl BrowserWindow {
                 if let Some(text) = &event.text {
                     let s = text.as_str();
                     if !s.is_empty() && s.chars().all(|c| !c.is_control()) {
+                        // Delete any existing selection first.
+                        self.delete_form_selection();
                         let tab = self.tabs.active_tab_mut();
                         if let Some(field) = tab.form_fields.get_mut(idx) {
                             // Enforce maxlength.
@@ -1699,6 +2014,7 @@ impl BrowserWindow {
                             }
                             field.value.insert_str(tab.form_cursor_pos, s);
                             tab.form_cursor_pos += s.len();
+                            tab.form_selection = None;
                         }
                         return true;
                     }
@@ -1847,6 +2163,7 @@ impl BrowserWindow {
                 tab.form_fields = Self::extract_form_fields(&cmds);
                 tab.focused_field = None;
                 tab.form_cursor_pos = 0;
+                tab.form_selection = None;
                 tab.dropdown_open = false;
                 tab.dropdown_hover_idx = None;
                 tab.content_height = Self::compute_content_height(&cmds);
@@ -2374,6 +2691,7 @@ impl BrowserWindow {
                 tab.anchor_regions = Self::extract_anchor_regions(&cmds);
                 tab.focused_field = None;
                 tab.form_cursor_pos = 0;
+                tab.form_selection = None;
                 tab.dropdown_open = false;
                 tab.dropdown_hover_idx = None;
                 tab.content_height = Self::compute_content_height(&cmds);
@@ -2476,6 +2794,7 @@ impl BrowserWindow {
                 tab.anchor_regions = Self::extract_anchor_regions(&cmds);
                 tab.focused_field = None;
                 tab.form_cursor_pos = 0;
+                tab.form_selection = None;
                 tab.dropdown_open = false;
                 tab.dropdown_hover_idx = None;
                 tab.content_height = Self::compute_content_height(&cmds);
@@ -2784,6 +3103,19 @@ impl ApplicationHandler for BrowserWindow {
                         return;
                     }
 
+                    // Ctrl+L: Focus the URL bar and select all text.
+                    if key_str == Some("l") && is_ctrl_combo {
+                        self.url_bar_focused = true;
+                        self.url_bar_select_all = true;
+                        self.url_bar_cursor = self.url_bar_text.len();
+                        // Unfocus any form field.
+                        let tab = self.tabs.active_tab_mut();
+                        tab.focused_field = None;
+                        tab.form_selection = None;
+                        self.request_redraw();
+                        return;
+                    }
+
                     // Ctrl+R: Reload current page.
                     if key_str == Some("r") && is_ctrl_combo {
                         self.reload();
@@ -2798,6 +3130,18 @@ impl ApplicationHandler for BrowserWindow {
                     // F5: Reload current page.
                     if event.logical_key == Key::Named(NamedKey::F5) {
                         self.reload();
+                        return;
+                    }
+
+                    // F6: Focus the URL bar and select all text.
+                    if event.logical_key == Key::Named(NamedKey::F6) {
+                        self.url_bar_focused = true;
+                        self.url_bar_select_all = true;
+                        self.url_bar_cursor = self.url_bar_text.len();
+                        let tab = self.tabs.active_tab_mut();
+                        tab.focused_field = None;
+                        tab.form_selection = None;
+                        self.request_redraw();
                         return;
                     }
 
@@ -3122,6 +3466,21 @@ impl ApplicationHandler for BrowserWindow {
                                 tab.focused_field = Some(idx);
                                 self.request_redraw();
                             }
+                            "file" => {
+                                // Open a native file picker dialog.
+                                let picked = rfd::FileDialog::new().pick_file();
+                                if let Some(path) = picked {
+                                    let filename = path.file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| path.display().to_string());
+                                    let tab = self.tabs.active_tab_mut();
+                                    if let Some(field) = tab.form_fields.get_mut(idx) {
+                                        field.value = path.display().to_string();
+                                    }
+                                    debug!(file = %filename, "File selected via file picker");
+                                }
+                                self.request_redraw();
+                            }
                             "hidden" => {
                                 // Hidden fields cannot be focused.
                             }
@@ -3136,8 +3495,52 @@ impl ApplicationHandler for BrowserWindow {
                                 let approx_char_w = 14.0_f32 * 0.6;
                                 let click_offset = (cx as f32 - field_screen_x).max(0.0);
                                 let char_pos = (click_offset / approx_char_w).round() as usize;
-                                tab.form_cursor_pos = char_pos.min(tab.form_fields[idx].value.len());
+                                let value_len = tab.form_fields[idx].value.len();
+                                tab.form_cursor_pos = char_pos.min(value_len);
                                 tab.dropdown_open = false;
+
+                                // Double-click / triple-click detection.
+                                let now = Instant::now();
+                                let click_count = if let Some(last_time) = tab.last_field_click_time {
+                                    if now.duration_since(last_time).as_millis() < 400 {
+                                        tab.field_click_count + 1
+                                    } else {
+                                        1
+                                    }
+                                } else {
+                                    1
+                                };
+                                tab.last_field_click_time = Some(now);
+                                tab.field_click_count = click_count;
+
+                                if click_count >= 3 {
+                                    // Triple-click: select all text.
+                                    let vlen = tab.form_fields[idx].value.len();
+                                    tab.form_selection = Some((0, vlen));
+                                    tab.form_cursor_pos = vlen;
+                                    tab.field_click_count = 0; // Reset to avoid quad-click confusion.
+                                } else if click_count == 2 {
+                                    // Double-click: select the word under the cursor.
+                                    let val = &tab.form_fields[idx].value;
+                                    let cursor = tab.form_cursor_pos.min(val.len());
+                                    // Find word boundaries.
+                                    let word_start = val[..cursor]
+                                        .rfind(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+                                        .map(|i| {
+                                            // Move past the delimiter.
+                                            val[i..].char_indices().nth(1).map(|(ci, _)| i + ci).unwrap_or(val.len())
+                                        })
+                                        .unwrap_or(0);
+                                    let word_end = val[cursor..]
+                                        .find(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+                                        .map(|i| cursor + i)
+                                        .unwrap_or(val.len());
+                                    tab.form_selection = Some((word_start, word_end));
+                                    tab.form_cursor_pos = word_end;
+                                } else {
+                                    // Single click: clear selection.
+                                    tab.form_selection = None;
+                                }
                             }
                         }
                         self.request_redraw();
@@ -3145,6 +3548,7 @@ impl ApplicationHandler for BrowserWindow {
                         let tab = self.tabs.active_tab_mut();
                         if tab.focused_field.is_some() || tab.dropdown_open {
                             tab.focused_field = None;
+                            tab.form_selection = None;
                             tab.dropdown_open = false;
                             tab.dropdown_hover_idx = None;
                             self.request_redraw();

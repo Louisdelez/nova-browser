@@ -1392,6 +1392,67 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
                 important: decl.important,
             });
         }
+        "place-items" => {
+            // place-items: <align-items> <justify-items>?
+            // If only one value, it applies to both.
+            let parts: Vec<&str> = decl.value.split_whitespace().collect();
+            let align = parts.first().copied().unwrap_or("stretch");
+            let justify = parts.get(1).copied().unwrap_or(align);
+            out.push(CascadedDeclaration {
+                property: "align-items".into(),
+                value: align.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+            out.push(CascadedDeclaration {
+                property: "justify-items".into(),
+                value: justify.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        }
+        "place-content" => {
+            // place-content: <align-content> <justify-content>?
+            let parts: Vec<&str> = decl.value.split_whitespace().collect();
+            let align = parts.first().copied().unwrap_or("stretch");
+            let justify = parts.get(1).copied().unwrap_or(align);
+            out.push(CascadedDeclaration {
+                property: "align-content".into(),
+                value: align.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+            out.push(CascadedDeclaration {
+                property: "justify-content".into(),
+                value: justify.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        }
+        "gap" => {
+            // gap: <row-gap> <column-gap>?
+            let parts: Vec<&str> = decl.value.split_whitespace().collect();
+            let row = parts.first().copied().unwrap_or("0");
+            let col = parts.get(1).copied().unwrap_or(row);
+            out.push(CascadedDeclaration {
+                property: "row-gap".into(),
+                value: row.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+            out.push(CascadedDeclaration {
+                property: "column-gap".into(),
+                value: col.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        }
         _ => {
             // Not a shorthand; pass through.
             out.push(decl);

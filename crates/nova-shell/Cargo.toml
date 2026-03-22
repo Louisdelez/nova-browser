@@ -38,5 +38,7 @@ regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 dirs = "6"
+arboard = "3"
+rfd = "0.15"
 woff2-patched = { workspace = true }
 woff = { workspace = true }

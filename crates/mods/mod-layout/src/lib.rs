@@ -1753,6 +1753,10 @@ fn build_children_with_ifc(
     // Track list item index for <li> children inside <ul>/<ol>.
     let mut li_counter = 0i32;
 
+    // Track whether the last processed sibling was a block element,
+    // so we can correctly detect inter-block whitespace/br runs.
+    let mut last_was_block = false;
+
     // Partition children into inline runs and block items.
     let mut i = 0;
     while i < children.len() {
@@ -1768,6 +1772,10 @@ fn build_children_with_ifc(
             // elements between block siblings. These inter-block runs should
             // not produce visible line boxes (which would add unwanted height
             // and break margin collapsing between adjacent blocks).
+            //
+            // Only skip when the run appears BETWEEN two block-level siblings.
+            // If the run is at the start (no preceding block) or followed by
+            // inline content, it is real inline content and must be kept.
             let is_inter_block_whitespace = inline_run.iter().all(|node| {
                 match node {
                     DomNode::Text(t) => t.trim().is_empty(),
@@ -1776,10 +1784,8 @@ fn build_children_with_ifc(
                     _ => true,
                 }
             });
-            // Only skip if there is a block before AND after (or at end).
-            let has_block_before = !result.is_empty() || start == 0;
             let has_block_after = i >= children.len() || !is_inline_node(&children[i]);
-            if is_inter_block_whitespace && has_block_before && has_block_after {
+            if is_inter_block_whitespace && last_was_block && has_block_after {
                 // Skip — do not emit any line boxes for this run.
                 continue;
             }
@@ -1789,6 +1795,7 @@ fn build_children_with_ifc(
                 taffy, inline_run, available_width, parent_font_size, parent_style_props,
             )?;
             result.extend(line_ids);
+            last_was_block = false;
         } else {
             //
             // Handle `clear` property: insert a full-width invisible break
@@ -1848,6 +1855,7 @@ fn build_children_with_ifc(
             }
 
             result.push(node_id);
+            last_was_block = true;
             i += 1;
         }
     }

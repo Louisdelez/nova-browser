@@ -271,10 +271,10 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
             props.push(("background-color".into(), StyleValue::Color(CssColor { r: 255, g: 255, b: 255, a: 1.0 })));
         }
         // <center> — legacy centering element.
+        // Only text-align: center is needed; no auto margins (the element is
+        // a full-width block, not a centred box).
         "center" => {
             props.push(("text-align".into(), StyleValue::Keyword("center".into())));
-            props.push(("margin-left".into(), StyleValue::Keyword("auto".into())));
-            props.push(("margin-right".into(), StyleValue::Keyword("auto".into())));
         }
         _ => {}
     }

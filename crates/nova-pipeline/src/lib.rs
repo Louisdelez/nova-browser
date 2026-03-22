@@ -175,7 +175,18 @@ fn inject_google_search_form(node: &mut DomNode) {
                         },
                     ],
                 };
-                children.push(form);
+                // Insert after the <center> element (which contains the logo)
+                // so the search form appears right below the logo.
+                let center_idx = children.iter().position(|c| {
+                    matches!(c, DomNode::Element { tag, .. } if tag == "center")
+                });
+                if let Some(idx) = center_idx {
+                    children.insert(idx + 1, form);
+                } else {
+                    // Fallback: insert after first few elements (skip header)
+                    let insert_pos = children.len().min(2);
+                    children.insert(insert_pos, form);
+                }
                 return;
             }
             for child in children.iter_mut() {
@@ -255,11 +266,9 @@ impl PipelineEngine {
         }
 
         // Step 2c: Inject Google search form.
-        // Always inject on Google homepages — Google's own search input is
-        // typically hidden inside a <noscript> or display:none container, so
-        // `has_search_input()` would find it and skip injection even though
-        // the input is invisible.  Our injected form has explicit inline
-        // styles and is always visible.
+        // Google's native form uses a <table> inside <form> which our table
+        // layout inside form elements doesn't handle well yet. The injected
+        // form has explicit inline styles and renders correctly.
         if is_google_homepage(url) {
             if let TypedData::Dom(ref mut node) = dom {
                 inject_google_search_form(node);

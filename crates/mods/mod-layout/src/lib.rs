@@ -4359,8 +4359,18 @@ fn build_taffy_style(
 
             // Pass through align-items / justify-content for block elements
             // that are modelled as column flex containers in Taffy.
-            let align_items = lp.align_items.as_deref()
-                .and_then(map_align_items);
+            //
+            // <center> is equivalent to <div align="center">: it centres
+            // both inline content (via text-align: center from the CSS
+            // defaults) and block children.  In Taffy's column-flex model,
+            // `align_items: Center` centres children on the cross (horizontal)
+            // axis, which is exactly what we need.
+            let align_items = if tag == "center" && lp.align_items.is_none() {
+                Some(AlignItems::Center)
+            } else {
+                lp.align_items.as_deref()
+                    .and_then(map_align_items)
+            };
             let justify_content = lp.justify_content.as_deref()
                 .and_then(map_justify_content);
 

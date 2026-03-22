@@ -519,6 +519,22 @@ fn add_node(
         } => {
             // ── Form elements → sized leaf nodes with placeholder text ──
             if matches!(tag.as_str(), "input" | "button" | "select" | "textarea") {
+                // Hidden inputs are invisible — produce a zero-size node.
+                let input_type_early = attributes.iter()
+                    .find(|(k, _)| k == "type")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("text");
+                if input_type_early == "hidden" {
+                    let ctx = NodeContext {
+                        content: LayoutContent::Block,
+                        style: StyleMap::default(),
+                    };
+                    return taffy
+                        .new_leaf(Style { display: Display::None, ..Style::DEFAULT })
+                        .map(|id| { taffy.set_node_context(id, Some(ctx)).ok(); id })
+                        .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+                }
+
                 let font_size = resolve_font_size(tag, attributes, parent_font_size);
                 let line_height = font_size * LINE_HEIGHT_FACTOR;
                 let display = resolve_display(tag, attributes);

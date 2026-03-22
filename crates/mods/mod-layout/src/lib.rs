@@ -3296,6 +3296,26 @@ fn layout_table(
                     }
                 }
 
+                // Propagate table border attribute to cells: when the table has
+                // `border="N"` (N > 0), each cell gets a 1px solid border unless
+                // the cell already has an explicit border set.
+                if border > 0.0
+                    && !cell_props.iter().any(|(k, _)| k == "border-width"
+                        || k == "border-top-width"
+                        || k == "border-style"
+                        || k == "border-top-style")
+                {
+                    cell_props.push(("border-width".into(), StyleValue::Px(1.0)));
+                    cell_props.push(("border-style".into(), StyleValue::Keyword("solid".into())));
+                    cell_props.push(("border-color".into(), StyleValue::Str("#999".into())));
+                    // Also set per-side for the painter.
+                    for side in &["border-top", "border-right", "border-bottom", "border-left"] {
+                        cell_props.push((format!("{side}-width"), StyleValue::Px(1.0)));
+                        cell_props.push((format!("{side}-style"), StyleValue::Keyword("solid".into())));
+                        cell_props.push((format!("{side}-color"), StyleValue::Str("#999".into())));
+                    }
+                }
+
                 // Handle vertical alignment from HTML valign attribute.
                 let valign = attributes
                     .iter()

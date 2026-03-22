@@ -1040,23 +1040,7 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
             }
         }
         "background" => {
-            // Simple: if it looks like a color, use it as background-color.
-            let val = decl.value.trim();
-            if values::parse_color(val).is_some()
-                || val.starts_with('#')
-                || val.starts_with("rgb")
-            {
-                out.push(CascadedDeclaration {
-                    property: "background-color".into(),
-                    value: val.to_string(),
-                    specificity: decl.specificity,
-                    origin: decl.origin,
-                    important: decl.important,
-                });
-            } else {
-                // Pass through as-is.
-                out.push(decl);
-            }
+            expand_background_shorthand(&decl, out);
         }
         "border" => {
             expand_border_shorthand("border", &decl, out);
@@ -1072,6 +1056,65 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
         }
         "border-right" => {
             expand_border_shorthand("border-right", &decl, out);
+        }
+        "border-width" => {
+            // border-width can have 1-4 values, like margin/padding.
+            let parts = split_shorthand(&decl.value);
+            let (top, right, bottom, left) = expand_trbl(&parts);
+            for (prop, val) in [
+                ("border-top-width", top),
+                ("border-right-width", right),
+                ("border-bottom-width", bottom),
+                ("border-left-width", left),
+            ] {
+                out.push(CascadedDeclaration {
+                    property: prop.into(),
+                    value: val.to_string(),
+                    specificity: decl.specificity,
+                    origin: decl.origin,
+                    important: decl.important,
+                });
+            }
+            // Also keep the shorthand for backwards compatibility.
+            out.push(decl);
+        }
+        "border-style" => {
+            let parts = split_shorthand(&decl.value);
+            let (top, right, bottom, left) = expand_trbl(&parts);
+            for (prop, val) in [
+                ("border-top-style", top),
+                ("border-right-style", right),
+                ("border-bottom-style", bottom),
+                ("border-left-style", left),
+            ] {
+                out.push(CascadedDeclaration {
+                    property: prop.into(),
+                    value: val.to_string(),
+                    specificity: decl.specificity,
+                    origin: decl.origin,
+                    important: decl.important,
+                });
+            }
+            out.push(decl);
+        }
+        "border-color" => {
+            let parts = split_shorthand(&decl.value);
+            let (top, right, bottom, left) = expand_trbl(&parts);
+            for (prop, val) in [
+                ("border-top-color", top),
+                ("border-right-color", right),
+                ("border-bottom-color", bottom),
+                ("border-left-color", left),
+            ] {
+                out.push(CascadedDeclaration {
+                    property: prop.into(),
+                    value: val.to_string(),
+                    specificity: decl.specificity,
+                    origin: decl.origin,
+                    important: decl.important,
+                });
+            }
+            out.push(decl);
         }
         "flex" => {
             let val = decl.value.trim();
@@ -1198,6 +1241,12 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
                     important: decl.important,
                 });
             }
+        }
+        "font" => {
+            expand_font_shorthand(&decl, out);
+        }
+        "border-radius" => {
+            expand_border_radius_shorthand(&decl, out);
         }
         "list-style" => {
             // Possible tokens: type keywords, position keywords (inside/outside), url(...)
@@ -1332,55 +1381,137 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
 
 /// Parse and expand a directional border shorthand (`border`, `border-top`, etc.).
 ///
-/// For `border` the longhands are `border-width`, `border-style`, `border-color`.
+/// For `border` the longhands are expanded to all four sides:
+///   `border-top-width`, `border-right-width`, etc.
 /// For `border-{side}` the longhands are `border-{side}-width`, `border-{side}-style`, `border-{side}-color`.
 fn expand_border_shorthand(prefix: &str, decl: &CascadedDeclaration, out: &mut Vec<CascadedDeclaration>) {
-    let (width_prop, style_prop, color_prop) = if prefix == "border" {
-        (
-            "border-width".to_string(),
-            "border-style".to_string(),
-            "border-color".to_string(),
-        )
-    } else {
-        (
-            format!("{prefix}-width"),
-            format!("{prefix}-style"),
-            format!("{prefix}-color"),
-        )
-    };
+    static BORDER_STYLE_KEYWORDS: &[&str] = &[
+        "none", "hidden", "dotted", "dashed", "solid", "double",
+        "groove", "ridge", "inset", "outset",
+    ];
 
+    // Parse the shorthand value into width, style, and color components.
     let parts: Vec<&str> = decl.value.split_whitespace().collect();
+    let mut width_val: Option<String> = None;
+    let mut style_val: Option<String> = None;
+    let mut color_val: Option<String> = None;
+
     for part in &parts {
-        if part.ends_with("px") || part.ends_with("em") || *part == "thin" || *part == "medium" || *part == "thick" {
-            let width_val = match *part {
+        if BORDER_STYLE_KEYWORDS.contains(part) {
+            style_val = Some(part.to_string());
+        } else if part.ends_with("px") || part.ends_with("em") || part.ends_with("rem")
+            || part.ends_with("pt")
+            || *part == "thin" || *part == "medium" || *part == "thick"
+            || part.parse::<f32>().is_ok()
+        {
+            let w = match *part {
                 "thin" => "1px".to_string(),
                 "medium" => "3px".to_string(),
                 "thick" => "5px".to_string(),
-                v => v.to_string(),
+                v => {
+                    // Bare number (e.g. "0" or "1") → treat as px.
+                    if v.parse::<f32>().is_ok()
+                        && !v.ends_with("px") && !v.ends_with("em")
+                        && !v.ends_with("rem") && !v.ends_with("pt")
+                    {
+                        format!("{v}px")
+                    } else {
+                        v.to_string()
+                    }
+                }
             };
-            out.push(CascadedDeclaration {
-                property: width_prop.clone(),
-                value: width_val,
-                specificity: decl.specificity,
-                origin: decl.origin,
-                important: decl.important,
-            });
-        } else if values::parse_color(part).is_some()
-            || part.starts_with('#')
-            || part.starts_with("rgb")
-        {
-            out.push(CascadedDeclaration {
-                property: color_prop.clone(),
-                value: part.to_string(),
-                specificity: decl.specificity,
-                origin: decl.origin,
-                important: decl.important,
-            });
+            width_val = Some(w);
         } else {
-            // Likely border-style keyword (solid, dashed, etc.).
+            // Assume color.
+            color_val = Some(part.to_string());
+        }
+    }
+
+    if prefix == "border" {
+        // Expand to all four sides.
+        let sides = ["border-top", "border-right", "border-bottom", "border-left"];
+        for side in &sides {
+            if let Some(ref w) = width_val {
+                out.push(CascadedDeclaration {
+                    property: format!("{side}-width"),
+                    value: w.clone(),
+                    specificity: decl.specificity,
+                    origin: decl.origin,
+                    important: decl.important,
+                });
+            }
+            if let Some(ref s) = style_val {
+                out.push(CascadedDeclaration {
+                    property: format!("{side}-style"),
+                    value: s.clone(),
+                    specificity: decl.specificity,
+                    origin: decl.origin,
+                    important: decl.important,
+                });
+            }
+            if let Some(ref c) = color_val {
+                out.push(CascadedDeclaration {
+                    property: format!("{side}-color"),
+                    value: c.clone(),
+                    specificity: decl.specificity,
+                    origin: decl.origin,
+                    important: decl.important,
+                });
+            }
+        }
+        // Also set the shorthand properties for backwards compatibility with
+        // code that reads `border-width`, `border-style`, `border-color` directly.
+        if let Some(ref w) = width_val {
             out.push(CascadedDeclaration {
-                property: style_prop.clone(),
-                value: part.to_string(),
+                property: "border-width".into(),
+                value: w.clone(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        }
+        if let Some(ref s) = style_val {
+            out.push(CascadedDeclaration {
+                property: "border-style".into(),
+                value: s.clone(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        }
+        if let Some(ref c) = color_val {
+            out.push(CascadedDeclaration {
+                property: "border-color".into(),
+                value: c.clone(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        }
+    } else {
+        // Single-side shorthand (border-top, border-right, etc.).
+        if let Some(ref w) = width_val {
+            out.push(CascadedDeclaration {
+                property: format!("{prefix}-width"),
+                value: w.clone(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        }
+        if let Some(ref s) = style_val {
+            out.push(CascadedDeclaration {
+                property: format!("{prefix}-style"),
+                value: s.clone(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        }
+        if let Some(ref c) = color_val {
+            out.push(CascadedDeclaration {
+                property: format!("{prefix}-color"),
+                value: c.clone(),
                 specificity: decl.specificity,
                 origin: decl.origin,
                 important: decl.important,
@@ -1414,6 +1545,330 @@ fn expand_trbl<'a>(parts: &[&'a str]) -> (&'a str, &'a str, &'a str, &'a str) {
         4 => (parts[0], parts[1], parts[2], parts[3]),
         _ => ("0", "0", "0", "0"),
     }
+}
+
+/// Expand the CSS `background` shorthand into individual longhand properties.
+///
+/// Handles:
+/// - `background: #color` or `background: rgb(...)` -> `background-color`
+/// - `background: url(...)` -> `background-image`
+/// - `background: #color url(...) no-repeat center` -> multiple longhands
+/// - `background: none` -> `background-color: transparent`
+/// - `background: linear-gradient(...)` / `radial-gradient(...)` -> `background-image`
+fn expand_background_shorthand(decl: &CascadedDeclaration, out: &mut Vec<CascadedDeclaration>) {
+    let val = decl.value.trim();
+
+    // Handle `none` and `transparent` keywords.
+    if val == "none" || val == "transparent" {
+        out.push(CascadedDeclaration {
+            property: "background-color".into(),
+            value: "transparent".into(),
+            specificity: decl.specificity,
+            origin: decl.origin,
+            important: decl.important,
+        });
+        return;
+    }
+
+    // If it contains a gradient function, treat the whole thing as background-image.
+    if val.contains("linear-gradient(") || val.contains("radial-gradient(")
+        || val.contains("conic-gradient(") || val.contains("repeating-")
+    {
+        out.push(CascadedDeclaration {
+            property: "background-image".into(),
+            value: val.to_string(),
+            specificity: decl.specificity,
+            origin: decl.origin,
+            important: decl.important,
+        });
+        return;
+    }
+
+    // Tokenize, but keep url(...) together.
+    let tokens = tokenize_background_value(val);
+
+    static BG_REPEAT_KEYWORDS: &[&str] = &[
+        "repeat", "no-repeat", "repeat-x", "repeat-y", "space", "round",
+    ];
+    static BG_POSITION_KEYWORDS: &[&str] = &[
+        "left", "right", "top", "bottom", "center",
+    ];
+    static BG_SIZE_KEYWORDS: &[&str] = &["cover", "contain"];
+    static BG_ATTACHMENT_KEYWORDS: &[&str] = &["scroll", "fixed", "local"];
+
+    let mut found_color = false;
+    let mut found_image = false;
+
+    for token in &tokens {
+        if token.starts_with("url(") {
+            out.push(CascadedDeclaration {
+                property: "background-image".into(),
+                value: token.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+            found_image = true;
+        } else if BG_REPEAT_KEYWORDS.contains(&token.as_str()) {
+            out.push(CascadedDeclaration {
+                property: "background-repeat".into(),
+                value: token.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        } else if BG_SIZE_KEYWORDS.contains(&token.as_str()) {
+            out.push(CascadedDeclaration {
+                property: "background-size".into(),
+                value: token.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        } else if BG_ATTACHMENT_KEYWORDS.contains(&token.as_str()) {
+            out.push(CascadedDeclaration {
+                property: "background-attachment".into(),
+                value: token.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        } else if BG_POSITION_KEYWORDS.contains(&token.as_str())
+            || token.ends_with('%') || token.ends_with("px")
+        {
+            // Position value — we emit the first one we find.
+            out.push(CascadedDeclaration {
+                property: "background-position".into(),
+                value: token.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        } else if values::parse_color(token).is_some()
+            || token.starts_with('#')
+            || token.starts_with("rgb")
+            || token.starts_with("hsl")
+        {
+            out.push(CascadedDeclaration {
+                property: "background-color".into(),
+                value: token.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+            found_color = true;
+        }
+    }
+
+    // If nothing was recognized, try the whole value as a color.
+    if !found_color && !found_image {
+        out.push(CascadedDeclaration {
+            property: "background-color".into(),
+            value: val.to_string(),
+            specificity: decl.specificity,
+            origin: decl.origin,
+            important: decl.important,
+        });
+    }
+}
+
+/// Tokenize a background shorthand value, keeping `url(...)` together.
+fn tokenize_background_value(val: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = val.chars().peekable();
+    let mut current = String::new();
+
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else if ch == 'u' || ch == 'U' {
+            current.push(ch);
+            // Check if this starts `url(`
+            let rest: String = chars.clone().take(3).collect();
+            if rest.eq_ignore_ascii_case("rl(") {
+                for _ in 0..3 {
+                    current.push(chars.next().unwrap());
+                }
+                // Read until matching closing paren.
+                let mut depth = 1;
+                while let Some(c) = chars.next() {
+                    current.push(c);
+                    if c == '(' { depth += 1; }
+                    else if c == ')' {
+                        depth -= 1;
+                        if depth == 0 { break; }
+                    }
+                }
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Expand the CSS `font` shorthand into individual longhand properties.
+///
+/// Handles: `font: [style] [variant] [weight] size[/line-height] family`
+///
+/// Examples:
+/// - `font: bold 16px/1.5 Arial, sans-serif`
+/// - `font: italic bold 14px Helvetica`
+/// - `font: 12px/1.4 monospace`
+fn expand_font_shorthand(decl: &CascadedDeclaration, out: &mut Vec<CascadedDeclaration>) {
+    let val = decl.value.trim();
+
+    // System font keywords — pass through.
+    if matches!(val, "caption" | "icon" | "menu" | "message-box" | "small-caption" | "status-bar") {
+        out.push(decl.clone());
+        return;
+    }
+
+    static FONT_STYLE_KEYWORDS: &[&str] = &["italic", "oblique"];
+    static FONT_VARIANT_KEYWORDS: &[&str] = &["small-caps"];
+    static FONT_WEIGHT_KEYWORDS: &[&str] = &[
+        "bold", "bolder", "lighter", "100", "200", "300", "400", "500",
+        "600", "700", "800", "900",
+    ];
+
+    // Find the font-size token: the first token that looks like a size.
+    // Everything before it is style/variant/weight.
+    // Everything after it (possibly with /line-height) is the font-family.
+    let parts: Vec<&str> = val.split_whitespace().collect();
+    let mut size_idx: Option<usize> = None;
+
+    for (i, part) in parts.iter().enumerate() {
+        // Check if this looks like a font-size (has px, em, rem, pt, %, or is a size keyword).
+        let p = if part.contains('/') { part.split('/').next().unwrap_or(part) } else { part };
+        if p.ends_with("px") || p.ends_with("em") || p.ends_with("rem")
+            || p.ends_with("pt") || p.ends_with('%')
+            || matches!(p, "xx-small" | "x-small" | "small" | "medium" | "large" | "x-large" | "xx-large")
+        {
+            size_idx = Some(i);
+            break;
+        }
+        // Bare number (like `16`) could be a font-size if no units.
+        if p.parse::<f32>().is_ok() && !FONT_WEIGHT_KEYWORDS.contains(part) {
+            size_idx = Some(i);
+            break;
+        }
+    }
+
+    let Some(si) = size_idx else {
+        // Could not identify font-size; pass through as-is.
+        out.push(decl.clone());
+        return;
+    };
+
+    // Tokens before size_idx are style/variant/weight.
+    for i in 0..si {
+        let part = parts[i];
+        if part == "normal" {
+            continue; // `normal` is the default for all three.
+        }
+        if FONT_STYLE_KEYWORDS.contains(&part) {
+            out.push(CascadedDeclaration {
+                property: "font-style".into(),
+                value: part.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        } else if FONT_VARIANT_KEYWORDS.contains(&part) {
+            out.push(CascadedDeclaration {
+                property: "font-variant".into(),
+                value: part.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        } else if FONT_WEIGHT_KEYWORDS.contains(&part) {
+            out.push(CascadedDeclaration {
+                property: "font-weight".into(),
+                value: part.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        }
+    }
+
+    // Parse font-size and optional line-height from "size/line-height".
+    let size_part = parts[si];
+    if let Some(slash_pos) = size_part.find('/') {
+        let size = &size_part[..slash_pos];
+        let lh = &size_part[slash_pos + 1..];
+        out.push(CascadedDeclaration {
+            property: "font-size".into(),
+            value: size.to_string(),
+            specificity: decl.specificity,
+            origin: decl.origin,
+            important: decl.important,
+        });
+        out.push(CascadedDeclaration {
+            property: "line-height".into(),
+            value: lh.to_string(),
+            specificity: decl.specificity,
+            origin: decl.origin,
+            important: decl.important,
+        });
+    } else {
+        out.push(CascadedDeclaration {
+            property: "font-size".into(),
+            value: size_part.to_string(),
+            specificity: decl.specificity,
+            origin: decl.origin,
+            important: decl.important,
+        });
+    }
+
+    // Everything after font-size is font-family.
+    if si + 1 < parts.len() {
+        let family = parts[si + 1..].join(" ");
+        out.push(CascadedDeclaration {
+            property: "font-family".into(),
+            value: family,
+            specificity: decl.specificity,
+            origin: decl.origin,
+            important: decl.important,
+        });
+    }
+}
+
+/// Expand `border-radius` shorthand (1-4 values) into individual corner properties.
+fn expand_border_radius_shorthand(decl: &CascadedDeclaration, out: &mut Vec<CascadedDeclaration>) {
+    // Handle `border-radius: 10px / 5px` (horizontal / vertical) — simplify by taking just the first part.
+    let val = if let Some(slash_pos) = decl.value.find('/') {
+        decl.value[..slash_pos].trim()
+    } else {
+        decl.value.trim()
+    };
+
+    let parts: Vec<&str> = val.split_whitespace().collect();
+    let (tl, tr, br, bl) = expand_trbl(&parts);
+
+    for (prop, v) in [
+        ("border-top-left-radius", tl),
+        ("border-top-right-radius", tr),
+        ("border-bottom-right-radius", br),
+        ("border-bottom-left-radius", bl),
+    ] {
+        out.push(CascadedDeclaration {
+            property: prop.into(),
+            value: v.to_string(),
+            specificity: decl.specificity,
+            origin: decl.origin,
+            important: decl.important,
+        });
+    }
+    // Also keep the shorthand for code that reads border-radius directly.
+    out.push(decl.clone());
 }
 
 /// Resolve `var(--name)` and `var(--name, fallback)` references in a CSS value.

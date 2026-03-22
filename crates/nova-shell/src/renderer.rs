@@ -730,8 +730,9 @@ pub struct Framebuffer {
     /// Stack of clip rectangles. Rendering is restricted to the intersection of
     /// all active clip rects.
     clip_stack: Vec<ClipRect>,
-    /// Extra y-offset applied by sticky positioning (reset each frame).
-    translate_y_offset: f32,
+    /// Stack of y-offsets for sticky positioning, supporting nested sticky
+    /// elements. The current effective offset is the sum of all entries.
+    sticky_offset_stack: Vec<f32>,
     /// Stack of opacity values for nested PushOpacity/PopOpacity.
     opacity_stack: Vec<f32>,
     /// Stack of 2D affine transforms for Save/Transform/Restore.
@@ -754,7 +755,7 @@ impl Framebuffer {
             pixels,
             font_renderer,
             clip_stack: Vec::new(),
-            translate_y_offset: 0.0,
+            sticky_offset_stack: Vec::new(),
             opacity_stack: Vec::new(),
             transform_stack: Vec::new(),
             current_transform: AffineTransform::identity(),
@@ -1384,7 +1385,7 @@ impl Framebuffer {
         self.clear(Color::WHITE);
         self.clip_stack.clear();
         self.opacity_stack.clear();
-        self.translate_y_offset = 0.0;
+        self.sticky_offset_stack.clear();
         self.transform_stack.clear();
         self.current_transform = AffineTransform::identity();
         self.fixed_depth = 0;
@@ -1397,7 +1398,7 @@ impl Framebuffer {
         let sx = scroll_x;
 
         for op in &commands.ops {
-            let sy_extra = self.translate_y_offset;
+            let sy_extra: f32 = self.sticky_offset_stack.iter().sum();
             // When inside a fixed-position element, ignore scroll offsets
             // so the element stays anchored to the viewport.
             let effective_scroll_x = if self.fixed_depth > 0 { 0.0 } else { sx };
@@ -1497,16 +1498,24 @@ impl Framebuffer {
                 // Sticky positioning: adjust the y-offset for subsequent ops
                 // so the element sticks to the viewport during scroll.
                 RenderOp::StickyStart { original_y, sticky_top } => {
-                    // If the element would scroll above sticky_top in the viewport,
-                    // push a translation to keep it at sticky_top.
+                    // The element's natural position in the viewport (after
+                    // accounting for scroll and the toolbar y_offset).
                     let element_viewport_y = *original_y + y_offset - scroll_y;
-                    if element_viewport_y < y_offset + *sticky_top {
-                        let offset = (y_offset + *sticky_top) - element_viewport_y;
-                        self.translate_y_offset += offset;
+                    // The sticky threshold: where the element should stick.
+                    let stick_threshold = y_offset + *sticky_top;
+                    if element_viewport_y < stick_threshold {
+                        // Element has scrolled past its sticky point — push
+                        // an offset so it stays at sticky_top from the
+                        // viewport top.
+                        let offset = stick_threshold - element_viewport_y;
+                        self.sticky_offset_stack.push(offset);
+                    } else {
+                        // Not sticky yet — push zero so StickyEnd can pop.
+                        self.sticky_offset_stack.push(0.0);
                     }
                 }
                 RenderOp::StickyEnd => {
-                    self.translate_y_offset = 0.0;
+                    self.sticky_offset_stack.pop();
                 }
                 // Save/Restore/Transform — manage the transform stack.
                 RenderOp::Save => {

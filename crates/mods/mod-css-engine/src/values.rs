@@ -72,6 +72,96 @@ pub fn eval_calc(expr: &str, context_px: f32) -> Option<f32> {
     eval_tokens(&tokens)
 }
 
+/// Evaluate a `clamp()`, `min()`, or `max()` CSS math function with a context
+/// value for resolving percentages and viewport-relative units.
+///
+/// `raw` is the full function call (e.g., `clamp(200px, 50%, 800px)`).
+/// `context_px` is the reference size for `%` and `vw` units.
+///
+/// Returns the computed value in pixels, or `None` if the expression cannot
+/// be parsed.
+pub fn eval_math_function(raw: &str, context_px: f32) -> Option<f32> {
+    if let Some(inner) = raw.strip_prefix("clamp(").and_then(|s| s.strip_suffix(')')) {
+        let args = split_function_args(inner);
+        if args.len() != 3 {
+            return None;
+        }
+        let min_val = eval_math_arg_ctx(args[0].trim(), context_px)?;
+        let preferred = eval_math_arg_ctx(args[1].trim(), context_px)?;
+        let max_val = eval_math_arg_ctx(args[2].trim(), context_px)?;
+        return Some(min_val.max(preferred.min(max_val)));
+    }
+
+    if let Some(inner) = raw.strip_prefix("min(").and_then(|s| s.strip_suffix(')')) {
+        let args = split_function_args(inner);
+        let mut result = f32::INFINITY;
+        for arg in &args {
+            let val = eval_math_arg_ctx(arg.trim(), context_px)?;
+            if val < result {
+                result = val;
+            }
+        }
+        return Some(result);
+    }
+
+    if let Some(inner) = raw.strip_prefix("max(").and_then(|s| s.strip_suffix(')')) {
+        let args = split_function_args(inner);
+        let mut result = f32::NEG_INFINITY;
+        for arg in &args {
+            let val = eval_math_arg_ctx(arg.trim(), context_px)?;
+            if val > result {
+                result = val;
+            }
+        }
+        return Some(result);
+    }
+
+    None
+}
+
+/// Evaluate a single math function argument to px, resolving `%` and `vw`
+/// against `context_px`.
+fn eval_math_arg_ctx(arg: &str, context_px: f32) -> Option<f32> {
+    let arg = arg.trim();
+
+    // Nested calc()
+    if arg.starts_with("calc(") {
+        let inner = arg.strip_prefix("calc(")?.strip_suffix(')')?;
+        return eval_calc(inner, context_px);
+    }
+
+    // Nested min/max/clamp
+    if arg.starts_with("min(") || arg.starts_with("max(") || arg.starts_with("clamp(") {
+        return eval_math_function(arg, context_px);
+    }
+
+    // Try percentage
+    if let Some(s) = arg.strip_suffix('%') {
+        return s.trim().parse::<f32>().ok().map(|n| n / 100.0 * context_px);
+    }
+    // Try vw/vh
+    if let Some(s) = arg.strip_suffix("vw").or_else(|| arg.strip_suffix("vh")) {
+        return s.trim().parse::<f32>().ok().map(|n| n / 100.0 * context_px);
+    }
+    // Try px
+    if let Some(s) = arg.strip_suffix("px") {
+        return s.trim().parse::<f32>().ok();
+    }
+    // Try em/rem
+    if let Some(s) = arg.strip_suffix("rem") {
+        return s.trim().parse::<f32>().ok().map(|n| n * 16.0);
+    }
+    if let Some(s) = arg.strip_suffix("em") {
+        return s.trim().parse::<f32>().ok().map(|n| n * 16.0);
+    }
+    // Try pt
+    if let Some(s) = arg.strip_suffix("pt") {
+        return s.trim().parse::<f32>().ok().map(|n| n * 1.333);
+    }
+    // Plain number (treated as px)
+    arg.parse::<f32>().ok()
+}
+
 /// Resolve a `calc(...)` CSS expression.
 ///
 /// If all operands are in `px` (or plain numbers), evaluates the expression fully
@@ -96,6 +186,161 @@ fn resolve_calc(raw: &str) -> Option<StyleValue> {
         Some(px) => Some(StyleValue::Px(px)),
         None => Some(StyleValue::Str(raw.to_string())),
     }
+}
+
+/// Resolve an `env()` CSS function.
+///
+/// Since NOVA does not have safe area insets or other environment variables,
+/// the fallback value is returned. If no fallback is specified, `0px` is used.
+///
+/// # Examples
+///
+/// - `env(safe-area-inset-top)` → `0px`
+/// - `env(safe-area-inset-top, 20px)` → `20px`
+fn resolve_env(raw: &str) -> Option<StyleValue> {
+    let inner = raw.strip_prefix("env(")?.strip_suffix(')')?.trim();
+
+    // Split into name and optional fallback at the first comma.
+    let fallback = if let Some(comma_pos) = inner.find(',') {
+        inner[comma_pos + 1..].trim()
+    } else {
+        "0px"
+    };
+
+    // Parse the fallback as a regular value.
+    parse_length_or_number(fallback).or_else(|| Some(StyleValue::Str(fallback.to_string())))
+}
+
+/// Resolve `clamp()`, `min()`, or `max()` CSS math functions.
+///
+/// If all arguments can be fully resolved (no `%` or viewport units),
+/// returns the computed `StyleValue::Px`. Otherwise, preserves the
+/// original string as `StyleValue::Str` for downstream resolution.
+///
+/// # Supported functions
+///
+/// - `clamp(min, preferred, max)` → `max(min, min(preferred, max))`
+/// - `min(a, b, ...)` → smallest value
+/// - `max(a, b, ...)` → largest value
+fn resolve_math_function(raw: &str) -> Option<StyleValue> {
+    // Check if it contains %, vw, vh — if so, preserve for layout-time resolution.
+    if raw.contains('%') || raw.contains("vw") || raw.contains("vh") {
+        return Some(StyleValue::Str(raw.to_string()));
+    }
+
+    if let Some(inner) = raw.strip_prefix("clamp(").and_then(|s| s.strip_suffix(')')) {
+        let args = split_function_args(inner);
+        if args.len() != 3 {
+            return Some(StyleValue::Str(raw.to_string()));
+        }
+        let min_val = eval_math_arg(args[0].trim())?;
+        let preferred = eval_math_arg(args[1].trim())?;
+        let max_val = eval_math_arg(args[2].trim())?;
+        // clamp(min, preferred, max) = max(min, min(preferred, max))
+        let result = min_val.max(preferred.min(max_val));
+        return Some(StyleValue::Px(result));
+    }
+
+    if let Some(inner) = raw.strip_prefix("min(").and_then(|s| s.strip_suffix(')')) {
+        let args = split_function_args(inner);
+        if args.is_empty() {
+            return Some(StyleValue::Str(raw.to_string()));
+        }
+        let mut result = f32::INFINITY;
+        for arg in &args {
+            let val = eval_math_arg(arg.trim())?;
+            if val < result {
+                result = val;
+            }
+        }
+        return Some(StyleValue::Px(result));
+    }
+
+    if let Some(inner) = raw.strip_prefix("max(").and_then(|s| s.strip_suffix(')')) {
+        let args = split_function_args(inner);
+        if args.is_empty() {
+            return Some(StyleValue::Str(raw.to_string()));
+        }
+        let mut result = f32::NEG_INFINITY;
+        for arg in &args {
+            let val = eval_math_arg(arg.trim())?;
+            if val > result {
+                result = val;
+            }
+        }
+        return Some(StyleValue::Px(result));
+    }
+
+    Some(StyleValue::Str(raw.to_string()))
+}
+
+/// Split a function's arguments at top-level commas (respecting nested parens).
+fn split_function_args(inner: &str) -> Vec<&str> {
+    let mut args = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            ',' if depth == 0 => {
+                args.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    // Push the last argument.
+    let last = &inner[start..];
+    if !last.trim().is_empty() {
+        args.push(last);
+    }
+    args
+}
+
+/// Evaluate a single math function argument to a px value.
+///
+/// Supports plain numbers, px/em/rem/pt values, calc(), and nested
+/// min()/max()/clamp() calls.
+fn eval_math_arg(arg: &str) -> Option<f32> {
+    let arg = arg.trim();
+
+    // Nested calc()
+    if arg.starts_with("calc(") {
+        let inner = arg.strip_prefix("calc(")?.strip_suffix(')')?;
+        return eval_calc_expr(inner);
+    }
+
+    // Nested min/max/clamp
+    if arg.starts_with("min(") || arg.starts_with("max(") || arg.starts_with("clamp(") {
+        match resolve_math_function(arg)? {
+            StyleValue::Px(px) => return Some(px),
+            _ => return None,
+        }
+    }
+
+    // Try px
+    if let Some(s) = arg.strip_suffix("px") {
+        return s.trim().parse::<f32>().ok();
+    }
+    // Try em/rem
+    if let Some(s) = arg.strip_suffix("rem") {
+        return s.trim().parse::<f32>().ok().map(|n| n * 16.0);
+    }
+    if let Some(s) = arg.strip_suffix("em") {
+        return s.trim().parse::<f32>().ok().map(|n| n * 16.0);
+    }
+    // Try pt
+    if let Some(s) = arg.strip_suffix("pt") {
+        return s.trim().parse::<f32>().ok().map(|n| n * 1.333);
+    }
+    // Plain number (treated as px)
+    arg.parse::<f32>().ok()
 }
 
 /// Evaluate a `calc` inner expression that contains only px / plain-number
@@ -387,10 +632,20 @@ fn eval_tokens(tokens: &[CalcToken]) -> Option<f32> {
 
 /// Try to parse a CSS length (`px`, `em`, `rem`, `%`) or plain number.
 ///
-/// Also handles `calc()` expressions.
+/// Also handles `calc()`, `clamp()`, `min()`, `max()`, and `env()` expressions.
 fn parse_length_or_number(raw: &str) -> Option<StyleValue> {
     if raw.starts_with("calc(") {
         return resolve_calc(raw);
+    }
+
+    // Handle env() — return fallback value or 0px.
+    if raw.starts_with("env(") {
+        return resolve_env(raw);
+    }
+
+    // Handle clamp(), min(), max() — these may contain %, vw, etc.
+    if raw.starts_with("clamp(") || raw.starts_with("min(") || raw.starts_with("max(") {
+        return resolve_math_function(raw);
     }
 
     if raw.ends_with("px") {
@@ -1063,5 +1318,127 @@ mod tests {
         // calc(50% + 20px) with context 800 → 420.0
         let result = eval_calc("50% + 20px", 800.0);
         assert_eq!(result, Some(420.0));
+    }
+
+    // ── clamp(), min(), max() tests ──────────────────────────────────────
+
+    #[test]
+    fn clamp_all_px() {
+        // clamp(200px, 500px, 800px) → 500px (preferred is in range)
+        match parse_value("width", "clamp(200px, 500px, 800px)") {
+            StyleValue::Px(v) => assert!((v - 500.0).abs() < 0.01, "expected 500, got {v}"),
+            other => panic!("expected Px(500), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clamp_preferred_below_min() {
+        // clamp(200px, 100px, 800px) → 200px (preferred < min)
+        match parse_value("width", "clamp(200px, 100px, 800px)") {
+            StyleValue::Px(v) => assert!((v - 200.0).abs() < 0.01, "expected 200, got {v}"),
+            other => panic!("expected Px(200), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clamp_preferred_above_max() {
+        // clamp(200px, 1000px, 800px) → 800px (preferred > max)
+        match parse_value("width", "clamp(200px, 1000px, 800px)") {
+            StyleValue::Px(v) => assert!((v - 800.0).abs() < 0.01, "expected 800, got {v}"),
+            other => panic!("expected Px(800), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clamp_with_percent_preserved() {
+        // clamp(200px, 50%, 800px) — contains %, preserved as Str
+        match parse_value("width", "clamp(200px, 50%, 800px)") {
+            StyleValue::Str(s) => assert_eq!(s, "clamp(200px, 50%, 800px)"),
+            other => panic!("expected Str, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_two_px_values() {
+        // min(100px, 600px) → 100px
+        match parse_value("width", "min(100px, 600px)") {
+            StyleValue::Px(v) => assert!((v - 100.0).abs() < 0.01, "expected 100, got {v}"),
+            other => panic!("expected Px(100), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_two_px_values() {
+        // max(200px, 50px) → 200px
+        match parse_value("width", "max(200px, 50px)") {
+            StyleValue::Px(v) => assert!((v - 200.0).abs() < 0.01, "expected 200, got {v}"),
+            other => panic!("expected Px(200), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_with_percent_preserved() {
+        // min(100%, 600px) — contains %, preserved as Str
+        match parse_value("width", "min(100%, 600px)") {
+            StyleValue::Str(s) => assert_eq!(s, "min(100%, 600px)"),
+            other => panic!("expected Str, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_math_clamp_with_context() {
+        // clamp(200px, 50%, 800px) with context 1000 → 500 (50% of 1000 = 500, in range)
+        let result = eval_math_function("clamp(200px, 50%, 800px)", 1000.0);
+        assert_eq!(result, Some(500.0));
+    }
+
+    #[test]
+    fn eval_math_min_with_context() {
+        // min(100%, 600px) with context 400 → 400 (100% of 400 = 400 < 600)
+        let result = eval_math_function("min(100%, 600px)", 400.0);
+        assert_eq!(result, Some(400.0));
+    }
+
+    #[test]
+    fn eval_math_max_with_context() {
+        // max(200px, 50%) with context 300 → 200 (50% of 300 = 150 < 200)
+        let result = eval_math_function("max(200px, 50%)", 300.0);
+        assert_eq!(result, Some(200.0));
+    }
+
+    #[test]
+    fn eval_math_nested_min_in_clamp() {
+        // clamp(100px, min(400px, 300px), 800px) → 300px
+        let result = eval_math_function("clamp(100px, min(400px, 300px), 800px)", 0.0);
+        assert_eq!(result, Some(300.0));
+    }
+
+    // ── env() tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn env_with_fallback() {
+        // env(safe-area-inset-top, 20px) → 20px
+        match parse_value("padding-top", "env(safe-area-inset-top, 20px)") {
+            StyleValue::Px(v) => assert!((v - 20.0).abs() < 0.01, "expected 20, got {v}"),
+            other => panic!("expected Px(20), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn env_without_fallback() {
+        // env(safe-area-inset-top) → 0px
+        match parse_value("padding-top", "env(safe-area-inset-top)") {
+            StyleValue::Px(v) => assert!((v - 0.0).abs() < 0.01, "expected 0, got {v}"),
+            other => panic!("expected Px(0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn env_with_percent_fallback() {
+        // env(safe-area-inset-bottom, 5%) → Percent(5.0)
+        match parse_value("margin-bottom", "env(safe-area-inset-bottom, 5%)") {
+            StyleValue::Percent(v) => assert!((v - 5.0).abs() < 0.01, "expected 5%, got {v}"),
+            other => panic!("expected Percent(5), got {other:?}"),
+        }
     }
 }

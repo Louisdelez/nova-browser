@@ -1083,6 +1083,17 @@ fn add_node(
                 if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "title") {
                     props.push(("nova-title".into(), StyleValue::Str(v.clone())));
                 }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "target") {
+                    props.push(("nova-target".into(), StyleValue::Str(v.clone())));
+                }
+            }
+
+            // Propagate the id attribute for all elements so the painter
+            // can emit Anchor ops for anchor scrolling (#section).
+            if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "id") {
+                if !v.is_empty() {
+                    props.push(("nova-element-id".into(), StyleValue::Str(v.clone())));
+                }
             }
 
             // For <li> elements, inherit list-style-type and nova-list-index
@@ -1195,6 +1206,57 @@ fn add_node(
                     .collect::<Result<Vec<_>, _>>()?
             };
             let mut taffy_style = build_taffy_style(&display, tag, attributes, viewport);
+
+            // ── Grid template areas resolution ──────────────────────
+            // When this element is a grid container with `grid-template-areas`,
+            // resolve each child's `grid-area: <name>` into explicit
+            // `grid-row` / `grid-column` placements on their Taffy styles.
+            if display == "grid" {
+                let lp_grid = parse_layout_props(attributes, viewport);
+                if let Some(ref areas) = lp_grid.grid_template_areas {
+                    // Also generate implicit grid-template-rows/columns from
+                    // the areas definition when the user didn't set them explicitly.
+                    let num_rows = areas.len();
+                    let num_cols = areas.first().map(|r| r.len()).unwrap_or(0);
+                    if taffy_style.grid_template_rows.is_empty() && num_rows > 0 {
+                        use taffy::style_helpers::FromFlex;
+                        taffy_style.grid_template_rows = (0..num_rows)
+                            .map(|_| <TrackSizingFunction as FromFlex>::from_flex(1.0))
+                            .collect();
+                    }
+                    if taffy_style.grid_template_columns.is_empty() && num_cols > 0 {
+                        use taffy::style_helpers::FromFlex;
+                        taffy_style.grid_template_columns = (0..num_cols)
+                            .map(|_| <TrackSizingFunction as FromFlex>::from_flex(1.0))
+                            .collect();
+                    }
+
+                    // Resolve each child's grid-area name to row/column placement.
+                    for (idx, child) in children_ref.iter().enumerate() {
+                        if let DomNode::Element { attributes: child_attrs, .. } = child {
+                            let child_lp = parse_layout_props(child_attrs, viewport);
+                            if let Some(ref area_name) = child_lp.grid_area {
+                                if let Some((rs, re, cs, ce)) = resolve_grid_area(areas, area_name) {
+                                    if idx < child_ids.len() {
+                                        let child_id = child_ids[idx];
+                                        if let Ok(mut child_style) = taffy.style(child_id).cloned() {
+                                            child_style.grid_row = Line {
+                                                start: GridPlacement::Line(rs.into()),
+                                                end: GridPlacement::Line(re.into()),
+                                            };
+                                            child_style.grid_column = Line {
+                                                start: GridPlacement::Line(cs.into()),
+                                                end: GridPlacement::Line(ce.into()),
+                                            };
+                                            let _ = taffy.set_style(child_id, child_style);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // ── Multi-column layout (column-count) ──────────────────
             // When column-count is set, distribute children across N columns.
@@ -2124,13 +2186,23 @@ fn flatten_node_recursive(
                 }
             }
 
-            // Propagate href and title for links.
+            // Propagate href, title, and target for links.
             if tag == "a" {
                 if let Some(href) = attributes.iter().find(|(k, _)| k == "href") {
                     child_props.push(("href".into(), StyleValue::Str(href.1.clone())));
                 }
                 if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "title") {
                     child_props.push(("nova-title".into(), StyleValue::Str(v.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "target") {
+                    child_props.push(("nova-target".into(), StyleValue::Str(v.clone())));
+                }
+            }
+
+            // Propagate the id attribute for anchor scrolling.
+            if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "id") {
+                if !v.is_empty() {
+                    child_props.push(("nova-element-id".into(), StyleValue::Str(v.clone())));
                 }
             }
 
@@ -3730,6 +3802,12 @@ struct LayoutProps {
     grid_column: Option<(i16, i16)>,
     /// `grid-row: start / end` (1-based, converted to 0-based line index).
     grid_row: Option<(i16, i16)>,
+    /// `grid-area` name (e.g. "header", "sidebar"). Resolved against the
+    /// parent's `grid-template-areas` to produce `grid-row` / `grid-column`.
+    grid_area: Option<String>,
+    /// Parsed `grid-template-areas` for a grid container.
+    /// Each inner Vec is one row of named area tokens.
+    grid_template_areas: Option<Vec<Vec<String>>>,
     // ── Flexbox alignment properties ─────────────────────────────────
     /// CSS `align-items` property for flex/grid containers.
     align_items: Option<String>,
@@ -4007,6 +4085,77 @@ fn parse_gap_value(s: &str) -> Option<f32> {
     None
 }
 
+/// Parse `grid-template-areas` value into a 2D grid of named area tokens.
+///
+/// Input example: `"header header" "sidebar main" "footer footer"`
+/// Output: `[["header","header"], ["sidebar","main"], ["footer","footer"]]`
+fn parse_grid_template_areas(val: &str) -> Option<Vec<Vec<String>>> {
+    let val = val.trim();
+    if val.is_empty() || val == "none" {
+        return None;
+    }
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    // Each quoted string is one row.
+    let mut rest = val;
+    while let Some(start) = rest.find('"') {
+        let after_start = &rest[start + 1..];
+        if let Some(end) = after_start.find('"') {
+            let row_str = &after_start[..end];
+            let tokens: Vec<String> = row_str.split_whitespace().map(|s| s.to_string()).collect();
+            if !tokens.is_empty() {
+                rows.push(tokens);
+            }
+            rest = &after_start[end + 1..];
+        } else {
+            break;
+        }
+    }
+    if rows.is_empty() {
+        None
+    } else {
+        Some(rows)
+    }
+}
+
+/// Given a parsed `grid-template-areas` 2D grid and an area name, return the
+/// grid placement as `(row_start, row_end, col_start, col_end)` using 1-based
+/// CSS grid line numbers (compatible with Taffy).
+///
+/// Returns `None` if the area name is not found.
+fn resolve_grid_area(areas: &[Vec<String>], name: &str) -> Option<(i16, i16, i16, i16)> {
+    let mut row_start: Option<usize> = None;
+    let mut row_end: usize = 0;
+    let mut col_start: Option<usize> = None;
+    let mut col_end: usize = 0;
+
+    for (r, row) in areas.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            if cell == name {
+                if row_start.is_none() {
+                    row_start = Some(r);
+                }
+                row_end = r + 1;
+                if col_start.is_none() || c < col_start.unwrap() {
+                    col_start = Some(c);
+                }
+                if c + 1 > col_end {
+                    col_end = c + 1;
+                }
+            }
+        }
+    }
+
+    let rs = row_start?;
+    let cs = col_start?;
+    // CSS grid lines are 1-based: area occupying rows 0..2 → lines 1..3.
+    Some((
+        (rs + 1) as i16,
+        (row_end + 1) as i16,
+        (cs + 1) as i16,
+        (col_end + 1) as i16,
+    ))
+}
+
 /// Parse `grid-column` / `grid-row` shorthand: `start / end`.
 /// Returns (start_line, end_line) as 0-based Taffy line indices.
 ///
@@ -4272,6 +4421,35 @@ fn parse_layout_props(attributes: &[(String, String)], viewport: &Viewport) -> L
                 "grid-row" => {
                     props.grid_row = parse_grid_line_span(val);
                 }
+                "grid-area" => {
+                    let v = val.trim().to_string();
+                    if !v.is_empty() {
+                        // If the value contains slashes it's a `row-start / col-start / row-end / col-end`
+                        // shorthand — try to parse as explicit line placement first.
+                        if v.contains('/') {
+                            let parts: Vec<&str> = v.splitn(4, '/').collect();
+                            if parts.len() >= 2 {
+                                // grid-area: row-start / col-start [ / row-end [ / col-end ] ]
+                                let rs = parts[0].trim().parse::<i16>().ok();
+                                let cs = parts[1].trim().parse::<i16>().ok();
+                                let re = parts.get(2).and_then(|s| s.trim().parse::<i16>().ok());
+                                let ce = parts.get(3).and_then(|s| s.trim().parse::<i16>().ok());
+                                if let (Some(rs), Some(cs)) = (rs, cs) {
+                                    props.grid_row = Some((rs, re.unwrap_or(0)));
+                                    props.grid_column = Some((cs, ce.unwrap_or(0)));
+                                } else {
+                                    // Not numeric — treat as a named area.
+                                    props.grid_area = Some(v);
+                                }
+                            }
+                        } else {
+                            props.grid_area = Some(v);
+                        }
+                    }
+                }
+                "grid-template-areas" => {
+                    props.grid_template_areas = parse_grid_template_areas(val);
+                }
 
                 // ── Flexbox alignment properties ─────────────────────
                 "align-items" => {
@@ -4493,11 +4671,24 @@ fn build_taffy_style(
     };
 
     // Build the inset rect from top/right/bottom/left.
-    let inset = Rect {
-        top: lp.top.unwrap_or(LengthPercentageAuto::Auto),
-        right: lp.right.unwrap_or(LengthPercentageAuto::Auto),
-        bottom: lp.bottom.unwrap_or(LengthPercentageAuto::Auto),
-        left: lp.left.unwrap_or(LengthPercentageAuto::Auto),
+    // For `position: sticky`, the inset values (top, left, etc.) are thresholds
+    // for the sticky behaviour, NOT layout offsets. Zero them out so Taffy does
+    // not apply a relative offset; the renderer handles the sticky clamping.
+    let is_sticky = lp.position.as_deref() == Some("sticky");
+    let inset = if is_sticky {
+        Rect {
+            top: LengthPercentageAuto::Auto,
+            right: LengthPercentageAuto::Auto,
+            bottom: LengthPercentageAuto::Auto,
+            left: LengthPercentageAuto::Auto,
+        }
+    } else {
+        Rect {
+            top: lp.top.unwrap_or(LengthPercentageAuto::Auto),
+            right: lp.right.unwrap_or(LengthPercentageAuto::Auto),
+            bottom: lp.bottom.unwrap_or(LengthPercentageAuto::Auto),
+            left: lp.left.unwrap_or(LengthPercentageAuto::Auto),
+        }
     };
 
     // Float approximation:

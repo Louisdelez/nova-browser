@@ -12,7 +12,7 @@ use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{ElementState, Modifiers, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, NamedKey},
     window::{CursorIcon, Window, WindowId},
@@ -58,6 +58,8 @@ pub struct HitRegion {
     pub url: String,
     /// The `title` attribute text (for tooltip).
     pub title: String,
+    /// The `target` attribute (e.g. "_blank", "_self"). Empty means default.
+    pub target: String,
 }
 
 impl HitRegion {
@@ -65,6 +67,16 @@ impl HitRegion {
     fn contains(&self, px: f32, py: f32) -> bool {
         px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
     }
+}
+
+/// An anchor point on the page (element with an `id` attribute).
+/// Used for scrolling to `#section` anchors.
+#[derive(Debug, Clone)]
+pub struct AnchorRegion {
+    /// The `id` attribute value.
+    pub id: String,
+    /// Y coordinate in page coordinates.
+    pub y: f32,
 }
 
 /// An interactive form field region on the page.
@@ -248,6 +260,18 @@ pub struct BrowserWindow {
     /// URL of the last clicked link (for diagnostics / future navigation).
     last_clicked_url: Option<String>,
 
+    // -- Anchor regions (for #section scrolling) --
+    /// Anchor points extracted from `RenderOp::Anchor` ops.
+    anchor_regions: Vec<AnchorRegion>,
+
+    // -- Navigation history --
+    /// Stack of visited URLs for back/forward navigation.
+    history: Vec<String>,
+    /// Current position in the history stack (index into `history`).
+    history_index: usize,
+    /// Whether we are currently navigating via back/forward (to avoid pushing to history).
+    navigating_history: bool,
+
     // -- Navigation --
     /// Reference to the core for in-place navigation.
     core: Arc<NovaCore>,
@@ -298,6 +322,10 @@ pub struct BrowserWindow {
     /// Whether to attempt GPU rendering (disabled if GPU init fails).
     use_gpu_rendering: bool,
 
+    // -- Keyboard modifier state --
+    /// Current keyboard modifier state (Ctrl, Alt, Shift, etc.).
+    modifiers: Modifiers,
+
     // -- Tooltip state --
     /// Text to display as a tooltip (from `title` attribute).
     tooltip_text: String,
@@ -336,6 +364,7 @@ impl BrowserWindow {
     ) -> Self {
         let hit_regions = Self::extract_hit_regions(&commands);
         let form_fields = Self::extract_form_fields(&commands);
+        let anchor_regions = Self::extract_anchor_regions(&commands);
         let content_height = Self::compute_content_height(&commands);
         let content_width = Self::compute_content_width(&commands);
         let layer_tree = Some(LayerTree::from_render_commands(&commands, width as f32, height as f32, URL_BAR_HEIGHT));
@@ -382,6 +411,10 @@ impl BrowserWindow {
             dropdown_hover_idx: None,
             hit_regions,
             last_clicked_url: None,
+            anchor_regions,
+            history: vec![initial_url.to_string()],
+            history_index: 0,
+            navigating_history: false,
             core,
             tokio_handle,
             viewport,
@@ -398,6 +431,7 @@ impl BrowserWindow {
             downloads_manager: DownloadsManager::new(),
             vello_backend,
             use_gpu_rendering: false, // Disabled: Vello text rendering not yet complete; software FreeType renderer used.
+            modifiers: Modifiers::default(),
             tooltip_text: String::new(),
             tooltip_x: 0.0,
             tooltip_y: 0.0,
@@ -484,7 +518,7 @@ impl BrowserWindow {
             .ops
             .iter()
             .filter_map(|op| {
-                if let RenderOp::Link { x, y, width, height, url, title } = op {
+                if let RenderOp::Link { x, y, width, height, url, title, target } = op {
                     Some(HitRegion {
                         x: *x,
                         y: *y,
@@ -492,6 +526,25 @@ impl BrowserWindow {
                         height: *height,
                         url: url.clone(),
                         title: title.clone(),
+                        target: target.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Extract anchor regions from `RenderOp::Anchor` entries in the render commands.
+    fn extract_anchor_regions(commands: &RenderCommands) -> Vec<AnchorRegion> {
+        commands
+            .ops
+            .iter()
+            .filter_map(|op| {
+                if let RenderOp::Anchor { id, y } = op {
+                    Some(AnchorRegion {
+                        id: id.clone(),
+                        y: *y,
                     })
                 } else {
                     None
@@ -600,6 +653,23 @@ impl BrowserWindow {
         for region in &self.hit_regions {
             if region.contains(page_x, page_y) {
                 return Some(&region.url);
+            }
+        }
+        None
+    }
+
+    /// Perform a hit-test returning both the URL and target attribute.
+    fn hit_test_with_target(&self, win_x: f64, win_y: f64) -> Option<(&str, &str)> {
+        if (win_y as f32) <= URL_BAR_HEIGHT {
+            return None;
+        }
+
+        let page_x = win_x as f32 + self.scroll_x;
+        let page_y = (win_y as f32 - URL_BAR_HEIGHT) + self.scroll_y;
+
+        for region in &self.hit_regions {
+            if region.contains(page_x, page_y) {
+                return Some((&region.url, &region.target));
             }
         }
         None
@@ -2092,6 +2162,40 @@ impl BrowserWindow {
     fn navigate_in_place(&mut self, url: &str) {
         info!("Navigating in-place to: {url}");
 
+        // Extract the fragment (anchor) from the URL, if any.
+        let (base_url, fragment) = if let Some(hash_pos) = url.find('#') {
+            (url[..hash_pos].to_string(), Some(url[hash_pos + 1..].to_string()))
+        } else {
+            (url.to_string(), None)
+        };
+
+        // Check if this is a same-page anchor navigation (only #fragment changed).
+        let current_base = if let Some(hash_pos) = self.url_bar_text.find('#') {
+            self.url_bar_text[..hash_pos].to_string()
+        } else {
+            self.url_bar_text.clone()
+        };
+
+        // If the URL is just "#section" or same base URL with different fragment,
+        // scroll to the anchor without fetching.
+        if (!base_url.is_empty() && base_url == current_base) || url.starts_with('#') {
+            info!("Same-page anchor navigation to #{}", fragment.as_deref().unwrap_or(""));
+            if let Some(ref frag) = fragment {
+                self.scroll_to_anchor(frag);
+            }
+            // Update URL bar and history.
+            let full_url = if url.starts_with('#') {
+                format!("{}{}", current_base, url)
+            } else {
+                url.to_string()
+            };
+            self.url_bar_text = full_url.clone();
+            self.url_bar_cursor = self.url_bar_text.len();
+            self.push_history(&full_url);
+            self.request_redraw();
+            return;
+        }
+
         let core = self.core.clone();
         let viewport = self.viewport;
         let url_owned = url.to_string();
@@ -2113,6 +2217,7 @@ impl BrowserWindow {
                 info!("In-place navigation successful! {} render ops", cmds.ops.len());
                 self.hit_regions = Self::extract_hit_regions(&cmds);
                 self.form_fields = Self::extract_form_fields(&cmds);
+                self.anchor_regions = Self::extract_anchor_regions(&cmds);
                 self.focused_field = None;
                 self.form_cursor_pos = 0;
                 self.dropdown_open = false;
@@ -2127,12 +2232,20 @@ impl BrowserWindow {
                 self.url_bar_text = url.to_string();
                 self.url_bar_cursor = self.url_bar_text.len();
 
+                // Push to navigation history (unless navigating via back/forward).
+                self.push_history(url);
+
                 // Record in persistent history.
                 self.persistent_history.record(url, url);
 
                 // Update window title.
                 if let Some(w) = &self.window {
                     w.set_title(&format!("NOVA - {}", self.url_bar_text));
+                }
+
+                // Scroll to anchor if URL has a fragment.
+                if let Some(ref frag) = fragment {
+                    self.scroll_to_anchor(frag);
                 }
 
                 self.apply_autofocus();
@@ -2147,6 +2260,80 @@ impl BrowserWindow {
                 self.request_redraw();
             }
         }
+    }
+
+    /// Push a URL onto the navigation history stack.
+    ///
+    /// When navigating via back/forward, this is a no-op (the history is
+    /// already in the correct state). For normal navigation, any forward
+    /// history entries after the current position are discarded.
+    fn push_history(&mut self, url: &str) {
+        if self.navigating_history {
+            self.navigating_history = false;
+            return;
+        }
+        // If we are not at the end of history, truncate forward entries.
+        if self.history_index + 1 < self.history.len() {
+            self.history.truncate(self.history_index + 1);
+        }
+        // Avoid pushing duplicate of current URL.
+        if self.history.last().map(|s| s.as_str()) != Some(url) {
+            self.history.push(url.to_string());
+            self.history_index = self.history.len() - 1;
+        }
+    }
+
+    /// Navigate back in history.
+    fn navigate_back(&mut self) {
+        if self.history_index == 0 {
+            info!("Already at the beginning of history");
+            return;
+        }
+        self.history_index -= 1;
+        let url = self.history[self.history_index].clone();
+        info!("Navigating back to: {url}");
+        self.navigating_history = true;
+        self.navigate_in_place(&url);
+    }
+
+    /// Navigate forward in history.
+    fn navigate_forward(&mut self) {
+        if self.history_index + 1 >= self.history.len() {
+            info!("Already at the end of history");
+            return;
+        }
+        self.history_index += 1;
+        let url = self.history[self.history_index].clone();
+        info!("Navigating forward to: {url}");
+        self.navigating_history = true;
+        self.navigate_in_place(&url);
+    }
+
+    /// Scroll to an anchor element with the given `id`.
+    fn scroll_to_anchor(&mut self, anchor_id: &str) {
+        if anchor_id.is_empty() {
+            // Empty fragment = scroll to top.
+            self.scroll_y = 0.0;
+            self.clamp_scroll();
+            return;
+        }
+        for anchor in &self.anchor_regions {
+            if anchor.id == anchor_id {
+                info!("Scrolling to anchor '{}' at y={}", anchor_id, anchor.y);
+                self.scroll_y = anchor.y;
+                self.clamp_scroll();
+                return;
+            }
+        }
+        warn!("Anchor '{}' not found in page", anchor_id);
+    }
+
+    /// Reload the current page.
+    fn reload(&mut self) {
+        let url = self.url_bar_text.clone();
+        info!("Reloading: {url}");
+        self.navigating_history = true; // Don't push duplicate history entry.
+        self.navigate_in_place(&url);
     }
 }
 
@@ -2256,6 +2443,11 @@ impl ApplicationHandler for BrowserWindow {
                     self.clamp_scroll();
                     self.request_redraw();
                 }
+            }
+
+            // ── Modifier tracking ─────────────────────────────────
+            WindowEvent::ModifiersChanged(new_modifiers) => {
+                self.modifiers = new_modifiers;
             }
 
             // ── Keyboard input ─────────────────────────────────────
@@ -2371,6 +2563,83 @@ impl ApplicationHandler for BrowserWindow {
                             self.set_zoom(1.0);
                             return;
                         }
+                    }
+
+                    // Ctrl+R: Reload current page.
+                    if key_str == Some("r") {
+                        let is_ctrl_combo = event
+                            .text
+                            .as_ref()
+                            .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
+                            .unwrap_or(false);
+
+                        if is_ctrl_combo {
+                            self.reload();
+                            return;
+                        }
+                    }
+                }
+
+                // Navigation shortcuts (non-Ctrl).
+                if event.state == ElementState::Pressed {
+                    let alt_held = self.modifiers.state().alt_key();
+
+                    // F5: Reload current page.
+                    if event.logical_key == Key::Named(NamedKey::F5) {
+                        self.reload();
+                        return;
+                    }
+
+                    // Escape: Stop loading (cancel pending navigation — currently a no-op
+                    // since navigation is synchronous, but log for future use).
+                    if event.logical_key == Key::Named(NamedKey::Escape)
+                        && !self.url_bar_focused
+                        && !self.find_bar_visible
+                        && self.focused_field.is_none()
+                    {
+                        info!("Escape pressed — stop loading (no-op: navigation is synchronous)");
+                        return;
+                    }
+
+                    // Alt+Left: Navigate back.
+                    if event.logical_key == Key::Named(NamedKey::ArrowLeft)
+                        && alt_held
+                        && !self.url_bar_focused
+                        && self.focused_field.is_none()
+                    {
+                        self.navigate_back();
+                        return;
+                    }
+
+                    // Backspace (when not in a text field): Navigate back.
+                    if event.logical_key == Key::Named(NamedKey::Backspace)
+                        && !self.url_bar_focused
+                        && !self.find_bar_visible
+                        && self.focused_field.is_none()
+                    {
+                        self.navigate_back();
+                        return;
+                    }
+
+                    // Alt+Right: Navigate forward.
+                    if event.logical_key == Key::Named(NamedKey::ArrowRight)
+                        && alt_held
+                        && !self.url_bar_focused
+                        && self.focused_field.is_none()
+                    {
+                        self.navigate_forward();
+                        return;
+                    }
+
+                    // Alt+Home: Navigate to home page.
+                    if event.logical_key == Key::Named(NamedKey::Home)
+                        && alt_held
+                        && !self.url_bar_focused
+                        && self.focused_field.is_none()
+                    {
+                        info!("Alt+Home — navigating to home page");
+                        self.navigate_in_place("about:blank");
+                        return;
                     }
                 }
 
@@ -2655,11 +2924,30 @@ impl ApplicationHandler for BrowserWindow {
                     }
 
                     // Check for link clicks — navigate in place.
-                    if let Some(url) = self.hit_test(cx, cy) {
+                    if let Some((url, target)) = self.hit_test_with_target(cx, cy) {
                         let url = url.to_string();
+                        let target = target.to_string();
+                        if target == "_blank" {
+                            warn!("target=\"_blank\" not yet supported (no tabs) — navigating in same window");
+                        }
                         info!(url = %url, "Link clicked — navigating");
                         self.navigate_in_place(&url);
                     }
+                }
+            }
+
+            // ── Middle-click on links ─────────────────────────────────
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Middle,
+                ..
+            } => {
+                let cx = self.cursor_x;
+                let cy = self.cursor_y;
+                if let Some((url, _target)) = self.hit_test_with_target(cx, cy) {
+                    let url = url.to_string();
+                    info!(url = %url, "Middle-click on link — navigating (tabs not yet supported)");
+                    self.navigate_in_place(&url);
                 }
             }
 

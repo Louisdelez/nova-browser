@@ -224,6 +224,18 @@ pub enum RenderOp {
         url: String,
         /// The `title` attribute text (for tooltip on links).
         title: String,
+        /// The `target` attribute (e.g. "_blank", "_self"). Empty string means default.
+        target: String,
+    },
+    /// An anchor point for an element with an `id` attribute.
+    ///
+    /// Emitted by the painter for elements that have an `id` attribute.
+    /// Used for anchor scrolling (navigating to `#section`).
+    Anchor {
+        /// The `id` attribute value.
+        id: String,
+        /// Y coordinate of the anchor in page coordinates.
+        y: f32,
     },
     /// Fill a rectangle with rounded corners using an SDF approach.
     ///

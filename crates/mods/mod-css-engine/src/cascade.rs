@@ -920,6 +920,26 @@ fn compute_element_style_impl(
         }
     }
 
+    // 7b2. Resolve clamp(), min(), max() functions that can be fully
+    //      evaluated (no context-dependent units like % or vw/vh).
+    for (_prop, val) in &mut final_props {
+        let trimmed = val.trim();
+        if trimmed.starts_with("clamp(") || trimmed.starts_with("min(") || trimmed.starts_with("max(") {
+            if !trimmed.contains('%') && !trimmed.contains("vw") && !trimmed.contains("vh") {
+                if let Some(px) = values::eval_math_function(trimmed, 0.0) {
+                    *val = format!("{px}px");
+                }
+            }
+        }
+    }
+
+    // 7b3. Resolve env() functions — return the fallback value.
+    for (_prop, val) in &mut final_props {
+        if val.contains("env(") {
+            *val = resolve_env_in_value(val);
+        }
+    }
+
     // 7c. Resolve `em` units contextually against the parent's computed font-size.
     // `rem` units are already resolved at parse time against 16px (root em).
     // `em` should resolve against the inherited font-size from the nearest ancestor.
@@ -1957,6 +1977,74 @@ fn resolve_var_once(value: &str, custom_props: &std::collections::HashMap<String
     result
 }
 
+/// Resolve `env()` function calls in a CSS value string.
+///
+/// Since NOVA does not have environment variables like safe area insets,
+/// `env()` is resolved to its fallback value (the part after the comma),
+/// or `0px` if no fallback is provided.
+fn resolve_env_in_value(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == 'e' {
+            // Check for "env("
+            let mut buf = String::from('e');
+            let prefix = "nv(";
+            let mut matched = true;
+            for expected in prefix.chars() {
+                if let Some(&next) = chars.peek() {
+                    if next == expected {
+                        buf.push(next);
+                        chars.next();
+                    } else {
+                        matched = false;
+                        break;
+                    }
+                } else {
+                    matched = false;
+                    break;
+                }
+            }
+
+            if matched {
+                // Read content inside env(...), tracking parenthesis depth.
+                let mut inner = String::new();
+                let mut depth = 1;
+                while let Some(c) = chars.next() {
+                    if c == '(' {
+                        depth += 1;
+                        inner.push(c);
+                    } else if c == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        inner.push(c);
+                    } else {
+                        inner.push(c);
+                    }
+                }
+
+                // Parse: name or name, fallback
+                let inner = inner.trim();
+                let fallback = if let Some(comma_pos) = inner.find(',') {
+                    inner[comma_pos + 1..].trim()
+                } else {
+                    "0px"
+                };
+                result.push_str(fallback);
+            } else {
+                result.push_str(&buf);
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
 /// Information about a matched pseudo-element rule: the resolved content text
 /// and the full set of CSS declarations to apply as inline styles.
 struct PseudoElementMatch {
@@ -2861,6 +2949,176 @@ mod tests {
     fn word_wrap_maps_to_overflow_wrap() {
         let m = expand("word-wrap", "break-word");
         assert_eq!(m.get("overflow-wrap").map(String::as_str), Some("break-word"));
+    }
+
+    // ── CSS custom properties (variables) ────────────────────────────────────
+
+    #[test]
+    fn custom_property_simple_var() {
+        // body defines --main-color, p uses var(--main-color)
+        let dom = make_dom(vec![
+            DomNode::Element {
+                tag: "style".into(),
+                attributes: vec![],
+                children: vec![DomNode::Text(
+                    "body { --main-color: red; } p { color: var(--main-color); }".into(),
+                )],
+            },
+            DomNode::Element {
+                tag: "p".into(),
+                attributes: vec![],
+                children: vec![],
+            },
+        ]);
+
+        let result = compute_styles(dom, &[], 1280.0);
+        fn find_p(node: &DomNode) -> Option<&DomNode> {
+            match node {
+                DomNode::Element { tag, children, .. } => {
+                    if tag == "p" { return Some(node); }
+                    for child in children { if let Some(f) = find_p(child) { return Some(f); } }
+                    None
+                }
+                DomNode::Document { children } => {
+                    for child in children { if let Some(f) = find_p(child) { return Some(f); } }
+                    None
+                }
+                _ => None,
+            }
+        }
+
+        let p = find_p(&result).expect("should find p");
+        let style = p.attr("data-nova-style").expect("p should have data-nova-style");
+        assert!(style.contains("color: red"), "var(--main-color) should resolve to red: style = {style}");
+    }
+
+    #[test]
+    fn custom_property_with_fallback() {
+        // No --missing defined, var(--missing, blue) should use fallback blue
+        let dom = make_dom(vec![
+            DomNode::Element {
+                tag: "style".into(),
+                attributes: vec![],
+                children: vec![DomNode::Text(
+                    "p { color: var(--missing, blue); }".into(),
+                )],
+            },
+            DomNode::Element {
+                tag: "p".into(),
+                attributes: vec![],
+                children: vec![],
+            },
+        ]);
+
+        let result = compute_styles(dom, &[], 1280.0);
+        fn find_p(node: &DomNode) -> Option<&DomNode> {
+            match node {
+                DomNode::Element { tag, children, .. } => {
+                    if tag == "p" { return Some(node); }
+                    for child in children { if let Some(f) = find_p(child) { return Some(f); } }
+                    None
+                }
+                DomNode::Document { children } => {
+                    for child in children { if let Some(f) = find_p(child) { return Some(f); } }
+                    None
+                }
+                _ => None,
+            }
+        }
+
+        let p = find_p(&result).expect("should find p");
+        let style = p.attr("data-nova-style").expect("p should have data-nova-style");
+        assert!(style.contains("color: blue"), "var(--missing, blue) should use fallback: style = {style}");
+    }
+
+    // ── env() resolution ─────────────────────────────────────────────────────
+
+    #[test]
+    fn env_function_uses_fallback() {
+        let dom = make_dom(vec![
+            DomNode::Element {
+                tag: "style".into(),
+                attributes: vec![],
+                children: vec![DomNode::Text(
+                    "p { padding-top: env(safe-area-inset-top, 16px); }".into(),
+                )],
+            },
+            DomNode::Element {
+                tag: "p".into(),
+                attributes: vec![],
+                children: vec![],
+            },
+        ]);
+
+        let result = compute_styles(dom, &[], 1280.0);
+        fn find_p(node: &DomNode) -> Option<&DomNode> {
+            match node {
+                DomNode::Element { tag, children, .. } => {
+                    if tag == "p" { return Some(node); }
+                    for child in children { if let Some(f) = find_p(child) { return Some(f); } }
+                    None
+                }
+                DomNode::Document { children } => {
+                    for child in children { if let Some(f) = find_p(child) { return Some(f); } }
+                    None
+                }
+                _ => None,
+            }
+        }
+
+        let p = find_p(&result).expect("should find p");
+        let style = p.attr("data-nova-style").expect("p should have data-nova-style");
+        assert!(style.contains("padding-top: 16px"), "env() should resolve to fallback: style = {style}");
+    }
+
+    // ── resolve_var unit tests ───────────────────────────────────────────────
+
+    #[test]
+    fn resolve_var_simple() {
+        let mut props = std::collections::HashMap::new();
+        props.insert("--bg".to_string(), "#ff0".to_string());
+        assert_eq!(resolve_var("var(--bg)", &props), "#ff0");
+    }
+
+    #[test]
+    fn resolve_var_fallback() {
+        let props = std::collections::HashMap::new();
+        assert_eq!(resolve_var("var(--missing, green)", &props), "green");
+    }
+
+    #[test]
+    fn resolve_var_nested_fallback() {
+        let mut props = std::collections::HashMap::new();
+        props.insert("--b".to_string(), "purple".to_string());
+        // var(--a, var(--b, red)) — --a not defined, falls back to var(--b, red) → purple
+        assert_eq!(resolve_var("var(--a, var(--b, red))", &props), "purple");
+    }
+
+    #[test]
+    fn resolve_var_nested_all_missing() {
+        let props = std::collections::HashMap::new();
+        // var(--a, var(--b, red)) — neither defined, falls back to red
+        assert_eq!(resolve_var("var(--a, var(--b, red))", &props), "red");
+    }
+
+    // ── resolve_env_in_value unit tests ──────────────────────────────────────
+
+    #[test]
+    fn resolve_env_simple() {
+        assert_eq!(resolve_env_in_value("env(safe-area-inset-top, 20px)"), "20px");
+    }
+
+    #[test]
+    fn resolve_env_no_fallback() {
+        assert_eq!(resolve_env_in_value("env(safe-area-inset-top)"), "0px");
+    }
+
+    #[test]
+    fn resolve_env_embedded() {
+        assert_eq!(
+            resolve_env_in_value("calc(100vh - env(safe-area-inset-bottom, 10px))"),
+            "calc(100vh - 10px)"
+        );
     }
 }
 

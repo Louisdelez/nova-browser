@@ -999,6 +999,7 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     if let Some(href) = extract_href(&layout_box.style) {
         if layout_box.width > 0.0 && layout_box.height > 0.0 {
             let link_title = extract_style_str(&layout_box.style, "nova-title");
+            let link_target = extract_style_str(&layout_box.style, "nova-target");
             ops.push(RenderOp::Link {
                 x: layout_box.x,
                 y: layout_box.y,
@@ -1006,8 +1007,18 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                 height: layout_box.height,
                 url: href,
                 title: link_title,
+                target: link_target,
             });
         }
+    }
+
+    // Emit an Anchor op for elements with an id attribute (for anchor scrolling).
+    let element_id = extract_style_str(&layout_box.style, "nova-element-id");
+    if !element_id.is_empty() {
+        ops.push(RenderOp::Anchor {
+            id: element_id,
+            y: layout_box.y,
+        });
     }
 
     // Check whether this box clips its overflow.

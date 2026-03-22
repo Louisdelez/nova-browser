@@ -5109,6 +5109,13 @@ fn build_taffy_style(
             // auto-size to its content; pages that want centering will set
             // min-height: 100vh explicitly on body via CSS.
             let is_html_root = tag == "html";
+            // For <html>, use FlexStart alignment so <body> doesn't stretch
+            // to the full viewport height (which causes excessive spacing).
+            let align_items_final = if is_html_root && align_items.is_none() {
+                Some(AlignItems::FlexStart)
+            } else {
+                align_items
+            };
             Style {
                 display: Display::Flex,
                 flex_direction: direction,
@@ -5138,7 +5145,7 @@ fn build_taffy_style(
                         height: LengthPercentage::Length(row_gap),
                     }
                 },
-                align_items,
+                align_items: align_items_final,
                 justify_content,
                 align_self: if center_via_auto_margin {
                     Some(AlignSelf::Center)

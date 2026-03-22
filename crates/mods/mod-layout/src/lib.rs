@@ -5435,14 +5435,11 @@ fn build_taffy_style(
             } else {
                 Dimension::Percent(1.0)
             };
-            // Floated elements shrink to content; non-floated auto-width elements grow.
-            let effective_flex_grow = if is_floated {
-                0.0
-            } else if default_width == Dimension::Auto {
-                1.0
-            } else {
-                0.0
-            };
+            // Block elements should NOT flex-grow along the main (vertical)
+            // axis of a column container — that would distribute free space
+            // from min-height among children, pushing them apart.
+            // Width-filling is handled by `width: 100%` / `flex-basis`.
+            let effective_flex_grow = 0.0;
             let float_margin = Rect {
                 top: margin.top,
                 right: margin.right,
@@ -5466,8 +5463,12 @@ fn build_taffy_style(
                 lp.align_items.as_deref()
                     .and_then(map_align_items)
             };
+            // Explicitly default to FlexStart so Taffy packs children at
+            // the top of the container instead of distributing free space
+            // when min-height exceeds content height.
             let justify_content = lp.justify_content.as_deref()
-                .and_then(map_justify_content);
+                .and_then(map_justify_content)
+                .or(Some(JustifyContent::FlexStart));
 
             // `clear` property: forces this element below preceding floats.
             // In a row-wrap flex container, setting flex-basis: 100% on a

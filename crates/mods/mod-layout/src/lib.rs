@@ -2351,6 +2351,57 @@ fn layout_inline_run(
 
 // ── Table layout ────────────────────────────────────────────────────────
 
+/// Estimate the intrinsic width of a form element (`<input>`, `<textarea>`,
+/// `<select>`) for table cell width estimation.
+///
+/// Uses the `size` attribute for `<input>` (width in average characters),
+/// `cols` for `<textarea>`, or a default of 150px for text inputs.
+fn estimate_form_element_width(tag: &str, attributes: &[(String, String)], font_size: f32) -> f32 {
+    match tag {
+        "input" => {
+            let input_type = attributes.iter()
+                .find(|(k, _)| k == "type")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("text");
+            if input_type == "hidden" {
+                return 0.0;
+            }
+            if matches!(input_type, "checkbox" | "radio") {
+                return 13.0;
+            }
+            // Check for `size` attribute — specifies width in average character widths.
+            if let Some(size_w) = attributes.iter()
+                .find(|(k, _)| k == "size")
+                .and_then(|(_, v)| v.parse::<f32>().ok())
+            {
+                return size_w * font_size * 0.6;
+            }
+            // Submit/button/reset: use value text width or a small default.
+            if matches!(input_type, "submit" | "button" | "reset") {
+                let label = attributes.iter()
+                    .find(|(k, _)| k == "value")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or(input_type);
+                return measure_text_width(label, font_size) + 12.0;
+            }
+            // Default text input width.
+            150.0
+        }
+        "textarea" => {
+            let cols: f32 = attributes.iter()
+                .find(|(k, _)| k == "cols")
+                .and_then(|(_, v)| v.parse().ok())
+                .unwrap_or(20.0);
+            cols * font_size * 0.6
+        }
+        "select" => {
+            // Rough estimate: 100px or measure first option text.
+            100.0
+        }
+        _ => 150.0,
+    }
+}
+
 /// Estimate the minimum content width of a table cell (min-content).
 ///
 /// This is the width of the longest individual word (or image) — the
@@ -2380,6 +2431,12 @@ fn estimate_cell_min_width(children: &[DomNode], font_size: f32) -> f32 {
                         .and_then(|(_, v)| v.parse().ok())
                         .unwrap_or(10.0);
                     max_word_w = max_word_w.max(img_w);
+                } else if tag == "input" || tag == "textarea" || tag == "select" {
+                    // Form elements are leaf nodes with no text children —
+                    // estimate their intrinsic width from the `size` attribute
+                    // (for <input>) or a default.
+                    let input_w = estimate_form_element_width(tag, attributes, font_size);
+                    max_word_w = max_word_w.max(input_w);
                 } else if tag == "table" {
                     // Nested table min-width: sum of per-column min widths.
                     let table_min = estimate_nested_table_min_width(cc, font_size);
@@ -2470,6 +2527,12 @@ fn estimate_cell_content_width(children: &[DomNode], font_size: f32) -> f32 {
                         .and_then(|(_, v)| v.parse().ok())
                         .unwrap_or(10.0);
                     max_w = max_w.max(img_w);
+                } else if tag == "input" || tag == "textarea" || tag == "select" {
+                    // Form elements are leaf nodes with no text children —
+                    // estimate their intrinsic width from the `size` attribute
+                    // (for <input>) or a default.
+                    let input_w = estimate_form_element_width(tag, attributes, font_size);
+                    max_w = max_w.max(input_w);
                 } else if tag == "table" {
                     // For nested tables, estimate width as sum of max column
                     // widths across all rows.

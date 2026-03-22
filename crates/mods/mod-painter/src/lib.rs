@@ -681,7 +681,7 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     }
 
     // Paint image content.
-    if let LayoutContent::Image { ref src } = layout_box.content {
+    if let LayoutContent::Image { ref src, ref alt } = layout_box.content {
         if let Some(decoded) = images.get(src) {
             if decoded.len() >= 8 {
                 let img_width = u32::from_le_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]);
@@ -723,21 +723,35 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                 }
             }
         } else {
-            ops.push(RenderOp::FillRect {
-                x: layout_box.x, y: layout_box.y,
-                width: layout_box.width.max(150.0), height: layout_box.height.max(80.0),
-                color: Color::rgb(0.85, 0.85, 0.85),
-            });
-            let label = src.rsplit('/').next().unwrap_or(src);
-            let label = if label.len() > 40 { format!("{}...", &label[..37]) } else { label.to_string() };
-            ops.push(RenderOp::DrawText {
-                x: layout_box.x + 4.0, y: layout_box.y + 16.0,
-                text: format!("[img: {label}]"), font_size: 12.0,
-                color: Color::rgb(0.4, 0.4, 0.4),
-                font_weight: None,
-                font_style: None,
-                font_family: None, letter_spacing: None,
-            });
+            // Show alt text if available, otherwise show filename as fallback.
+            let label = if let Some(alt_text) = alt {
+                if !alt_text.is_empty() {
+                    alt_text.clone()
+                } else {
+                    // Empty alt means decorative image — show minimal placeholder.
+                    String::new()
+                }
+            } else {
+                let fname = src.rsplit('/').next().unwrap_or(src);
+                let fname = if fname.len() > 40 { format!("{}...", &fname[..37]) } else { fname.to_string() };
+                format!("[img: {fname}]")
+            };
+
+            if !label.is_empty() {
+                ops.push(RenderOp::FillRect {
+                    x: layout_box.x, y: layout_box.y,
+                    width: layout_box.width.max(150.0), height: layout_box.height.max(80.0),
+                    color: Color::rgb(0.85, 0.85, 0.85),
+                });
+                ops.push(RenderOp::DrawText {
+                    x: layout_box.x + 4.0, y: layout_box.y + 16.0,
+                    text: label, font_size: 12.0,
+                    color: Color::rgb(0.4, 0.4, 0.4),
+                    font_weight: None,
+                    font_style: None,
+                    font_family: None, letter_spacing: None,
+                });
+            }
         }
     }
 

@@ -318,7 +318,11 @@ pub enum LayoutContent {
     /// A text run.
     Text(String),
     /// An image.
-    Image { src: String },
+    Image {
+        src: String,
+        /// The `alt` attribute text, shown when the image fails to load.
+        alt: Option<String>,
+    },
     /// An inline SVG element, serialized back to SVG markup for rasterization.
     InlineSvg { markup: String },
     /// An iframe element.

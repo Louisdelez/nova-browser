@@ -732,21 +732,32 @@ fn add_node(
                     .find(|(k, _)| k == "src")
                     .map(|(_, v)| v.clone())
                     .unwrap_or_default();
+                let alt = attributes
+                    .iter()
+                    .find(|(k, _)| k == "alt")
+                    .map(|(_, v)| v.clone());
 
-                // Determine image dimensions from attributes or defaults.
-                let img_w: f32 = attributes
+                // Parse CSS layout props (handles width/height from
+                // data-nova-style, including percentages like `width:100%`).
+                let img_lp = parse_layout_props(attributes, viewport);
+
+                // Fall back to HTML width/height attributes, then defaults.
+                let attr_w: f32 = attributes
                     .iter()
                     .find(|(k, _)| k == "width")
                     .and_then(|(_, v)| v.parse().ok())
                     .unwrap_or(150.0);
-                let img_h: f32 = attributes
+                let attr_h: f32 = attributes
                     .iter()
                     .find(|(k, _)| k == "height")
                     .and_then(|(_, v)| v.parse().ok())
                     .unwrap_or(80.0);
 
+                let w_dim = img_lp.width.unwrap_or(Dimension::Length(attr_w.min(available_width)));
+                let h_dim = img_lp.height.unwrap_or(Dimension::Length(attr_h));
+
                 let ctx = NodeContext {
-                    content: LayoutContent::Image { src },
+                    content: LayoutContent::Image { src, alt },
                     style: StyleMap::default(),
                 };
                 return taffy
@@ -754,8 +765,16 @@ fn add_node(
                         Style {
                             display: Display::Flex,
                             size: Size {
-                                width: Dimension::Length(img_w.min(available_width)),
-                                height: Dimension::Length(img_h),
+                                width: w_dim,
+                                height: h_dim,
+                            },
+                            max_size: Size {
+                                width: img_lp.max_width.unwrap_or(Dimension::Auto),
+                                height: img_lp.max_height.unwrap_or(Dimension::Auto),
+                            },
+                            min_size: Size {
+                                width: img_lp.min_width.unwrap_or(Dimension::Auto),
+                                height: img_lp.min_height.unwrap_or(Dimension::Auto),
                             },
                             ..Style::DEFAULT
                         },
@@ -1385,7 +1404,7 @@ enum InlineItem {
     /// A space between words.
     Space { width: f32, style: Vec<(String, StyleValue)> },
     /// An inline image.
-    Image { src: String, width: f32, height: f32 },
+    Image { src: String, alt: Option<String>, width: f32, height: f32 },
     /// An inline form field (submit button, checkbox, etc.).
     FormField {
         tag: String,
@@ -1587,6 +1606,38 @@ fn collapse_margin_with_previous(
             let _ = taffy.set_style(current_id, new_style);
         }
     }
+}
+
+/// Extract CSS `width` and `height` as absolute px values from `data-nova-style`/`style`.
+///
+/// Only returns `Some` for `<n>px` values — percentage widths are left for the
+/// caller that has access to the container width. Used in inline image sizing.
+fn extract_css_dimension(attributes: &[(String, String)]) -> (Option<f32>, Option<f32>) {
+    let mut w = None;
+    let mut h = None;
+    for attr_name in &["style", "data-nova-style"] {
+        if let Some((_, style_str)) = attributes.iter().find(|(k, _)| k == *attr_name) {
+            for decl in style_str.split(';') {
+                let parts: Vec<&str> = decl.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    continue;
+                }
+                let prop = parts[0].trim();
+                let val = parts[1].trim();
+                if prop == "width" {
+                    if let Some(px) = val.strip_suffix("px").and_then(|s| s.trim().parse::<f32>().ok()) {
+                        w = Some(px);
+                    }
+                }
+                if prop == "height" {
+                    if let Some(px) = val.strip_suffix("px").and_then(|s| s.trim().parse::<f32>().ok()) {
+                        h = Some(px);
+                    }
+                }
+            }
+        }
+    }
+    (w, h)
 }
 
 /// Flatten an inline run (consecutive inline children) into InlineItems.
@@ -1798,9 +1849,14 @@ fn flatten_node_recursive(
             }
             if tag == "img" {
                 let src = attributes.iter().find(|(k,_)| k == "src").map(|(_, v)| v.clone()).unwrap_or_default();
-                let w: f32 = attributes.iter().find(|(k,_)| k == "width").and_then(|(_, v)| v.parse().ok()).unwrap_or(150.0);
-                let h: f32 = attributes.iter().find(|(k,_)| k == "height").and_then(|(_, v)| v.parse().ok()).unwrap_or(80.0);
-                items.push(InlineItem::Image { src, width: w, height: h });
+                let alt = attributes.iter().find(|(k,_)| k == "alt").map(|(_, v)| v.clone());
+                let attr_w: f32 = attributes.iter().find(|(k,_)| k == "width").and_then(|(_, v)| v.parse().ok()).unwrap_or(150.0);
+                let attr_h: f32 = attributes.iter().find(|(k,_)| k == "height").and_then(|(_, v)| v.parse().ok()).unwrap_or(80.0);
+                // Check CSS width/height from data-nova-style (handles px values).
+                let css_dim = extract_css_dimension(attributes);
+                let w = css_dim.0.unwrap_or(attr_w);
+                let h = css_dim.1.unwrap_or(attr_h);
+                items.push(InlineItem::Image { src, alt, width: w, height: h });
                 return;
             }
             // Inline form fields: all <input> types, <button>, <select>, <textarea>.
@@ -2266,10 +2322,10 @@ fn layout_inline_run(
                         .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")))?;
                     item_ids.push(id);
                 }
-                InlineItem::Image { src, width, height } => {
+                InlineItem::Image { src, alt, width, height } => {
                     max_height = max_height.max(*height);
                     let ctx = NodeContext {
-                        content: LayoutContent::Image { src: src.clone() },
+                        content: LayoutContent::Image { src: src.clone(), alt: alt.clone() },
                         style: StyleMap::default(),
                     };
                     let id = taffy

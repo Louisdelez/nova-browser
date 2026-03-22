@@ -3,13 +3,14 @@
 //! Manages browser tabs for the NOVA browser. Each tab has its own
 //! URL, render state, scroll position, and navigation history.
 
+use std::time::Instant;
+
 use nova_mod_api::RenderCommands;
 
 use crate::history::HistoryStack;
-use crate::window::{FormFieldRegion, HitRegion};
+use crate::window::{AnchorRegion, FormFieldRegion, HitRegion};
 
 /// A single browser tab.
-#[derive(Debug, Clone)]
 pub struct Tab {
     /// Unique identifier for this tab.
     pub id: u64,
@@ -31,8 +32,82 @@ pub struct Tab {
     pub hit_regions: Vec<HitRegion>,
     /// Form field regions.
     pub form_fields: Vec<FormFieldRegion>,
+    /// Anchor regions for #section scrolling.
+    pub anchor_regions: Vec<AnchorRegion>,
     /// Navigation history for this tab.
     pub history: HistoryStack,
+
+    // -- Form field interaction state --
+    /// Index of the currently focused form field, or None.
+    pub focused_field: Option<usize>,
+    /// Cursor position (character index) within the focused text field.
+    pub form_cursor_pos: usize,
+    /// Timestamp when the cursor last toggled visibility (for blinking).
+    pub cursor_blink_time: Instant,
+    /// Whether the cursor is currently visible (toggles every 500ms).
+    pub cursor_visible: bool,
+
+    // -- Select dropdown state --
+    /// Whether a dropdown is open for a `<select>` field.
+    pub dropdown_open: bool,
+    /// Index of the form field whose dropdown is open.
+    pub dropdown_field_idx: usize,
+    /// Index of the currently hovered option in the dropdown.
+    pub dropdown_hover_idx: Option<usize>,
+
+    // -- Find in Page (Ctrl+F) --
+    /// Whether the find bar is visible.
+    pub find_bar_visible: bool,
+    /// Current search query text.
+    pub find_query: String,
+    /// All match positions.
+    pub find_matches: Vec<FindMatch>,
+    /// Index of the current highlighted match.
+    pub find_current: usize,
+}
+
+/// A match found during Find in Page.
+#[derive(Debug, Clone)]
+pub struct FindMatch {
+    /// Y coordinate of the match in page coordinates.
+    pub y: f32,
+    /// X coordinate of the match.
+    pub x: f32,
+    /// Width of the matched text.
+    pub width: f32,
+    /// Height of the matched text line.
+    pub height: f32,
+}
+
+impl Tab {
+    /// Create a new tab with the given URL and render commands.
+    pub fn new(id: u64, url: &str, commands: RenderCommands) -> Self {
+        Self {
+            id,
+            url: url.to_string(),
+            title: url.to_string(),
+            render_commands: commands,
+            scroll_y: 0.0,
+            scroll_x: 0.0,
+            content_height: 0.0,
+            content_width: 0.0,
+            hit_regions: Vec::new(),
+            form_fields: Vec::new(),
+            anchor_regions: Vec::new(),
+            history: HistoryStack::new(url),
+            focused_field: None,
+            form_cursor_pos: 0,
+            cursor_blink_time: Instant::now(),
+            cursor_visible: true,
+            dropdown_open: false,
+            dropdown_field_idx: 0,
+            dropdown_hover_idx: None,
+            find_bar_visible: false,
+            find_query: String::new(),
+            find_matches: Vec::new(),
+            find_current: 0,
+        }
+    }
 }
 
 /// Manages multiple browser tabs.
@@ -72,19 +147,7 @@ impl TabManager {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
 
-        let tab = Tab {
-            id,
-            url: url.to_string(),
-            title: url.to_string(),
-            render_commands: commands,
-            scroll_y: 0.0,
-            scroll_x: 0.0,
-            content_height: 0.0,
-            content_width: 0.0,
-            hit_regions: Vec::new(),
-            form_fields: Vec::new(),
-            history: HistoryStack::new(url),
-        };
+        let tab = Tab::new(id, url, commands);
 
         self.tabs.push(tab);
         self.active_tab_index = self.tabs.len() - 1;
@@ -156,19 +219,7 @@ mod tests {
     use super::*;
 
     fn make_tab(url: &str) -> Tab {
-        Tab {
-            id: 0,
-            url: url.to_string(),
-            title: url.to_string(),
-            render_commands: RenderCommands { ops: vec![], fonts: vec![] },
-            scroll_y: 0.0,
-            scroll_x: 0.0,
-            content_height: 0.0,
-            content_width: 0.0,
-            hit_regions: Vec::new(),
-            form_fields: Vec::new(),
-            history: HistoryStack::new(url),
-        }
+        Tab::new(0, url, RenderCommands { ops: vec![], fonts: vec![] })
     }
 
     #[test]

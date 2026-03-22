@@ -27,6 +27,7 @@ use crate::bookmarks::BookmarkStore;
 use crate::downloads::DownloadsManager;
 use crate::persistent_history::PersistentHistory;
 use crate::renderer::Framebuffer;
+use crate::tab::{FindMatch, Tab, TabManager};
 
 /// Height of the URL bar area in logical pixels.
 const URL_BAR_HEIGHT: f32 = 40.0;
@@ -36,6 +37,12 @@ const URL_BAR_FONT_SIZE: f32 = 14.0;
 const URL_BAR_PADDING: f32 = 8.0;
 /// Height of the text input field inside the URL bar.
 const URL_INPUT_HEIGHT: f32 = 28.0;
+
+/// Height of the tab bar area in logical pixels.
+const TAB_BAR_HEIGHT: f32 = 30.0;
+
+/// Combined height of URL bar + tab bar (the chrome above the page).
+const CHROME_HEIGHT: f32 = URL_BAR_HEIGHT + TAB_BAR_HEIGHT;
 
 /// Pixels scrolled per mouse wheel tick.
 const SCROLL_STEP: f32 = 40.0;
@@ -62,13 +69,6 @@ pub struct HitRegion {
     pub target: String,
 }
 
-impl HitRegion {
-    /// Test whether a point (in page coordinates) falls inside this region.
-    fn contains(&self, px: f32, py: f32) -> bool {
-        px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
-    }
-}
-
 /// An anchor point on the page (element with an `id` attribute).
 /// Used for scrolling to `#section` anchors.
 #[derive(Debug, Clone)]
@@ -77,6 +77,13 @@ pub struct AnchorRegion {
     pub id: String,
     /// Y coordinate in page coordinates.
     pub y: f32,
+}
+
+impl HitRegion {
+    /// Test whether a point (in page coordinates) falls inside this region.
+    fn contains(&self, px: f32, py: f32) -> bool {
+        px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
+    }
 }
 
 /// An interactive form field region on the page.
@@ -203,10 +210,13 @@ pub struct BrowserWindow {
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
     framebuffer: Framebuffer,
-    render_commands: RenderCommands,
     title: String,
     width: u32,
     height: u32,
+
+    // -- Tab management --
+    /// Manages all open tabs and their per-tab state.
+    tabs: TabManager,
 
     // -- URL bar state --
     /// Current text in the URL bar.
@@ -224,54 +234,6 @@ pub struct BrowserWindow {
     /// URL to navigate to when the user presses Enter. Returned from `run()`.
     pending_navigation: Option<String>,
 
-    // -- Scrolling state --
-    /// Current vertical scroll offset in pixels (0 = top of page).
-    scroll_y: f32,
-    /// Current horizontal scroll offset in pixels (0 = left of page).
-    scroll_x: f32,
-    /// Total height of the rendered content in pixels.
-    content_height: f32,
-    /// Total width of the rendered content in pixels.
-    content_width: f32,
-
-    // -- Form field interaction state --
-    /// Interactive form field regions extracted from `RenderOp::FormField` ops.
-    form_fields: Vec<FormFieldRegion>,
-    /// Index of the currently focused form field, or None.
-    focused_field: Option<usize>,
-    /// Cursor position (character index) within the focused text field.
-    form_cursor_pos: usize,
-    /// Timestamp when the cursor last toggled visibility (for blinking).
-    cursor_blink_time: Instant,
-    /// Whether the cursor is currently visible (toggles every 500ms).
-    cursor_visible: bool,
-
-    // -- Select dropdown state --
-    /// Whether a dropdown is open for a `<select>` field.
-    dropdown_open: bool,
-    /// Index of the form field whose dropdown is open.
-    dropdown_field_idx: usize,
-    /// Index of the currently hovered option in the dropdown.
-    dropdown_hover_idx: Option<usize>,
-
-    // -- Link interaction state --
-    /// Clickable link regions extracted from `RenderOp::Link` ops.
-    hit_regions: Vec<HitRegion>,
-    /// URL of the last clicked link (for diagnostics / future navigation).
-    last_clicked_url: Option<String>,
-
-    // -- Anchor regions (for #section scrolling) --
-    /// Anchor points extracted from `RenderOp::Anchor` ops.
-    anchor_regions: Vec<AnchorRegion>,
-
-    // -- Navigation history --
-    /// Stack of visited URLs for back/forward navigation.
-    history: Vec<String>,
-    /// Current position in the history stack (index into `history`).
-    history_index: usize,
-    /// Whether we are currently navigating via back/forward (to avoid pushing to history).
-    navigating_history: bool,
-
     // -- Navigation --
     /// Reference to the core for in-place navigation.
     core: Arc<NovaCore>,
@@ -285,16 +247,6 @@ pub struct BrowserWindow {
     layer_tree: Option<LayerTree>,
     /// Whether the content framebuffer needs to be rebuilt (dirty content).
     content_dirty: bool,
-
-    // -- Find in Page (Ctrl+F) --
-    /// Whether the find bar is visible.
-    find_bar_visible: bool,
-    /// Current search query text.
-    find_query: String,
-    /// All match positions as `(render_op_index, char_offset)`.
-    find_matches: Vec<FindMatch>,
-    /// Index of the current highlighted match.
-    find_current: usize,
 
     // -- Zoom (Ctrl+Plus/Minus) --
     /// Current zoom level (1.0 = 100%).
@@ -336,19 +288,6 @@ pub struct BrowserWindow {
     tooltip_hover_start: Option<Instant>,
 }
 
-/// A match found during Find in Page.
-#[derive(Debug, Clone)]
-struct FindMatch {
-    /// Y coordinate of the match in page coordinates.
-    y: f32,
-    /// X coordinate of the match.
-    x: f32,
-    /// Width of the matched text.
-    width: f32,
-    /// Height of the matched text line.
-    height: f32,
-}
-
 impl BrowserWindow {
     /// Create a new browser window.
     ///
@@ -367,7 +306,7 @@ impl BrowserWindow {
         let anchor_regions = Self::extract_anchor_regions(&commands);
         let content_height = Self::compute_content_height(&commands);
         let content_width = Self::compute_content_width(&commands);
-        let layer_tree = Some(LayerTree::from_render_commands(&commands, width as f32, height as f32, URL_BAR_HEIGHT));
+        let layer_tree = Some(LayerTree::from_render_commands(&commands, width as f32, height as f32, CHROME_HEIGHT));
         let fb = Framebuffer::new(width, height);
         let tokio_handle = tokio::runtime::Handle::current();
         let viewport = Viewport {
@@ -382,14 +321,24 @@ impl BrowserWindow {
         let mut vello_backend = VelloBackend::new();
         vello_backend.init(1.0);
 
+        // Create the initial tab with per-page state.
+        let mut initial_tab = Tab::new(0, initial_url, commands);
+        initial_tab.hit_regions = hit_regions;
+        initial_tab.form_fields = form_fields;
+        initial_tab.anchor_regions = anchor_regions;
+        initial_tab.content_height = content_height;
+        initial_tab.content_width = content_width;
+
+        let tab_manager = TabManager::new(initial_tab);
+
         let mut browser = Self {
             window: None,
             gpu: None,
             framebuffer: fb,
-            render_commands: commands,
             title: title.to_string(),
             width,
             height,
+            tabs: tab_manager,
             url_bar_text: initial_url.to_string(),
             url_bar_focused: false,
             url_bar_cursor: initial_url.len(),
@@ -397,33 +346,11 @@ impl BrowserWindow {
             cursor_x: 0.0,
             cursor_y: 0.0,
             pending_navigation: None,
-            scroll_y: 0.0,
-            scroll_x: 0.0,
-            content_height,
-            content_width,
-            form_fields,
-            focused_field: None,
-            form_cursor_pos: 0,
-            cursor_blink_time: Instant::now(),
-            cursor_visible: true,
-            dropdown_open: false,
-            dropdown_field_idx: 0,
-            dropdown_hover_idx: None,
-            hit_regions,
-            last_clicked_url: None,
-            anchor_regions,
-            history: vec![initial_url.to_string()],
-            history_index: 0,
-            navigating_history: false,
             core,
             tokio_handle,
             viewport,
             layer_tree,
             content_dirty: false,
-            find_bar_visible: false,
-            find_query: String::new(),
-            find_matches: Vec::new(),
-            find_current: 0,
             zoom_level: 1.0,
             zoom_indicator_ticks: 0,
             bookmark_store,
@@ -446,13 +373,14 @@ impl BrowserWindow {
 
     /// Set focus to the first form field with the `autofocus` attribute.
     fn apply_autofocus(&mut self) {
-        if self.focused_field.is_some() {
+        let tab = self.tabs.active_tab_mut();
+        if tab.focused_field.is_some() {
             return;
         }
-        for (i, field) in self.form_fields.iter().enumerate() {
+        for (i, field) in tab.form_fields.iter().enumerate() {
             if field.autofocus && !matches!(field.field_type.as_str(), "hidden") {
-                self.focused_field = Some(i);
-                self.form_cursor_pos = field.value.len();
+                tab.focused_field = Some(i);
+                tab.form_cursor_pos = field.value.len();
                 break;
             }
         }
@@ -463,7 +391,7 @@ impl BrowserWindow {
     /// Elements with `tabindex=-1` are skipped. Positive tabindex values are visited
     /// first in ascending order, then `tabindex=0` and unspecified follow in document order.
     fn next_tab_field(&self, current_idx: usize) -> Option<usize> {
-        let total = self.form_fields.len();
+        let total = self.tabs.active_tab().form_fields.len();
         if total == 0 {
             return None;
         }
@@ -476,7 +404,7 @@ impl BrowserWindow {
         // Then: tabindex=0 or unspecified in document order.
         let mut natural: Vec<usize> = Vec::new();
 
-        for (i, field) in self.form_fields.iter().enumerate() {
+        for (i, field) in self.tabs.active_tab().form_fields.iter().enumerate() {
             // Skip non-tabbable fields.
             if field.tabindex == Some(-1) {
                 continue;
@@ -626,12 +554,13 @@ impl BrowserWindow {
 
     /// Clamp `scroll_y` to the valid range `[0, max_scroll]`.
     fn clamp_scroll(&mut self) {
-        let page_viewport = (self.height as f32 - URL_BAR_HEIGHT).max(0.0);
-        let max_scroll = (self.content_height - page_viewport).max(0.0);
-        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
+        let page_viewport = (self.height as f32 - CHROME_HEIGHT).max(0.0);
+        let tab = self.tabs.active_tab_mut();
+        let max_scroll = (tab.content_height - page_viewport).max(0.0);
+        tab.scroll_y = tab.scroll_y.clamp(0.0, max_scroll);
         // Clamp horizontal scroll.
-        let max_scroll_x = (self.content_width - self.width as f32).max(0.0);
-        self.scroll_x = self.scroll_x.clamp(0.0, max_scroll_x);
+        let max_scroll_x = (tab.content_width - self.width as f32).max(0.0);
+        tab.scroll_x = tab.scroll_x.clamp(0.0, max_scroll_x);
     }
 
     // -- Link interaction helpers -------------------------------------------
@@ -642,15 +571,16 @@ impl BrowserWindow {
     /// Window coordinates are translated to page coordinates by subtracting
     /// the URL bar offset and adding the scroll offset.
     fn hit_test(&self, win_x: f64, win_y: f64) -> Option<&str> {
-        // Only test if the cursor is below the URL bar.
-        if (win_y as f32) <= URL_BAR_HEIGHT {
+        // Only test if the cursor is below the chrome (URL bar + tab bar).
+        if (win_y as f32) <= CHROME_HEIGHT {
             return None;
         }
 
-        let page_x = win_x as f32 + self.scroll_x;
-        let page_y = (win_y as f32 - URL_BAR_HEIGHT) + self.scroll_y;
+        let tab = self.tabs.active_tab();
+        let page_x = win_x as f32 + tab.scroll_x;
+        let page_y = (win_y as f32 - CHROME_HEIGHT) + tab.scroll_y;
 
-        for region in &self.hit_regions {
+        for region in &tab.hit_regions {
             if region.contains(page_x, page_y) {
                 return Some(&region.url);
             }
@@ -660,14 +590,15 @@ impl BrowserWindow {
 
     /// Perform a hit-test returning both the URL and target attribute.
     fn hit_test_with_target(&self, win_x: f64, win_y: f64) -> Option<(&str, &str)> {
-        if (win_y as f32) <= URL_BAR_HEIGHT {
+        if (win_y as f32) <= CHROME_HEIGHT {
             return None;
         }
 
-        let page_x = win_x as f32 + self.scroll_x;
-        let page_y = (win_y as f32 - URL_BAR_HEIGHT) + self.scroll_y;
+        let tab = self.tabs.active_tab();
+        let page_x = win_x as f32 + tab.scroll_x;
+        let page_y = (win_y as f32 - CHROME_HEIGHT) + tab.scroll_y;
 
-        for region in &self.hit_regions {
+        for region in &tab.hit_regions {
             if region.contains(page_x, page_y) {
                 return Some((&region.url, &region.target));
             }
@@ -683,12 +614,13 @@ impl BrowserWindow {
 
         // Determine tooltip text from hovered element.
         let mut new_tooltip = String::new();
-        if (win_y as f32) > URL_BAR_HEIGHT {
-            let page_x = win_x as f32 + self.scroll_x;
-            let page_y = (win_y as f32 - URL_BAR_HEIGHT) + self.scroll_y;
+        if (win_y as f32) > CHROME_HEIGHT {
+            let tab = self.tabs.active_tab();
+            let page_x = win_x as f32 + tab.scroll_x;
+            let page_y = (win_y as f32 - CHROME_HEIGHT) + tab.scroll_y;
 
             // Check links for title.
-            for region in &self.hit_regions {
+            for region in &tab.hit_regions {
                 if region.contains(page_x, page_y) && !region.title.is_empty() {
                     new_tooltip = region.title.clone();
                     break;
@@ -696,7 +628,7 @@ impl BrowserWindow {
             }
             // Check form fields for title.
             if new_tooltip.is_empty() {
-                for field in &self.form_fields {
+                for field in &tab.form_fields {
                     if field.contains(page_x, page_y) && !field.title.is_empty() {
                         new_tooltip = field.title.clone();
                         break;
@@ -720,11 +652,12 @@ impl BrowserWindow {
         if let Some(w) = &self.window {
             if self.hit_test_no_pointer_events(win_x, win_y).is_some() {
                 w.set_cursor(CursorIcon::Pointer);
-            } else if (win_y as f32) > URL_BAR_HEIGHT {
+            } else if (win_y as f32) > CHROME_HEIGHT {
                 // Check if cursor is over a text-like form field.
-                let page_x = win_x as f32 + self.scroll_x;
-                let page_y = (win_y as f32 - URL_BAR_HEIGHT) + self.scroll_y;
-                let over_text_field = self.form_fields.iter().any(|f| {
+                let tab = self.tabs.active_tab();
+                let page_x = win_x as f32 + tab.scroll_x;
+                let page_y = (win_y as f32 - CHROME_HEIGHT) + tab.scroll_y;
+                let over_text_field = tab.form_fields.iter().any(|f| {
                     f.contains(page_x, page_y)
                         && !f.pointer_events_none
                         && matches!(
@@ -912,7 +845,7 @@ impl BrowserWindow {
         let mut used_gpu = false;
         if self.use_gpu_rendering {
             let gpu_pixels = self.vello_backend.render_to_texture(
-                &self.render_commands.ops,
+                &self.tabs.active_tab().render_commands.ops,
                 self.width,
                 self.height,
             );
@@ -931,12 +864,13 @@ impl BrowserWindow {
 
         if !used_gpu {
             // Software fallback: render page content with the CPU renderer.
+            let tab = self.tabs.active_tab();
             self.framebuffer.render_scrolled(
-                &self.render_commands,
-                URL_BAR_HEIGHT,
-                self.scroll_x,
-                self.scroll_y,
-                self.content_height,
+                &tab.render_commands,
+                CHROME_HEIGHT,
+                tab.scroll_x,
+                tab.scroll_y,
+                tab.content_height,
             );
         }
 
@@ -944,12 +878,15 @@ impl BrowserWindow {
         self.draw_form_field_overlays();
 
         // Draw focus ring on the focused form field (if any).
-        if let Some(idx) = self.focused_field {
-            if let Some(field) = self.form_fields.get(idx) {
-                let fx = field.x - self.scroll_x;
-                let fy = field.y + URL_BAR_HEIGHT - self.scroll_y;
-                let focus_color = Color { r: 0.26, g: 0.52, b: 0.96, a: 1.0 };
-                self.framebuffer.stroke_rect(fx - 1.0, fy - 1.0, field.width + 2.0, field.height + 2.0, focus_color, 2.0);
+        {
+            let tab = self.tabs.active_tab();
+            if let Some(idx) = tab.focused_field {
+                if let Some(field) = tab.form_fields.get(idx) {
+                    let fx = field.x - tab.scroll_x;
+                    let fy = field.y + CHROME_HEIGHT - tab.scroll_y;
+                    let focus_color = Color { r: 0.26, g: 0.52, b: 0.96, a: 1.0 };
+                    self.framebuffer.stroke_rect(fx - 1.0, fy - 1.0, field.width + 2.0, field.height + 2.0, focus_color, 2.0);
+                }
             }
         }
 
@@ -961,6 +898,9 @@ impl BrowserWindow {
 
         // Draw find-in-page highlights (before URL bar so they appear under it).
         self.draw_find_highlights();
+
+        // Draw the tab bar below the URL bar.
+        self.draw_tab_bar();
 
         // Draw the URL bar on top (overwrites the top region, not affected by scroll).
         self.draw_url_bar();
@@ -1026,14 +966,17 @@ impl BrowserWindow {
     /// background when it has been edited.
     fn draw_form_field_overlays(&mut self) {
         // Collect field data first to avoid borrowing issues.
-        let fields: Vec<_> = self.form_fields.iter().enumerate().map(|(i, f)| {
+        let tab = self.tabs.active_tab();
+        let scroll_x = tab.scroll_x;
+        let scroll_y = tab.scroll_y;
+        let fields: Vec<_> = tab.form_fields.iter().enumerate().map(|(i, f)| {
             (i, f.x, f.y, f.width, f.height, f.field_type.clone(), f.value.clone(),
              f.placeholder.clone(), f.checked, f.options.clone())
         }).collect();
 
-        for (idx, x, y, w, h, field_type, value, placeholder, checked, options) in fields {
-            let fx = x - self.scroll_x;
-            let fy = y + URL_BAR_HEIGHT - self.scroll_y;
+        for (_idx, x, y, w, h, field_type, value, placeholder, checked, options) in fields {
+            let fx = x - scroll_x;
+            let fy = y + CHROME_HEIGHT - scroll_y;
             let font_size = 14.0_f32; // Default form field font size.
 
             match field_type.as_str() {
@@ -1178,12 +1121,13 @@ impl BrowserWindow {
 
     /// Draw a blinking text cursor in the currently focused text field.
     fn draw_form_field_cursor(&mut self) {
-        let idx = match self.focused_field {
+        let tab = self.tabs.active_tab_mut();
+        let idx = match tab.focused_field {
             Some(i) => i,
             None => return,
         };
 
-        let field = match self.form_fields.get(idx) {
+        let field = match tab.form_fields.get(idx) {
             Some(f) => f,
             None => return,
         };
@@ -1198,18 +1142,21 @@ impl BrowserWindow {
         }
 
         // Toggle cursor visibility every 500ms.
-        let elapsed = self.cursor_blink_time.elapsed();
+        let elapsed = tab.cursor_blink_time.elapsed();
         if elapsed.as_millis() >= 500 {
-            self.cursor_visible = !self.cursor_visible;
-            self.cursor_blink_time = Instant::now();
+            tab.cursor_visible = !tab.cursor_visible;
+            tab.cursor_blink_time = Instant::now();
         }
 
-        if !self.cursor_visible {
+        if !tab.cursor_visible {
             return;
         }
 
-        let fx = field.x - self.scroll_x;
-        let fy = field.y + URL_BAR_HEIGHT - self.scroll_y;
+        let scroll_x = tab.scroll_x;
+        let scroll_y = tab.scroll_y;
+        let form_cursor_pos = tab.form_cursor_pos;
+        let fx = field.x - scroll_x;
+        let fy = field.y + CHROME_HEIGHT - scroll_y;
         let h = field.height;
         let font_size = 14.0_f32;
 
@@ -1220,7 +1167,7 @@ impl BrowserWindow {
         } else {
             field.value.len()
         };
-        let cursor_char_pos = self.form_cursor_pos.min(display_len);
+        let cursor_char_pos = form_cursor_pos.min(display_len);
         let cursor_x = fx + 4.0 + cursor_char_pos as f32 * approx_char_w;
         let cursor_y = fy + (h - font_size) / 2.0;
 
@@ -1230,14 +1177,16 @@ impl BrowserWindow {
 
     /// Draw a dropdown overlay for the currently open `<select>` field.
     fn draw_select_dropdown(&mut self) {
-        if !self.dropdown_open {
+        let tab = self.tabs.active_tab_mut();
+        if !tab.dropdown_open {
             return;
         }
 
-        let field = match self.form_fields.get(self.dropdown_field_idx) {
+        let dd_idx = tab.dropdown_field_idx;
+        let field = match tab.form_fields.get(dd_idx) {
             Some(f) => f,
             None => {
-                self.dropdown_open = false;
+                tab.dropdown_open = false;
                 return;
             }
         };
@@ -1247,8 +1196,11 @@ impl BrowserWindow {
             return;
         }
 
-        let fx = field.x - self.scroll_x;
-        let fy = field.y + URL_BAR_HEIGHT - self.scroll_y + field.height;
+        let scroll_x = tab.scroll_x;
+        let scroll_y = tab.scroll_y;
+        let dropdown_hover_idx = tab.dropdown_hover_idx;
+        let fx = field.x - scroll_x;
+        let fy = field.y + CHROME_HEIGHT - scroll_y + field.height;
         let w = field.width;
         let option_h = 24.0_f32;
         let total_h = option_h * options.len() as f32;
@@ -1271,7 +1223,7 @@ impl BrowserWindow {
             let oy = fy + i as f32 * option_h;
 
             // Hover highlight.
-            if Some(i) == self.dropdown_hover_idx {
+            if Some(i) == dropdown_hover_idx {
                 let hover_bg = Color::rgb(0.26, 0.52, 0.96);
                 self.framebuffer.fill_rect(fx + 1.0, oy, w - 2.0, option_h, hover_bg);
             } else if *val == current_value {
@@ -1281,7 +1233,7 @@ impl BrowserWindow {
             }
 
             // Option text.
-            let text_color = if Some(i) == self.dropdown_hover_idx {
+            let text_color = if Some(i) == dropdown_hover_idx {
                 Color::WHITE
             } else {
                 Color::BLACK
@@ -1634,14 +1586,15 @@ impl BrowserWindow {
     ///
     /// Returns `true` if the event was consumed.
     fn handle_form_field_key(&mut self, event: &winit::event::KeyEvent) -> bool {
-        let idx = match self.focused_field {
+        let tab = self.tabs.active_tab_mut();
+        let idx = match tab.focused_field {
             Some(i) => i,
             None => return false,
         };
 
         // Reset cursor blink on any keypress.
-        self.cursor_visible = true;
-        self.cursor_blink_time = Instant::now();
+        tab.cursor_visible = true;
+        tab.cursor_blink_time = Instant::now();
 
         match &event.logical_key {
             Key::Named(NamedKey::Enter) => {
@@ -1650,37 +1603,41 @@ impl BrowserWindow {
                 return true;
             }
             Key::Named(NamedKey::Escape) => {
-                self.focused_field = None;
-                self.dropdown_open = false;
+                let tab = self.tabs.active_tab_mut();
+                tab.focused_field = None;
+                tab.dropdown_open = false;
                 return true;
             }
             Key::Named(NamedKey::Backspace) => {
-                if let Some(field) = self.form_fields.get_mut(idx) {
-                    if self.form_cursor_pos > 0 && !field.value.is_empty() {
+                let tab = self.tabs.active_tab_mut();
+                if let Some(field) = tab.form_fields.get_mut(idx) {
+                    if tab.form_cursor_pos > 0 && !field.value.is_empty() {
                         // Find the char boundary before cursor_pos.
-                        let prev = field.value[..self.form_cursor_pos]
+                        let prev = field.value[..tab.form_cursor_pos]
                             .char_indices()
                             .next_back()
                             .map(|(i, _)| i)
                             .unwrap_or(0);
                         field.value.remove(prev);
-                        self.form_cursor_pos = prev;
+                        tab.form_cursor_pos = prev;
                     }
                 }
                 return true;
             }
             Key::Named(NamedKey::Delete) => {
-                if let Some(field) = self.form_fields.get_mut(idx) {
-                    if self.form_cursor_pos < field.value.len() {
-                        field.value.remove(self.form_cursor_pos);
+                let tab = self.tabs.active_tab_mut();
+                if let Some(field) = tab.form_fields.get_mut(idx) {
+                    if tab.form_cursor_pos < field.value.len() {
+                        field.value.remove(tab.form_cursor_pos);
                     }
                 }
                 return true;
             }
             Key::Named(NamedKey::ArrowLeft) => {
-                if self.form_cursor_pos > 0 {
-                    if let Some(field) = self.form_fields.get(idx) {
-                        self.form_cursor_pos = field.value[..self.form_cursor_pos]
+                let tab = self.tabs.active_tab_mut();
+                if tab.form_cursor_pos > 0 {
+                    if let Some(field) = tab.form_fields.get(idx) {
+                        tab.form_cursor_pos = field.value[..tab.form_cursor_pos]
                             .char_indices()
                             .next_back()
                             .map(|(i, _)| i)
@@ -1690,24 +1647,27 @@ impl BrowserWindow {
                 return true;
             }
             Key::Named(NamedKey::ArrowRight) => {
-                if let Some(field) = self.form_fields.get(idx) {
-                    if self.form_cursor_pos < field.value.len() {
-                        self.form_cursor_pos = field.value[self.form_cursor_pos..]
+                let tab = self.tabs.active_tab_mut();
+                if let Some(field) = tab.form_fields.get(idx) {
+                    if tab.form_cursor_pos < field.value.len() {
+                        tab.form_cursor_pos = field.value[tab.form_cursor_pos..]
                             .char_indices()
                             .nth(1)
-                            .map(|(i, _)| self.form_cursor_pos + i)
+                            .map(|(i, _)| tab.form_cursor_pos + i)
                             .unwrap_or(field.value.len());
                     }
                 }
                 return true;
             }
             Key::Named(NamedKey::Home) => {
-                self.form_cursor_pos = 0;
+                let tab = self.tabs.active_tab_mut();
+                tab.form_cursor_pos = 0;
                 return true;
             }
             Key::Named(NamedKey::End) => {
-                if let Some(field) = self.form_fields.get(idx) {
-                    self.form_cursor_pos = field.value.len();
+                let tab = self.tabs.active_tab_mut();
+                if let Some(field) = tab.form_fields.get(idx) {
+                    tab.form_cursor_pos = field.value.len();
                 }
                 return true;
             }
@@ -1715,11 +1675,12 @@ impl BrowserWindow {
                 // Move focus to the next focusable form field, respecting tabindex.
                 // tabindex=-1 means not tabbable; positive values are visited first
                 // in ascending order; 0 means natural document order.
-                if !self.form_fields.is_empty() {
+                if !self.tabs.active_tab().form_fields.is_empty() {
                     let next = self.next_tab_field(idx);
                     if let Some(next_idx) = next {
-                        self.focused_field = Some(next_idx);
-                        self.form_cursor_pos = self.form_fields[next_idx].value.len();
+                        let tab = self.tabs.active_tab_mut();
+                        tab.focused_field = Some(next_idx);
+                        tab.form_cursor_pos = tab.form_fields[next_idx].value.len();
                     }
                 }
                 return true;
@@ -1728,15 +1689,16 @@ impl BrowserWindow {
                 if let Some(text) = &event.text {
                     let s = text.as_str();
                     if !s.is_empty() && s.chars().all(|c| !c.is_control()) {
-                        if let Some(field) = self.form_fields.get_mut(idx) {
+                        let tab = self.tabs.active_tab_mut();
+                        if let Some(field) = tab.form_fields.get_mut(idx) {
                             // Enforce maxlength.
                             if let Some(maxlen) = field.maxlength {
                                 if field.value.len() + s.len() > maxlen {
                                     return true; // don't add more text
                                 }
                             }
-                            field.value.insert_str(self.form_cursor_pos, s);
-                            self.form_cursor_pos += s.len();
+                            field.value.insert_str(tab.form_cursor_pos, s);
+                            tab.form_cursor_pos += s.len();
                         }
                         return true;
                     }
@@ -1752,7 +1714,8 @@ impl BrowserWindow {
     /// a query string (GET) or POST body from their name/value pairs.
     /// Performs HTML5 validation before submission.
     fn submit_form(&mut self, trigger_idx: usize) {
-        let trigger = match self.form_fields.get(trigger_idx) {
+        let tab = self.tabs.active_tab();
+        let trigger = match tab.form_fields.get(trigger_idx) {
             Some(f) => f.clone(),
             None => return,
         };
@@ -1763,7 +1726,7 @@ impl BrowserWindow {
 
         // Validate all fields in this form before submission.
         let mut validation_errors = Vec::new();
-        for field in &self.form_fields {
+        for field in &tab.form_fields {
             if field.form_action == form_action && !field.name.is_empty() {
                 if let Some(error) = field.validate() {
                     validation_errors.push(format!("{}: {}", field.name, error));
@@ -1777,7 +1740,7 @@ impl BrowserWindow {
         }
 
         // Collect all fields that belong to the same form (same action URL).
-        let fields: Vec<(String, String)> = self.form_fields.iter()
+        let fields: Vec<(String, String)> = self.tabs.active_tab().form_fields.iter()
             .filter(|f| f.form_action == form_action && !f.name.is_empty())
             .filter(|f| !matches!(f.field_type.as_str(), "submit" | "button" | "reset"))
             .filter_map(|f| {
@@ -1879,17 +1842,21 @@ impl BrowserWindow {
         match result {
             Ok(TypedData::RenderCommands(cmds)) => {
                 info!("POST navigation successful! {} render ops", cmds.ops.len());
-                self.hit_regions = Self::extract_hit_regions(&cmds);
-                self.form_fields = Self::extract_form_fields(&cmds);
-                self.focused_field = None;
-                self.form_cursor_pos = 0;
-                self.dropdown_open = false;
-                self.dropdown_hover_idx = None;
-                self.content_height = Self::compute_content_height(&cmds);
-                self.content_width = Self::compute_content_width(&cmds);
-                self.render_commands = cmds;
-                self.scroll_y = 0.0;
-                self.scroll_x = 0.0;
+                let tab = self.tabs.active_tab_mut();
+                tab.hit_regions = Self::extract_hit_regions(&cmds);
+                tab.form_fields = Self::extract_form_fields(&cmds);
+                tab.focused_field = None;
+                tab.form_cursor_pos = 0;
+                tab.dropdown_open = false;
+                tab.dropdown_hover_idx = None;
+                tab.content_height = Self::compute_content_height(&cmds);
+                tab.content_width = Self::compute_content_width(&cmds);
+                tab.render_commands = cmds;
+                tab.scroll_y = 0.0;
+                tab.scroll_x = 0.0;
+                tab.url = url.to_string();
+                tab.title = url.to_string();
+
                 self.url_bar_focused = false;
                 self.url_bar_select_all = false;
                 self.url_bar_text = url.to_string();
@@ -1915,17 +1882,18 @@ impl BrowserWindow {
 
     /// Perform a search through all DrawText render ops and collect match positions.
     fn find_in_page(&mut self) {
-        self.find_matches.clear();
-        self.find_current = 0;
+        let tab = self.tabs.active_tab_mut();
+        tab.find_matches.clear();
+        tab.find_current = 0;
 
-        if self.find_query.is_empty() {
+        if tab.find_query.is_empty() {
             return;
         }
 
-        let query_lower = self.find_query.to_lowercase();
+        let query_lower = tab.find_query.to_lowercase();
         let approx_char_w_factor = 0.6;
 
-        for op in &self.render_commands.ops {
+        for op in &tab.render_commands.ops {
             if let RenderOp::DrawText {
                 x,
                 y,
@@ -1944,7 +1912,7 @@ impl BrowserWindow {
                     let match_x = x + char_offset as f32 * char_w;
                     let match_w = query_lower.len() as f32 * char_w;
 
-                    self.find_matches.push(FindMatch {
+                    tab.find_matches.push(FindMatch {
                         x: match_x,
                         y: *y,
                         width: match_w,
@@ -1957,59 +1925,69 @@ impl BrowserWindow {
         }
 
         debug!(
-            query = %self.find_query,
-            matches = self.find_matches.len(),
+            query = %tab.find_query,
+            matches = tab.find_matches.len(),
             "find in page"
         );
 
         // Scroll to first match if any.
-        if !self.find_matches.is_empty() {
+        let has_matches = !tab.find_matches.is_empty();
+        if has_matches {
             self.scroll_to_find_match();
         }
     }
 
     /// Navigate to the next find match.
     fn find_next(&mut self) {
-        if self.find_matches.is_empty() {
+        let tab = self.tabs.active_tab_mut();
+        if tab.find_matches.is_empty() {
             return;
         }
-        self.find_current = (self.find_current + 1) % self.find_matches.len();
+        tab.find_current = (tab.find_current + 1) % tab.find_matches.len();
         self.scroll_to_find_match();
     }
 
     /// Navigate to the previous find match.
     fn find_prev(&mut self) {
-        if self.find_matches.is_empty() {
+        let tab = self.tabs.active_tab_mut();
+        if tab.find_matches.is_empty() {
             return;
         }
-        if self.find_current == 0 {
-            self.find_current = self.find_matches.len() - 1;
+        if tab.find_current == 0 {
+            tab.find_current = tab.find_matches.len() - 1;
         } else {
-            self.find_current -= 1;
+            tab.find_current -= 1;
         }
         self.scroll_to_find_match();
     }
 
     /// Scroll the viewport to show the current find match.
     fn scroll_to_find_match(&mut self) {
-        if let Some(m) = self.find_matches.get(self.find_current) {
-            let page_viewport = (self.height as f32 - URL_BAR_HEIGHT).max(0.0);
+        let tab = self.tabs.active_tab_mut();
+        let find_current = tab.find_current;
+        if let Some(m) = tab.find_matches.get(find_current) {
+            let page_viewport = (self.height as f32 - CHROME_HEIGHT).max(0.0);
             // Center the match vertically in the viewport.
-            self.scroll_y = (m.y - page_viewport / 2.0).max(0.0);
-            self.clamp_scroll();
+            tab.scroll_y = (m.y - page_viewport / 2.0).max(0.0);
         }
+        self.clamp_scroll();
     }
 
     /// Draw the find bar overlay at the top-right of the window.
     fn draw_find_bar(&mut self) {
-        if !self.find_bar_visible {
+        let tab = self.tabs.active_tab();
+        if !tab.find_bar_visible {
             return;
         }
+
+        let find_query = tab.find_query.clone();
+        let find_matches_len = tab.find_matches.len();
+        let find_current = tab.find_current;
 
         let bar_w = 320.0_f32;
         let bar_h = 32.0_f32;
         let bar_x = (self.width as f32 - bar_w - 8.0).max(0.0);
-        let bar_y = URL_BAR_HEIGHT + 4.0;
+        let bar_y = CHROME_HEIGHT + 4.0;
 
         // Background.
         let bg = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.95 };
@@ -2026,7 +2004,7 @@ impl BrowserWindow {
         self.framebuffer.draw_text(
             text_x,
             text_y,
-            &self.find_query,
+            &find_query,
             12.0,
             text_color,
             None,
@@ -2036,14 +2014,14 @@ impl BrowserWindow {
         );
 
         // Match count.
-        let count_text = if self.find_matches.is_empty() {
-            if self.find_query.is_empty() {
+        let count_text = if find_matches_len == 0 {
+            if find_query.is_empty() {
                 String::new()
             } else {
                 "0 matches".to_string()
             }
         } else {
-            format!("{} of {}", self.find_current + 1, self.find_matches.len())
+            format!("{} of {}", find_current + 1, find_matches_len)
         };
 
         if !count_text.is_empty() {
@@ -2064,22 +2042,28 @@ impl BrowserWindow {
 
     /// Draw yellow highlight rectangles for all find matches, and orange for the current one.
     fn draw_find_highlights(&mut self) {
-        if !self.find_bar_visible || self.find_matches.is_empty() {
+        let tab = self.tabs.active_tab();
+        if !tab.find_bar_visible || tab.find_matches.is_empty() {
             return;
         }
+
+        let scroll_x = tab.scroll_x;
+        let scroll_y = tab.scroll_y;
+        let find_current = tab.find_current;
+        let matches: Vec<_> = tab.find_matches.iter().map(|m| (m.x, m.y, m.width, m.height)).collect();
 
         let highlight_color = Color { r: 1.0, g: 1.0, b: 0.0, a: 0.4 };
         let current_color = Color { r: 1.0, g: 0.65, b: 0.0, a: 0.5 };
 
-        for (i, m) in self.find_matches.iter().enumerate() {
-            let sx = m.x - self.scroll_x;
-            let sy = m.y + URL_BAR_HEIGHT - self.scroll_y;
-            let color = if i == self.find_current {
+        for (i, (mx, my, mw, mh)) in matches.iter().enumerate() {
+            let sx = mx - scroll_x;
+            let sy = my + CHROME_HEIGHT - scroll_y;
+            let color = if i == find_current {
                 current_color
             } else {
                 highlight_color
             };
-            self.framebuffer.fill_rect(sx, sy, m.width, m.height, color);
+            self.framebuffer.fill_rect(sx, sy, *mw, *mh, color);
         }
     }
 
@@ -2141,6 +2125,175 @@ impl BrowserWindow {
 
     // -- Bookmark indicator -------------------------------------------------
 
+    // -- Tab bar rendering --------------------------------------------------
+
+    /// Draw the tab bar below the URL bar.
+    fn draw_tab_bar(&mut self) {
+        let w = self.width as f32;
+        let tab_bar_y = URL_BAR_HEIGHT;
+
+        // Tab bar background.
+        let tab_bar_bg = Color { r: 0.88, g: 0.88, b: 0.88, a: 1.0 };
+        self.framebuffer.fill_rect(0.0, tab_bar_y, w, TAB_BAR_HEIGHT, tab_bar_bg);
+
+        // Bottom border.
+        let border_color = Color { r: 0.75, g: 0.75, b: 0.75, a: 1.0 };
+        self.framebuffer.fill_rect(0.0, tab_bar_y + TAB_BAR_HEIGHT - 1.0, w, 1.0, border_color);
+
+        let tab_count = self.tabs.tab_count();
+        let active_idx = self.tabs.active_index();
+        let tabs_data: Vec<(String, usize)> = self.tabs.tabs().iter().enumerate().map(|(i, t)| {
+            let title = if t.title.len() > 20 {
+                format!("{}...", &t.title[..17])
+            } else if t.title.is_empty() {
+                t.url.clone()
+            } else {
+                t.title.clone()
+            };
+            (title, i)
+        }).collect();
+
+        // Calculate tab width: max 200px, shrink to fit.
+        let plus_btn_w = 30.0_f32;
+        let available_w = w - plus_btn_w;
+        let tab_w = (available_w / tab_count.max(1) as f32).min(200.0);
+        let font_size = 12.0_f32;
+        let close_btn_size = 14.0_f32;
+
+        for (title, idx) in &tabs_data {
+            let tx = *idx as f32 * tab_w;
+            let ty = tab_bar_y;
+
+            // Tab background.
+            let bg = if *idx == active_idx {
+                Color::WHITE
+            } else {
+                Color { r: 0.82, g: 0.82, b: 0.82, a: 1.0 }
+            };
+            self.framebuffer.fill_rect(tx, ty + 2.0, tab_w - 1.0, TAB_BAR_HEIGHT - 3.0, bg);
+
+            // Tab separator (right edge).
+            self.framebuffer.fill_rect(tx + tab_w - 1.0, ty + 4.0, 1.0, TAB_BAR_HEIGHT - 8.0, border_color);
+
+            // Tab title text.
+            let text_x = tx + 8.0;
+            let text_y = ty + (TAB_BAR_HEIGHT - font_size) / 2.0;
+            let max_text_w = tab_w - 8.0 - close_btn_size - 8.0;
+            let max_chars = (max_text_w / (font_size * 0.6)).max(1.0) as usize;
+            let display_title = if title.len() > max_chars {
+                format!("{}...", &title[..max_chars.saturating_sub(3).max(1)])
+            } else {
+                title.clone()
+            };
+            let text_color = if *idx == active_idx {
+                Color::BLACK
+            } else {
+                Color { r: 0.3, g: 0.3, b: 0.3, a: 1.0 }
+            };
+            self.framebuffer.draw_text(text_x, text_y, &display_title, font_size, text_color, None, None, None, None);
+
+            // Close button (X) — only show if more than 1 tab.
+            if tab_count > 1 {
+                let close_x = tx + tab_w - close_btn_size - 6.0;
+                let close_y = ty + (TAB_BAR_HEIGHT - close_btn_size) / 2.0;
+                let close_color = Color { r: 0.5, g: 0.5, b: 0.5, a: 1.0 };
+                self.framebuffer.draw_text(close_x, close_y, "\u{00D7}", close_btn_size, close_color, None, None, None, None);
+            }
+        }
+
+        // "+" button to open a new tab.
+        let plus_x = tabs_data.len() as f32 * tab_w;
+        let plus_y = tab_bar_y + (TAB_BAR_HEIGHT - font_size) / 2.0;
+        let plus_color = Color { r: 0.4, g: 0.4, b: 0.4, a: 1.0 };
+        self.framebuffer.draw_text(plus_x + 8.0, plus_y, "+", 16.0, plus_color, Some(700), None, None, None);
+    }
+
+    /// Handle a click in the tab bar area. Returns `true` if the click was consumed.
+    fn handle_tab_bar_click(&mut self, x: f64, y: f64) -> bool {
+        let tab_bar_y = URL_BAR_HEIGHT as f64;
+        let tab_bar_bottom = (URL_BAR_HEIGHT + TAB_BAR_HEIGHT) as f64;
+
+        if y < tab_bar_y || y >= tab_bar_bottom {
+            return false;
+        }
+
+        let tab_count = self.tabs.tab_count();
+        let plus_btn_w = 30.0_f64;
+        let available_w = self.width as f64 - plus_btn_w;
+        let tab_w = (available_w / tab_count.max(1) as f64).min(200.0);
+
+        let tabs_end_x = tab_count as f64 * tab_w;
+
+        // Check if "+" button was clicked.
+        if x >= tabs_end_x && x < tabs_end_x + plus_btn_w {
+            info!("New tab button clicked");
+            self.open_new_tab("about:blank");
+            return true;
+        }
+
+        // Check which tab was clicked.
+        if x < tabs_end_x {
+            let tab_idx = (x / tab_w) as usize;
+            if tab_idx < tab_count {
+                // Check if close button was clicked.
+                let close_btn_size = 14.0_f64;
+                let close_x = tab_idx as f64 * tab_w + tab_w - close_btn_size - 6.0;
+                let close_y = tab_bar_y + (TAB_BAR_HEIGHT as f64 - close_btn_size) / 2.0;
+
+                if tab_count > 1 && x >= close_x && x < close_x + close_btn_size
+                    && y >= close_y && y < close_y + close_btn_size
+                {
+                    info!(tab = tab_idx, "Close tab button clicked");
+                    self.tabs.close_tab(tab_idx);
+                    self.sync_url_bar_from_active_tab();
+                    self.request_redraw();
+                    return true;
+                }
+
+                // Switch to this tab.
+                if tab_idx != self.tabs.active_index() {
+                    info!(tab = tab_idx, "Switching to tab");
+                    self.tabs.switch_to(tab_idx);
+                    self.sync_url_bar_from_active_tab();
+                    self.request_redraw();
+                }
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Open a new tab and navigate to the given URL.
+    fn open_new_tab(&mut self, url: &str) {
+        let commands = RenderCommands { ops: vec![], fonts: vec![] };
+        self.tabs.new_tab(url, commands);
+        self.sync_url_bar_from_active_tab();
+
+        // Navigate the new tab if it's not about:blank.
+        if url != "about:blank" {
+            self.navigate_in_place(url);
+        } else {
+            self.url_bar_focused = true;
+            self.url_bar_select_all = true;
+            self.request_redraw();
+        }
+    }
+
+    /// Sync the URL bar text from the active tab.
+    fn sync_url_bar_from_active_tab(&mut self) {
+        let tab = self.tabs.active_tab();
+        self.url_bar_text = tab.url.clone();
+        self.url_bar_cursor = self.url_bar_text.len();
+        self.url_bar_focused = false;
+        self.url_bar_select_all = false;
+
+        // Update window title.
+        if let Some(w) = &self.window {
+            w.set_title(&format!("NOVA - {}", self.url_bar_text));
+        }
+    }
+
     /// Draw a star icon in the URL bar (filled if bookmarked, outline otherwise).
     fn draw_bookmark_star(&mut self) {
         let star_x = self.width as f32 - URL_BAR_PADDING - 22.0;
@@ -2191,7 +2344,7 @@ impl BrowserWindow {
             };
             self.url_bar_text = full_url.clone();
             self.url_bar_cursor = self.url_bar_text.len();
-            self.push_history(&full_url);
+            self.tabs.active_tab_mut().history.push(&full_url);
             self.request_redraw();
             return;
         }
@@ -2215,25 +2368,29 @@ impl BrowserWindow {
         match result {
             Ok(TypedData::RenderCommands(cmds)) => {
                 info!("In-place navigation successful! {} render ops", cmds.ops.len());
-                self.hit_regions = Self::extract_hit_regions(&cmds);
-                self.form_fields = Self::extract_form_fields(&cmds);
-                self.anchor_regions = Self::extract_anchor_regions(&cmds);
-                self.focused_field = None;
-                self.form_cursor_pos = 0;
-                self.dropdown_open = false;
-                self.dropdown_hover_idx = None;
-                self.content_height = Self::compute_content_height(&cmds);
-                self.content_width = Self::compute_content_width(&cmds);
-                self.render_commands = cmds;
-                self.scroll_y = 0.0;
-                self.scroll_x = 0.0;
+                let tab = self.tabs.active_tab_mut();
+                tab.hit_regions = Self::extract_hit_regions(&cmds);
+                tab.form_fields = Self::extract_form_fields(&cmds);
+                tab.anchor_regions = Self::extract_anchor_regions(&cmds);
+                tab.focused_field = None;
+                tab.form_cursor_pos = 0;
+                tab.dropdown_open = false;
+                tab.dropdown_hover_idx = None;
+                tab.content_height = Self::compute_content_height(&cmds);
+                tab.content_width = Self::compute_content_width(&cmds);
+                tab.render_commands = cmds;
+                tab.scroll_y = 0.0;
+                tab.scroll_x = 0.0;
+                tab.url = url.to_string();
+                tab.title = url.to_string();
+
+                // Push to navigation history.
+                tab.history.push(url);
+
                 self.url_bar_focused = false;
                 self.url_bar_select_all = false;
                 self.url_bar_text = url.to_string();
                 self.url_bar_cursor = self.url_bar_text.len();
-
-                // Push to navigation history (unless navigating via back/forward).
-                self.push_history(url);
 
                 // Record in persistent history.
                 self.persistent_history.record(url, url);
@@ -2262,65 +2419,112 @@ impl BrowserWindow {
         }
     }
 
-    /// Push a URL onto the navigation history stack.
-    ///
-    /// When navigating via back/forward, this is a no-op (the history is
-    /// already in the correct state). For normal navigation, any forward
-    /// history entries after the current position are discarded.
-    fn push_history(&mut self, url: &str) {
-        if self.navigating_history {
-            self.navigating_history = false;
-            return;
-        }
-        // If we are not at the end of history, truncate forward entries.
-        if self.history_index + 1 < self.history.len() {
-            self.history.truncate(self.history_index + 1);
-        }
-        // Avoid pushing duplicate of current URL.
-        if self.history.last().map(|s| s.as_str()) != Some(url) {
-            self.history.push(url.to_string());
-            self.history_index = self.history.len() - 1;
-        }
-    }
-
-    /// Navigate back in history.
+    /// Navigate back in history for the active tab.
     fn navigate_back(&mut self) {
-        if self.history_index == 0 {
-            info!("Already at the beginning of history");
-            return;
-        }
-        self.history_index -= 1;
-        let url = self.history[self.history_index].clone();
+        let url = {
+            let tab = self.tabs.active_tab_mut();
+            match tab.history.back() {
+                Some(entry) => entry.url.clone(),
+                None => {
+                    info!("Already at the beginning of history");
+                    return;
+                }
+            }
+        };
         info!("Navigating back to: {url}");
-        self.navigating_history = true;
-        self.navigate_in_place(&url);
+        self.navigate_in_place_no_history(&url);
     }
 
-    /// Navigate forward in history.
+    /// Navigate forward in history for the active tab.
     fn navigate_forward(&mut self) {
-        if self.history_index + 1 >= self.history.len() {
-            info!("Already at the end of history");
-            return;
-        }
-        self.history_index += 1;
-        let url = self.history[self.history_index].clone();
+        let url = {
+            let tab = self.tabs.active_tab_mut();
+            match tab.history.forward() {
+                Some(entry) => entry.url.clone(),
+                None => {
+                    info!("Already at the end of history");
+                    return;
+                }
+            }
+        };
         info!("Navigating forward to: {url}");
-        self.navigating_history = true;
-        self.navigate_in_place(&url);
+        self.navigate_in_place_no_history(&url);
+    }
+
+    /// Navigate in place without pushing to history (used by back/forward/reload).
+    fn navigate_in_place_no_history(&mut self, url: &str) {
+        let core = self.core.clone();
+        let viewport = self.viewport;
+        let url_owned = url.to_string();
+        let handle = self.tokio_handle.clone();
+
+        let result = std::thread::spawn(move || {
+            handle.block_on(async {
+                core.navigate(&url_owned, viewport).await
+            })
+        })
+        .join()
+        .map_err(|_| nova_mod_api::NovaError::Internal("navigation thread panicked".into()))
+        .and_then(|r| r);
+
+        match result {
+            Ok(TypedData::RenderCommands(cmds)) => {
+                info!("Navigation successful! {} render ops", cmds.ops.len());
+                let tab = self.tabs.active_tab_mut();
+                tab.hit_regions = Self::extract_hit_regions(&cmds);
+                tab.form_fields = Self::extract_form_fields(&cmds);
+                tab.anchor_regions = Self::extract_anchor_regions(&cmds);
+                tab.focused_field = None;
+                tab.form_cursor_pos = 0;
+                tab.dropdown_open = false;
+                tab.dropdown_hover_idx = None;
+                tab.content_height = Self::compute_content_height(&cmds);
+                tab.content_width = Self::compute_content_width(&cmds);
+                tab.render_commands = cmds;
+                tab.scroll_y = 0.0;
+                tab.scroll_x = 0.0;
+                tab.url = url.to_string();
+                tab.title = url.to_string();
+
+                self.url_bar_focused = false;
+                self.url_bar_select_all = false;
+                self.url_bar_text = url.to_string();
+                self.url_bar_cursor = self.url_bar_text.len();
+
+                self.persistent_history.record(url, url);
+
+                if let Some(w) = &self.window {
+                    w.set_title(&format!("NOVA - {}", self.url_bar_text));
+                }
+
+                self.apply_autofocus();
+                self.request_redraw();
+            }
+            Ok(_) => {
+                info!("Navigation returned unexpected type");
+                self.request_redraw();
+            }
+            Err(e) => {
+                error!("Navigation failed: {e}");
+                self.request_redraw();
+            }
+        }
     }
 
     /// Scroll to an anchor element with the given `id`.
     fn scroll_to_anchor(&mut self, anchor_id: &str) {
         if anchor_id.is_empty() {
             // Empty fragment = scroll to top.
-            self.scroll_y = 0.0;
+            self.tabs.active_tab_mut().scroll_y = 0.0;
             self.clamp_scroll();
             return;
         }
-        for anchor in &self.anchor_regions {
+        let tab = self.tabs.active_tab();
+        for anchor in &tab.anchor_regions {
             if anchor.id == anchor_id {
                 info!("Scrolling to anchor '{}' at y={}", anchor_id, anchor.y);
-                self.scroll_y = anchor.y;
+                let y = anchor.y;
+                self.tabs.active_tab_mut().scroll_y = y;
                 self.clamp_scroll();
                 return;
             }
@@ -2332,19 +2536,19 @@ impl BrowserWindow {
     fn reload(&mut self) {
         let url = self.url_bar_text.clone();
         info!("Reloading: {url}");
-        self.navigating_history = true; // Don't push duplicate history entry.
-        self.navigate_in_place(&url);
+        self.navigate_in_place_no_history(&url);
     }
 }
 
 impl ApplicationHandler for BrowserWindow {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // When a text field is focused, schedule periodic redraws for cursor blinking.
-        if self.focused_field.is_some() {
-            let elapsed = self.cursor_blink_time.elapsed();
+        if self.tabs.active_tab().focused_field.is_some() {
+            let tab = self.tabs.active_tab_mut();
+            let elapsed = tab.cursor_blink_time.elapsed();
             if elapsed.as_millis() >= 500 {
-                self.cursor_visible = !self.cursor_visible;
-                self.cursor_blink_time = Instant::now();
+                tab.cursor_visible = !tab.cursor_visible;
+                tab.cursor_blink_time = Instant::now();
                 self.rebuild_framebuffer();
                 if let Some(w) = &self.window {
                     w.request_redraw();
@@ -2430,24 +2634,20 @@ impl ApplicationHandler for BrowserWindow {
                     MouseScrollDelta::PixelDelta(pos) => (-pos.x as f32, -pos.y as f32),
                 };
 
+                let tab = self.tabs.active_tab_mut();
                 let mut changed = false;
                 if dy.abs() > 0.01 {
-                    self.scroll_y += dy;
+                    tab.scroll_y += dy;
                     changed = true;
                 }
                 if dx.abs() > 0.01 {
-                    self.scroll_x += dx;
+                    tab.scroll_x += dx;
                     changed = true;
                 }
                 if changed {
                     self.clamp_scroll();
                     self.request_redraw();
                 }
-            }
-
-            // ── Modifier tracking ─────────────────────────────────
-            WindowEvent::ModifiersChanged(new_modifiers) => {
-                self.modifiers = new_modifiers;
             }
 
             // ── Keyboard input ─────────────────────────────────────
@@ -2464,119 +2664,130 @@ impl ApplicationHandler for BrowserWindow {
                         _ => None,
                     };
 
-                    // Ctrl+F: Find in page.
-                    if key_str == Some("f") && event.repeat == false {
-                        // Check for ctrl via modifiers in the text field.
-                        // winit doesn't give us modifiers directly on KeyboardInput,
-                        // but Ctrl+F produces the character "\x06". Also, the
-                        // `text` field will be empty or control char when Ctrl is held.
-                        let is_ctrl_combo = event
-                            .text
-                            .as_ref()
-                            .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
-                            .unwrap_or(false);
+                    // Helper: detect Ctrl modifier from the event text.
+                    let is_ctrl_combo = event
+                        .text
+                        .as_ref()
+                        .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
+                        .unwrap_or(false);
 
-                        if is_ctrl_combo {
-                            self.find_bar_visible = !self.find_bar_visible;
-                            if !self.find_bar_visible {
-                                self.find_query.clear();
-                                self.find_matches.clear();
-                            }
+                    // Ctrl+T: New tab.
+                    if key_str == Some("t") && is_ctrl_combo {
+                        info!("Ctrl+T: Opening new tab");
+                        self.open_new_tab("about:blank");
+                        return;
+                    }
+
+                    // Ctrl+W: Close current tab.
+                    if key_str == Some("w") && is_ctrl_combo {
+                        if self.tabs.tab_count() > 1 {
+                            let idx = self.tabs.active_index();
+                            info!(tab = idx, "Ctrl+W: Closing tab");
+                            self.tabs.close_tab(idx);
+                            self.sync_url_bar_from_active_tab();
                             self.request_redraw();
-                            return;
                         }
+                        return;
+                    }
+
+                    // Ctrl+Tab: Next tab / Ctrl+Shift+Tab: Previous tab.
+                    if event.logical_key == Key::Named(NamedKey::Tab) && is_ctrl_combo {
+                        // Ctrl+Shift+Tab is detected by checking if the text
+                        // is a backtab or if shift is held. However, winit
+                        // does not provide modifier state directly.
+                        // We'll handle Ctrl+Shift+Tab via the separate
+                        // Shift+Tab detection below.
+                        self.tabs.next_tab();
+                        self.sync_url_bar_from_active_tab();
+                        self.request_redraw();
+                        return;
+                    }
+
+                    // Ctrl+1-9: Switch to tab by index.
+                    if is_ctrl_combo {
+                        let tab_num = match key_str {
+                            Some("1") => Some(0),
+                            Some("2") => Some(1),
+                            Some("3") => Some(2),
+                            Some("4") => Some(3),
+                            Some("5") => Some(4),
+                            Some("6") => Some(5),
+                            Some("7") => Some(6),
+                            Some("8") => Some(7),
+                            Some("9") => Some(self.tabs.tab_count().saturating_sub(1)), // Ctrl+9 = last tab
+                            _ => None,
+                        };
+                        if let Some(idx) = tab_num {
+                            if idx < self.tabs.tab_count() {
+                                self.tabs.switch_to(idx);
+                                self.sync_url_bar_from_active_tab();
+                                self.request_redraw();
+                                return;
+                            }
+                        }
+                    }
+
+                    // Ctrl+Shift+Tab: Previous tab (detected via backtab).
+                    if event.logical_key == Key::Named(NamedKey::Tab) {
+                        // If we get here and the Tab key has control text, it
+                        // may be Ctrl+Shift+Tab. We handle it as prev tab.
+                        // (This is a best-effort; actual Ctrl+Tab was handled above.)
+                    }
+
+                    // Ctrl+F: Find in page.
+                    if key_str == Some("f") && !event.repeat && is_ctrl_combo {
+                        let tab = self.tabs.active_tab_mut();
+                        tab.find_bar_visible = !tab.find_bar_visible;
+                        if !tab.find_bar_visible {
+                            tab.find_query.clear();
+                            tab.find_matches.clear();
+                        }
+                        self.request_redraw();
+                        return;
                     }
 
                     // Ctrl+D: Toggle bookmark.
-                    if key_str == Some("d") {
-                        let is_ctrl_combo = event
-                            .text
-                            .as_ref()
-                            .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
-                            .unwrap_or(false);
-
-                        if is_ctrl_combo {
-                            let url = self.url_bar_text.clone();
-                            self.bookmark_store.toggle(&url, &url);
-                            self.request_redraw();
-                            return;
-                        }
+                    if key_str == Some("d") && is_ctrl_combo {
+                        let url = self.url_bar_text.clone();
+                        self.bookmark_store.toggle(&url, &url);
+                        self.request_redraw();
+                        return;
                     }
 
                     // Ctrl+H: Log history (future: open history panel).
-                    if key_str == Some("h") {
-                        let is_ctrl_combo = event
-                            .text
-                            .as_ref()
-                            .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
-                            .unwrap_or(false);
-
-                        if is_ctrl_combo {
-                            let entries = self.persistent_history.all();
-                            info!("History ({} entries):", entries.len());
-                            for (i, e) in entries.iter().take(20).enumerate() {
-                                info!("  [{}] {} — {}", i + 1, e.url, e.title);
-                            }
-                            return;
+                    if key_str == Some("h") && is_ctrl_combo {
+                        let entries = self.persistent_history.all();
+                        info!("History ({} entries):", entries.len());
+                        for (i, e) in entries.iter().take(20).enumerate() {
+                            info!("  [{}] {} — {}", i + 1, e.url, e.title);
                         }
+                        return;
                     }
 
                     // Ctrl+= or Ctrl++: Zoom in.
-                    if key_str == Some("=") || key_str == Some("+") {
-                        let is_ctrl_combo = event
-                            .text
-                            .as_ref()
-                            .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
-                            .unwrap_or(false);
-
-                        if is_ctrl_combo {
-                            let new_zoom = self.zoom_level + 0.1;
-                            self.set_zoom(new_zoom);
-                            return;
-                        }
+                    if (key_str == Some("=") || key_str == Some("+")) && is_ctrl_combo {
+                        let new_zoom = self.zoom_level + 0.1;
+                        self.set_zoom(new_zoom);
+                        return;
                     }
 
                     // Ctrl+-: Zoom out.
-                    if key_str == Some("-") {
-                        let is_ctrl_combo = event
-                            .text
-                            .as_ref()
-                            .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
-                            .unwrap_or(false);
-
-                        if is_ctrl_combo {
-                            let new_zoom = self.zoom_level - 0.1;
-                            self.set_zoom(new_zoom);
-                            return;
-                        }
+                    if key_str == Some("-") && is_ctrl_combo {
+                        let new_zoom = self.zoom_level - 0.1;
+                        self.set_zoom(new_zoom);
+                        return;
                     }
 
                     // Ctrl+0: Reset zoom.
-                    if key_str == Some("0") {
-                        let is_ctrl_combo = event
-                            .text
-                            .as_ref()
-                            .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
-                            .unwrap_or(false);
-
-                        if is_ctrl_combo {
-                            self.set_zoom(1.0);
-                            return;
-                        }
+                    if key_str == Some("0") && is_ctrl_combo {
+                        self.set_zoom(1.0);
+                        return;
                     }
 
                     // Ctrl+R: Reload current page.
-                    if key_str == Some("r") {
-                        let is_ctrl_combo = event
-                            .text
-                            .as_ref()
-                            .map(|t| t.as_str().chars().next().is_some_and(|c| c.is_control()))
-                            .unwrap_or(false);
-
-                        if is_ctrl_combo {
-                            self.reload();
-                            return;
-                        }
+                    if key_str == Some("r") && is_ctrl_combo {
+                        self.reload();
+                        return;
                     }
                 }
 
@@ -2590,12 +2801,11 @@ impl ApplicationHandler for BrowserWindow {
                         return;
                     }
 
-                    // Escape: Stop loading (cancel pending navigation — currently a no-op
-                    // since navigation is synchronous, but log for future use).
+                    // Escape: Stop loading (no-op for now since navigation is synchronous).
                     if event.logical_key == Key::Named(NamedKey::Escape)
                         && !self.url_bar_focused
-                        && !self.find_bar_visible
-                        && self.focused_field.is_none()
+                        && !self.tabs.active_tab().find_bar_visible
+                        && self.tabs.active_tab().focused_field.is_none()
                     {
                         info!("Escape pressed — stop loading (no-op: navigation is synchronous)");
                         return;
@@ -2605,7 +2815,7 @@ impl ApplicationHandler for BrowserWindow {
                     if event.logical_key == Key::Named(NamedKey::ArrowLeft)
                         && alt_held
                         && !self.url_bar_focused
-                        && self.focused_field.is_none()
+                        && self.tabs.active_tab().focused_field.is_none()
                     {
                         self.navigate_back();
                         return;
@@ -2614,8 +2824,8 @@ impl ApplicationHandler for BrowserWindow {
                     // Backspace (when not in a text field): Navigate back.
                     if event.logical_key == Key::Named(NamedKey::Backspace)
                         && !self.url_bar_focused
-                        && !self.find_bar_visible
-                        && self.focused_field.is_none()
+                        && !self.tabs.active_tab().find_bar_visible
+                        && self.tabs.active_tab().focused_field.is_none()
                     {
                         self.navigate_back();
                         return;
@@ -2625,7 +2835,7 @@ impl ApplicationHandler for BrowserWindow {
                     if event.logical_key == Key::Named(NamedKey::ArrowRight)
                         && alt_held
                         && !self.url_bar_focused
-                        && self.focused_field.is_none()
+                        && self.tabs.active_tab().focused_field.is_none()
                     {
                         self.navigate_forward();
                         return;
@@ -2635,7 +2845,7 @@ impl ApplicationHandler for BrowserWindow {
                     if event.logical_key == Key::Named(NamedKey::Home)
                         && alt_held
                         && !self.url_bar_focused
-                        && self.focused_field.is_none()
+                        && self.tabs.active_tab().focused_field.is_none()
                     {
                         info!("Alt+Home — navigating to home page");
                         self.navigate_in_place("about:blank");
@@ -2644,12 +2854,13 @@ impl ApplicationHandler for BrowserWindow {
                 }
 
                 // Handle find bar input when it's visible.
-                if self.find_bar_visible && event.state == ElementState::Pressed {
+                if self.tabs.active_tab().find_bar_visible && event.state == ElementState::Pressed {
                     match &event.logical_key {
                         Key::Named(NamedKey::Escape) => {
-                            self.find_bar_visible = false;
-                            self.find_query.clear();
-                            self.find_matches.clear();
+                            let tab = self.tabs.active_tab_mut();
+                            tab.find_bar_visible = false;
+                            tab.find_query.clear();
+                            tab.find_matches.clear();
                             self.request_redraw();
                             return;
                         }
@@ -2659,7 +2870,7 @@ impl ApplicationHandler for BrowserWindow {
                             return;
                         }
                         Key::Named(NamedKey::Backspace) => {
-                            self.find_query.pop();
+                            self.tabs.active_tab_mut().find_query.pop();
                             self.find_in_page();
                             self.request_redraw();
                             return;
@@ -2668,7 +2879,7 @@ impl ApplicationHandler for BrowserWindow {
                             if let Some(text) = &event.text {
                                 let s = text.as_str();
                                 if !s.is_empty() && s.chars().all(|c| !c.is_control()) {
-                                    self.find_query.push_str(s);
+                                    self.tabs.active_tab_mut().find_query.push_str(s);
                                     self.find_in_page();
                                     self.request_redraw();
                                     return;
@@ -2686,7 +2897,7 @@ impl ApplicationHandler for BrowserWindow {
                 }
 
                 // Handle text input for focused form fields.
-                if self.focused_field.is_some() && event.state == ElementState::Pressed {
+                if self.tabs.active_tab().focused_field.is_some() && event.state == ElementState::Pressed {
                     if self.handle_form_field_key(&event) {
                         self.request_redraw();
                         return;
@@ -2695,42 +2906,43 @@ impl ApplicationHandler for BrowserWindow {
 
                 // Page scrolling (only when URL bar is not focused).
                 if event.state == ElementState::Pressed {
-                    let page_viewport = (self.height as f32 - URL_BAR_HEIGHT).max(0.0);
+                    let page_viewport = (self.height as f32 - CHROME_HEIGHT).max(0.0);
+                    let tab = self.tabs.active_tab_mut();
                     let scrolled = match event.logical_key {
                         Key::Named(NamedKey::ArrowDown) => {
-                            self.scroll_y += ARROW_SCROLL_STEP;
+                            tab.scroll_y += ARROW_SCROLL_STEP;
                             true
                         }
                         Key::Named(NamedKey::ArrowUp) => {
-                            self.scroll_y -= ARROW_SCROLL_STEP;
+                            tab.scroll_y -= ARROW_SCROLL_STEP;
                             true
                         }
                         Key::Named(NamedKey::ArrowRight) => {
-                            self.scroll_x += ARROW_SCROLL_STEP;
+                            tab.scroll_x += ARROW_SCROLL_STEP;
                             true
                         }
                         Key::Named(NamedKey::ArrowLeft) => {
-                            self.scroll_x -= ARROW_SCROLL_STEP;
+                            tab.scroll_x -= ARROW_SCROLL_STEP;
                             true
                         }
                         Key::Named(NamedKey::PageDown) => {
-                            self.scroll_y += page_viewport * PAGE_SCROLL_FRACTION;
+                            tab.scroll_y += page_viewport * PAGE_SCROLL_FRACTION;
                             true
                         }
                         Key::Named(NamedKey::PageUp) => {
-                            self.scroll_y -= page_viewport * PAGE_SCROLL_FRACTION;
+                            tab.scroll_y -= page_viewport * PAGE_SCROLL_FRACTION;
                             true
                         }
                         Key::Named(NamedKey::Home) => {
-                            self.scroll_y = 0.0;
+                            tab.scroll_y = 0.0;
                             true
                         }
                         Key::Named(NamedKey::End) => {
-                            self.scroll_y = self.content_height;
+                            tab.scroll_y = tab.content_height;
                             true
                         }
                         Key::Named(NamedKey::Space) => {
-                            self.scroll_y += page_viewport * PAGE_SCROLL_FRACTION;
+                            tab.scroll_y += page_viewport * PAGE_SCROLL_FRACTION;
                             true
                         }
                         _ => false,
@@ -2750,26 +2962,30 @@ impl ApplicationHandler for BrowserWindow {
                 self.update_cursor();
 
                 // Update dropdown hover index if dropdown is open.
-                if self.dropdown_open {
-                    if let Some(field) = self.form_fields.get(self.dropdown_field_idx) {
-                        let fx = field.x - self.scroll_x;
-                        let fy = field.y + URL_BAR_HEIGHT - self.scroll_y + field.height;
-                        let w = field.width;
-                        let option_h = 24.0_f32;
-                        let total_h = option_h * field.options.len() as f32;
+                {
+                    let tab = self.tabs.active_tab();
+                    if tab.dropdown_open {
+                        let dd_idx = tab.dropdown_field_idx;
+                        if let Some(field) = tab.form_fields.get(dd_idx) {
+                            let fx = field.x - tab.scroll_x;
+                            let fy = field.y + CHROME_HEIGHT - tab.scroll_y + field.height;
+                            let w = field.width;
+                            let option_h = 24.0_f32;
+                            let total_h = option_h * field.options.len() as f32;
 
-                        let mx = position.x as f32;
-                        let my = position.y as f32;
+                            let mx = position.x as f32;
+                            let my = position.y as f32;
 
-                        if mx >= fx && mx < fx + w && my >= fy && my < fy + total_h {
-                            let new_hover = ((my - fy) / option_h) as usize;
-                            if self.dropdown_hover_idx != Some(new_hover) {
-                                self.dropdown_hover_idx = Some(new_hover);
+                            if mx >= fx && mx < fx + w && my >= fy && my < fy + total_h {
+                                let new_hover = ((my - fy) / option_h) as usize;
+                                if tab.dropdown_hover_idx != Some(new_hover) {
+                                    self.tabs.active_tab_mut().dropdown_hover_idx = Some(new_hover);
+                                    self.request_redraw();
+                                }
+                            } else if tab.dropdown_hover_idx.is_some() {
+                                self.tabs.active_tab_mut().dropdown_hover_idx = None;
                                 self.request_redraw();
                             }
-                        } else if self.dropdown_hover_idx.is_some() {
-                            self.dropdown_hover_idx = None;
-                            self.request_redraw();
                         }
                     }
                 }
@@ -2788,6 +3004,8 @@ impl ApplicationHandler for BrowserWindow {
                 if (cy as f32) < URL_BAR_HEIGHT {
                     self.handle_mouse_click(cx, cy);
                     self.request_redraw();
+                } else if self.handle_tab_bar_click(cx, cy) {
+                    // Click was in the tab bar area and was handled.
                 } else {
                     // Unfocus URL bar when clicking in the page area.
                     if self.url_bar_focused {
@@ -2796,58 +3014,64 @@ impl ApplicationHandler for BrowserWindow {
                         self.request_redraw();
                     }
 
-                    let page_x = cx as f32 + self.scroll_x;
-                    let page_y = (cy as f32 - URL_BAR_HEIGHT) + self.scroll_y;
+                    let tab = self.tabs.active_tab();
+                    let page_x = cx as f32 + tab.scroll_x;
+                    let page_y = (cy as f32 - CHROME_HEIGHT) + tab.scroll_y;
 
                     // Check if click is inside an open dropdown first.
-                    if self.dropdown_open {
-                        if let Some(field) = self.form_fields.get(self.dropdown_field_idx) {
-                            let fx = field.x - self.scroll_x;
-                            let fy = field.y + URL_BAR_HEIGHT - self.scroll_y + field.height;
-                            let w = field.width;
-                            let option_h = 24.0_f32;
-                            let total_h = option_h * field.options.len() as f32;
+                    {
+                        let tab = self.tabs.active_tab();
+                        if tab.dropdown_open {
+                            let dd_idx = tab.dropdown_field_idx;
+                            if let Some(field) = tab.form_fields.get(dd_idx) {
+                                let fx = field.x - tab.scroll_x;
+                                let fy = field.y + CHROME_HEIGHT - tab.scroll_y + field.height;
+                                let w = field.width;
+                                let option_h = 24.0_f32;
+                                let total_h = option_h * field.options.len() as f32;
 
-                            let win_x = cx as f32;
-                            let win_y = cy as f32;
+                                let win_x = cx as f32;
+                                let win_y = cy as f32;
 
-                            if win_x >= fx && win_x < fx + w && win_y >= fy && win_y < fy + total_h {
-                                // Clicked inside the dropdown — select the option.
-                                let option_idx = ((win_y - fy) / option_h) as usize;
-                                let dd_idx = self.dropdown_field_idx;
-                                if let Some(field) = self.form_fields.get_mut(dd_idx) {
-                                    if option_idx < field.options.len() {
-                                        let new_val = field.options[option_idx].0.clone();
-                                        field.value = new_val.clone();
-                                        for opt in &mut field.options {
-                                            opt.2 = opt.0 == new_val;
+                                if win_x >= fx && win_x < fx + w && win_y >= fy && win_y < fy + total_h {
+                                    // Clicked inside the dropdown — select the option.
+                                    let option_idx = ((win_y - fy) / option_h) as usize;
+                                    let tab = self.tabs.active_tab_mut();
+                                    if let Some(field) = tab.form_fields.get_mut(dd_idx) {
+                                        if option_idx < field.options.len() {
+                                            let new_val = field.options[option_idx].0.clone();
+                                            field.value = new_val.clone();
+                                            for opt in &mut field.options {
+                                                opt.2 = opt.0 == new_val;
+                                            }
+                                            debug!(value = %new_val, "Select option chosen");
                                         }
-                                        debug!(value = %new_val, "Select option chosen");
                                     }
+                                    tab.dropdown_open = false;
+                                    tab.dropdown_hover_idx = None;
+                                    self.request_redraw();
+                                    return; // Don't process further clicks
                                 }
-                                self.dropdown_open = false;
-                                self.dropdown_hover_idx = None;
-                                self.request_redraw();
-                                return; // Don't process further clicks
                             }
+                            // Clicked outside the dropdown — close it.
+                            let tab = self.tabs.active_tab_mut();
+                            tab.dropdown_open = false;
+                            tab.dropdown_hover_idx = None;
+                            self.request_redraw();
                         }
-                        // Clicked outside the dropdown — close it.
-                        self.dropdown_open = false;
-                        self.dropdown_hover_idx = None;
-                        self.request_redraw();
                     }
 
                     // Check for form field clicks — focus the field.
                     // Skip fields with pointer-events: none.
                     let mut clicked_field = None;
-                    for (i, field) in self.form_fields.iter().enumerate() {
+                    for (i, field) in self.tabs.active_tab().form_fields.iter().enumerate() {
                         if field.contains(page_x, page_y) && !field.pointer_events_none {
                             clicked_field = Some(i);
                             break;
                         }
                     }
                     if let Some(idx) = clicked_field {
-                        let field_type = self.form_fields.get(idx)
+                        let field_type = self.tabs.active_tab().form_fields.get(idx)
                             .map(|f| f.field_type.clone())
                             .unwrap_or_default();
 
@@ -2857,43 +3081,45 @@ impl ApplicationHandler for BrowserWindow {
                             }
                             "checkbox" => {
                                 // Toggle checked state.
-                                if let Some(field) = self.form_fields.get_mut(idx) {
+                                if let Some(field) = self.tabs.active_tab_mut().form_fields.get_mut(idx) {
                                     field.checked = !field.checked;
                                 }
                                 self.request_redraw();
                             }
                             "radio" => {
                                 // Select this radio, deselect siblings with same name.
-                                let name = self.form_fields.get(idx)
+                                let name = self.tabs.active_tab().form_fields.get(idx)
                                     .map(|f| f.name.clone())
                                     .unwrap_or_default();
-                                let form_action = self.form_fields.get(idx)
+                                let form_action = self.tabs.active_tab().form_fields.get(idx)
                                     .map(|f| f.form_action.clone())
                                     .unwrap_or_default();
-                                for f in &mut self.form_fields {
+                                for f in &mut self.tabs.active_tab_mut().form_fields {
                                     if f.field_type == "radio" && f.name == name
                                         && f.form_action == form_action
                                     {
                                         f.checked = false;
                                     }
                                 }
-                                if let Some(field) = self.form_fields.get_mut(idx) {
+                                if let Some(field) = self.tabs.active_tab_mut().form_fields.get_mut(idx) {
                                     field.checked = true;
                                 }
                                 self.request_redraw();
                             }
                             "select" => {
                                 // Open the dropdown overlay.
-                                if self.dropdown_open && self.dropdown_field_idx == idx {
+                                let tab = self.tabs.active_tab_mut();
+                                if tab.dropdown_open && tab.dropdown_field_idx == idx {
                                     // Already open — close it.
-                                    self.dropdown_open = false;
-                                    self.dropdown_hover_idx = None;
+                                    tab.dropdown_open = false;
+                                    tab.dropdown_hover_idx = None;
                                 } else {
-                                    self.dropdown_open = true;
-                                    self.dropdown_field_idx = idx;
-                                    self.dropdown_hover_idx = None;
+                                    tab.dropdown_open = true;
+                                    tab.dropdown_field_idx = idx;
+                                    tab.dropdown_hover_idx = None;
                                 }
-                                self.focused_field = Some(idx);
+                                let tab = self.tabs.active_tab_mut();
+                                tab.focused_field = Some(idx);
                                 self.request_redraw();
                             }
                             "hidden" => {
@@ -2901,24 +3127,26 @@ impl ApplicationHandler for BrowserWindow {
                             }
                             _ => {
                                 // Focus the text field and position cursor.
-                                self.focused_field = Some(idx);
-                                self.cursor_visible = true;
-                                self.cursor_blink_time = Instant::now();
+                                let tab = self.tabs.active_tab_mut();
+                                tab.focused_field = Some(idx);
+                                tab.cursor_visible = true;
+                                tab.cursor_blink_time = Instant::now();
                                 // Position cursor based on click x within the field.
-                                let field_screen_x = self.form_fields[idx].x - self.scroll_x + 4.0;
+                                let field_screen_x = tab.form_fields[idx].x - tab.scroll_x + 4.0;
                                 let approx_char_w = 14.0_f32 * 0.6;
                                 let click_offset = (cx as f32 - field_screen_x).max(0.0);
                                 let char_pos = (click_offset / approx_char_w).round() as usize;
-                                self.form_cursor_pos = char_pos.min(self.form_fields[idx].value.len());
-                                self.dropdown_open = false;
+                                tab.form_cursor_pos = char_pos.min(tab.form_fields[idx].value.len());
+                                tab.dropdown_open = false;
                             }
                         }
                         self.request_redraw();
                     } else {
-                        if self.focused_field.is_some() || self.dropdown_open {
-                            self.focused_field = None;
-                            self.dropdown_open = false;
-                            self.dropdown_hover_idx = None;
+                        let tab = self.tabs.active_tab_mut();
+                        if tab.focused_field.is_some() || tab.dropdown_open {
+                            tab.focused_field = None;
+                            tab.dropdown_open = false;
+                            tab.dropdown_hover_idx = None;
                             self.request_redraw();
                         }
                     }
@@ -2928,10 +3156,12 @@ impl ApplicationHandler for BrowserWindow {
                         let url = url.to_string();
                         let target = target.to_string();
                         if target == "_blank" {
-                            warn!("target=\"_blank\" not yet supported (no tabs) — navigating in same window");
+                            info!(url = %url, "target=\"_blank\" — opening in new tab");
+                            self.open_new_tab(&url);
+                        } else {
+                            info!(url = %url, "Link clicked — navigating");
+                            self.navigate_in_place(&url);
                         }
-                        info!(url = %url, "Link clicked — navigating");
-                        self.navigate_in_place(&url);
                     }
                 }
             }
@@ -2946,9 +3176,14 @@ impl ApplicationHandler for BrowserWindow {
                 let cy = self.cursor_y;
                 if let Some((url, _target)) = self.hit_test_with_target(cx, cy) {
                     let url = url.to_string();
-                    info!(url = %url, "Middle-click on link — navigating (tabs not yet supported)");
-                    self.navigate_in_place(&url);
+                    info!(url = %url, "Middle-click on link — opening in new tab");
+                    self.open_new_tab(&url);
                 }
+            }
+
+            // ── Modifier key state tracking ──────────────────────────
+            WindowEvent::ModifiersChanged(new_modifiers) => {
+                self.modifiers = new_modifiers;
             }
 
             _ => {}

@@ -3842,10 +3842,15 @@ fn build_layout_box(
 /// both margins as spacing. This function post-processes the LayoutBox tree
 /// to shift children up by the overlap amount.
 ///
-/// For each pair of adjacent block children `(i-1, i)`:
-///   - overlap = margin_bottom[i-1] + margin_top[i] - max(margin_bottom[i-1], margin_top[i])
-///   - Shift child[i] and all subsequent children UP by `overlap`
+/// For each pair of adjacent *visible* block children:
+///   - overlap = margin_bottom[prev] + margin_top[curr] - max(margin_bottom[prev], margin_top[curr])
+///   - Shift curr and all subsequent children UP by `overlap`
 ///   - Reduce the parent's height by `overlap`
+///
+/// Zero-height children (e.g. display:none elements that produce an empty
+/// block box) are skipped when searching for adjacent siblings so they do
+/// not break margin collapsing between the two real visible blocks around
+/// them.  Any margins on the zero-height box itself are also collapsed away.
 fn collapse_sibling_margins(parent: &mut LayoutBox) {
     if parent.children.len() < 2 {
         return;
@@ -3868,20 +3873,50 @@ fn collapse_sibling_margins(parent: &mut LayoutBox) {
         _ => {}
     }
 
-    // Accumulate total overlap so we can reduce the parent's height.
+    // First pass: collapse away zero-height block boxes by shifting all
+    // subsequent siblings up by the zero-height box's total vertical margin
+    // contribution.  A display:none element should not occupy any vertical
+    // space at all, including its margins.
+    let mut total_zero_height_shift = 0.0_f32;
+    for i in 0..parent.children.len() {
+        let child = &parent.children[i];
+        let is_block = matches!(child.content, LayoutContent::Block);
+        if is_block && child.height < 0.5 {
+            let mt = get_margin_value(&child.style, "margin-top");
+            let mb = get_margin_value(&child.style, "margin-bottom");
+            let margin_space = mt + mb;
+            if margin_space > 0.5 {
+                // Shift this child and all subsequent children up.
+                for j in i..parent.children.len() {
+                    parent.children[j].y -= margin_space;
+                    shift_children_y(&mut parent.children[j], -margin_space);
+                }
+                total_zero_height_shift += margin_space;
+            }
+        }
+    }
+    if total_zero_height_shift > 0.5 {
+        parent.height -= total_zero_height_shift;
+    }
+
+    // Second pass: collapse margins between adjacent visible block children,
+    // skipping zero-height blocks that should be invisible.
     let mut total_overlap = 0.0_f32;
 
-    for i in 1..parent.children.len() {
-        // Only collapse between block-level children.
-        let prev_is_block = matches!(parent.children[i - 1].content, LayoutContent::Block);
-        let curr_is_block = matches!(parent.children[i].content, LayoutContent::Block);
+    // Collect indices of visible block children (height >= 0.5).
+    let visible_block_indices: Vec<usize> = (0..parent.children.len())
+        .filter(|&i| {
+            let child = &parent.children[i];
+            matches!(child.content, LayoutContent::Block) && child.height >= 0.5
+        })
+        .collect();
 
-        if !prev_is_block || !curr_is_block {
-            continue;
-        }
+    for pair in visible_block_indices.windows(2) {
+        let prev_idx = pair[0];
+        let curr_idx = pair[1];
 
-        let prev_margin_bottom = get_margin_value(&parent.children[i - 1].style, "margin-bottom");
-        let curr_margin_top = get_margin_value(&parent.children[i].style, "margin-top");
+        let prev_margin_bottom = get_margin_value(&parent.children[prev_idx].style, "margin-bottom");
+        let curr_margin_top = get_margin_value(&parent.children[curr_idx].style, "margin-top");
 
         if prev_margin_bottom <= 0.0 && curr_margin_top <= 0.0 {
             continue;
@@ -3891,8 +3926,8 @@ fn collapse_sibling_margins(parent: &mut LayoutBox) {
         let overlap = (prev_margin_bottom + curr_margin_top) - collapsed;
 
         if overlap > 0.5 {
-            // Shift child[i] and all subsequent children up by `overlap`.
-            for j in i..parent.children.len() {
+            // Shift child[curr_idx] and all subsequent children up by `overlap`.
+            for j in curr_idx..parent.children.len() {
                 parent.children[j].y -= overlap;
                 shift_children_y(&mut parent.children[j], -overlap);
             }
@@ -3962,13 +3997,24 @@ fn collapse_parent_child_margins(parent: &mut LayoutBox) {
         return;
     }
 
-    // Only collapse with the first child if it is block-level.
-    if !matches!(parent.children[0].content, LayoutContent::Block) {
-        return;
-    }
+    // Find the first visible block child (skip zero-height boxes from
+    // display:none elements that should not participate in collapsing).
+    let first_visible = parent.children.iter().position(|c| {
+        matches!(c.content, LayoutContent::Block) && c.height >= 0.5
+    });
+    let first_idx = match first_visible {
+        Some(idx) => idx,
+        None => {
+            // No visible block child — check if children[0] is block at all.
+            if !matches!(parent.children[0].content, LayoutContent::Block) {
+                return;
+            }
+            0
+        }
+    };
 
-    // Get the first child's margin-top.
-    let first_child_margin_top = get_margin_value(&parent.children[0].style, "margin-top");
+    // Get the first visible child's margin-top.
+    let first_child_margin_top = get_margin_value(&parent.children[first_idx].style, "margin-top");
 
     // Get the parent's margin-top.
     let parent_margin_top = get_margin_value(&parent.style, "margin-top");

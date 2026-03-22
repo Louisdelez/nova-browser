@@ -636,6 +636,7 @@ fn add_node(
                 }
 
                 let mut taffy_style = build_taffy_style(&display, tag, attributes, viewport);
+                // Form field dimensions are computed and forced onto Taffy.
                 // Override taffy dimensions with the computed form field size.
                 // `build_taffy_style` may leave width/height as Auto for inline
                 // elements, which collapses to zero when there are no children.
@@ -1367,6 +1368,13 @@ fn is_inline_node(node: &DomNode) -> bool {
         DomNode::Text(_) => true,
         DomNode::Comment(_) => true,
         DomNode::Element { tag, attributes, .. } => {
+            // Form elements are handled as block-level by add_node (which has
+            // a dedicated form field handler). They must NOT be treated as
+            // inline content here, or they'll get swallowed by the IFC and
+            // never reach the form field code path.
+            if matches!(tag.as_str(), "input" | "button" | "select" | "textarea") {
+                return false;
+            }
             let display = resolve_display(tag, attributes);
             matches!(display.as_str(), "inline" | "inline-block")
                 || tag == "br" || tag == "img"

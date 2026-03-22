@@ -229,7 +229,8 @@ impl NovaMod for CssEngineMod {
                 // styles as data-nova-style attributes.
                 // Use the parallel cascade for large DOMs (it falls back to
                 // sequential for small DOMs internally).
-                let styled_dom = parallel::parallel_compute_styles(dom_node, &extra_css, viewport_width);
+                // Use sequential cascade (parallel cascade has bugs that strip form elements)
+                let styled_dom = cascade::compute_styles(dom_node, &extra_css, viewport_width);
 
                 Ok(TypedData::Dom(styled_dom))
             }

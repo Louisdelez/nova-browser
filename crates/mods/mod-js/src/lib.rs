@@ -232,13 +232,19 @@ impl NovaMod for JsMod {
                     }
                 };
 
-                // Export the (potentially mutated) DOM back.
-                let mutated_dom = tree.lock().unwrap().to_dom();
-                debug!(?value, "ExecScriptWithDom: script returned");
+                // Export the (potentially mutated) DOM back and SPA state.
+                let tree_guard = tree.lock().unwrap();
+                let mutated_dom = tree_guard.to_dom();
+                let push_state_url = tree_guard.push_state_url.clone();
+                let replace_state_url = tree_guard.replace_state_url.clone();
+                drop(tree_guard);
+                debug!(?value, ?push_state_url, ?replace_state_url, "ExecScriptWithDom: script returned");
 
                 Ok(TypedData::JsResultWithDom {
                     value,
                     dom: Box::new(mutated_dom),
+                    push_state_url,
+                    replace_state_url,
                 })
             }
 
@@ -285,10 +291,16 @@ impl NovaMod for JsMod {
                         js_ctx.quickjs.as_ref().unwrap().eval(&dispatch_script)
                     };
 
-                    let mutated_dom = tree.lock().unwrap().to_dom();
+                    let tree_guard = tree.lock().unwrap();
+                    let mutated_dom = tree_guard.to_dom();
+                    let push_state_url = tree_guard.push_state_url.clone();
+                    let replace_state_url = tree_guard.replace_state_url.clone();
+                    drop(tree_guard);
                     return Ok(TypedData::JsResultWithDom {
                         value,
                         dom: Box::new(mutated_dom),
+                        push_state_url,
+                        replace_state_url,
                     });
                 }
 
@@ -309,10 +321,16 @@ impl NovaMod for JsMod {
                     last = eval_script_with_env_and_core(&cb_source, Arc::clone(&tree), &captured_env, self.core.as_ref());
                 }
 
-                let mutated_dom = tree.lock().unwrap().to_dom();
+                let tree_guard = tree.lock().unwrap();
+                let mutated_dom = tree_guard.to_dom();
+                let push_state_url = tree_guard.push_state_url.clone();
+                let replace_state_url = tree_guard.replace_state_url.clone();
+                drop(tree_guard);
                 Ok(TypedData::JsResultWithDom {
                     value: last,
                     dom: Box::new(mutated_dom),
+                    push_state_url,
+                    replace_state_url,
                 })
             }
 

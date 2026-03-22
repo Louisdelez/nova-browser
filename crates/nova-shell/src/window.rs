@@ -286,6 +286,18 @@ pub struct BrowserWindow {
     tooltip_y: f32,
     /// Time when the cursor started hovering over the element with a title.
     tooltip_hover_start: Option<Instant>,
+
+    // -- Notification toast --
+    /// Text to display as a brief notification overlay.
+    notification_text: String,
+    /// When the notification was shown (used for auto-dismiss after ~2 seconds).
+    notification_time: Option<Instant>,
+
+    // -- Page status indicators --
+    /// Whether the current page returned a 404 status.
+    is_404: bool,
+    /// Raw HTML source of the current page (for Ctrl+U view source).
+    page_source_html: Option<String>,
 }
 
 impl BrowserWindow {
@@ -363,6 +375,10 @@ impl BrowserWindow {
             tooltip_x: 0.0,
             tooltip_y: 0.0,
             tooltip_hover_start: None,
+            notification_text: String::new(),
+            notification_time: None,
+            is_404: false,
+            page_source_html: None,
         };
 
         // Autofocus: find the first form field with autofocus and set it as focused.
@@ -916,6 +932,27 @@ impl BrowserWindow {
 
         // Draw tooltip overlay (after a 500ms hover delay).
         self.draw_tooltip();
+
+        // Draw notification toast overlay (if active).
+        self.draw_notification_overlay();
+
+        // Draw 404 indicator in the URL bar area.
+        if self.is_404 {
+            let indicator_x = self.width as f32 - URL_BAR_PADDING - 60.0;
+            let indicator_y = (URL_BAR_HEIGHT - 12.0) / 2.0;
+            let color_404 = Color { r: 0.9, g: 0.5, b: 0.0, a: 0.9 };
+            self.framebuffer.draw_text(
+                indicator_x,
+                indicator_y,
+                "404",
+                12.0,
+                color_404,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
     }
 
     /// Draw a tooltip overlay if hovering over an element with a `title` attribute.
@@ -2189,7 +2226,7 @@ impl BrowserWindow {
                 self.request_redraw();
             }
             Err(e) => {
-                error!("POST navigation failed: {e}");
+                self.show_notification(&format!("POST navigation failed: {e}"));
                 self.request_redraw();
             }
         }
@@ -2583,7 +2620,7 @@ impl BrowserWindow {
 
     /// Open a new tab and navigate to the given URL.
     fn open_new_tab(&mut self, url: &str) {
-        let commands = RenderCommands { ops: vec![], fonts: vec![] };
+        let commands = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None };
         self.tabs.new_tab(url, commands);
         self.sync_url_bar_from_active_tab();
 
@@ -2685,6 +2722,14 @@ impl BrowserWindow {
         match result {
             Ok(TypedData::RenderCommands(cmds)) => {
                 info!("In-place navigation successful! {} render ops", cmds.ops.len());
+
+                // Check if JS used pushState/replaceState to set a different URL.
+                let spa_push = cmds.spa_push_url.clone();
+                let spa_replace = cmds.spa_replace_url.clone();
+                let effective_url = spa_push.as_deref()
+                    .or(spa_replace.as_deref())
+                    .unwrap_or(url);
+
                 let tab = self.tabs.active_tab_mut();
                 tab.hit_regions = Self::extract_hit_regions(&cmds);
                 tab.form_fields = Self::extract_form_fields(&cmds);
@@ -2699,19 +2744,23 @@ impl BrowserWindow {
                 tab.render_commands = cmds;
                 tab.scroll_y = 0.0;
                 tab.scroll_x = 0.0;
-                tab.url = url.to_string();
-                tab.title = url.to_string();
+                tab.url = effective_url.to_string();
+                tab.title = effective_url.to_string();
 
-                // Push to navigation history.
-                tab.history.push(url);
+                // Push or replace in navigation history depending on SPA mode.
+                if spa_replace.is_some() {
+                    tab.history.replace_current(effective_url);
+                } else {
+                    tab.history.push(effective_url);
+                }
 
                 self.url_bar_focused = false;
                 self.url_bar_select_all = false;
-                self.url_bar_text = url.to_string();
+                self.url_bar_text = effective_url.to_string();
                 self.url_bar_cursor = self.url_bar_text.len();
 
                 // Record in persistent history.
-                self.persistent_history.record(url, url);
+                self.persistent_history.record(effective_url, effective_url);
 
                 // Update window title.
                 if let Some(w) = &self.window {
@@ -2731,7 +2780,7 @@ impl BrowserWindow {
                 self.request_redraw();
             }
             Err(e) => {
-                error!("Navigation failed: {e}");
+                self.show_notification(&format!("Navigation failed: {e}"));
                 self.request_redraw();
             }
         }
@@ -2824,9 +2873,135 @@ impl BrowserWindow {
                 self.request_redraw();
             }
             Err(e) => {
-                error!("Navigation failed: {e}");
+                self.show_notification(&format!("Navigation failed: {e}"));
                 self.request_redraw();
             }
+        }
+    }
+
+    /// Show a brief notification toast that auto-dismisses after ~2 seconds.
+    fn show_notification(&mut self, text: &str) {
+        info!("Notification: {text}");
+        self.notification_text = text.to_string();
+        self.notification_time = Some(Instant::now());
+        self.request_redraw();
+    }
+
+    /// Draw the notification toast overlay (if active).
+    fn draw_notification_overlay(&mut self) {
+        let elapsed = match self.notification_time {
+            Some(t) => t.elapsed().as_millis(),
+            None => return,
+        };
+        if elapsed > 2000 || self.notification_text.is_empty() {
+            // Auto-dismiss after 2 seconds.
+            self.notification_text.clear();
+            self.notification_time = None;
+            return;
+        }
+        // Draw a semi-transparent background bar at the bottom of the window.
+        let bar_h = 36.0_f32;
+        let bar_y = self.height as f32 - bar_h;
+        let bg_color = Color { r: 0.15, g: 0.15, b: 0.15, a: 0.85 };
+        self.framebuffer.fill_rect(0.0, bar_y, self.width as f32, bar_h, bg_color);
+        let text_color = Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+        self.framebuffer.draw_text(
+            12.0,
+            bar_y + 10.0,
+            &self.notification_text,
+            13.0,
+            text_color,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// Save the current page as a PNG screenshot.
+    fn save_screenshot(&mut self) {
+        let w = self.width;
+        let h = self.height;
+        let pixels = self.framebuffer.pixels.clone();
+        // Build a PNG file from the raw RGBA pixel data.
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let filename = format!("nova_screenshot_{timestamp}.png");
+        let path = std::env::current_dir()
+            .unwrap_or_default()
+            .join(&filename);
+
+        // Spawn encoding on a background thread so we don't block the event loop.
+        let path_clone = path.clone();
+        std::thread::spawn(move || {
+            let file = match std::fs::File::create(&path_clone) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!("Failed to create screenshot file: {e}");
+                    return;
+                }
+            };
+            let ref_file = std::io::BufWriter::new(file);
+            let mut encoder = png::Encoder::new(ref_file, w, h);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            if let Ok(mut writer) = encoder.write_header() {
+                let _ = writer.write_image_data(&pixels);
+            }
+        });
+
+        self.show_notification(&format!("Screenshot saved: {filename}"));
+    }
+
+    /// View the source HTML of the current page.
+    fn view_source(&mut self) {
+        if let Some(ref html) = self.page_source_html {
+            let url = self.tabs.active_tab().url.clone();
+            let escaped = html.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            let source_page_html = format!(
+                r#"<html><head><title>View Source: {url}</title>
+<style>
+body {{ margin: 0; padding: 16px; background: #1e1e1e; color: #d4d4d4; }}
+pre {{ font-family: monospace; font-size: 13px; white-space: pre-wrap; word-wrap: break-word; line-height: 1.5; }}
+</style></head>
+<body><pre>{escaped}</pre></body></html>"#
+            );
+            let core = self.core.clone();
+            let viewport = self.viewport;
+            let handle = self.tokio_handle.clone();
+            let source_url = format!("view-source:{url}");
+
+            let result = std::thread::spawn(move || {
+                handle.block_on(async {
+                    core.pipeline.render_html_string(&source_page_html, viewport).await
+                })
+            })
+            .join()
+            .map_err(|_| nova_mod_api::NovaError::Internal("view-source thread panicked".into()))
+            .and_then(|r| r);
+
+            match result {
+                Ok(TypedData::RenderCommands(cmds)) => {
+                    info!("View source rendered, {} ops", cmds.ops.len());
+                    self.tabs.new_tab(&source_url, cmds.clone());
+                    let tab = self.tabs.active_tab_mut();
+                    tab.hit_regions = Self::extract_hit_regions(&cmds);
+                    tab.form_fields = Self::extract_form_fields(&cmds);
+                    tab.anchor_regions = Self::extract_anchor_regions(&cmds);
+                    tab.content_height = Self::compute_content_height(&cmds);
+                    tab.content_width = Self::compute_content_width(&cmds);
+                    tab.render_commands = cmds;
+
+                    self.sync_url_bar_from_active_tab();
+                    self.request_redraw();
+                }
+                _ => {
+                    self.show_notification("Failed to render page source");
+                }
+            }
+        } else {
+            self.show_notification("No page source available");
         }
     }
 
@@ -2861,6 +3036,10 @@ impl BrowserWindow {
 
 impl ApplicationHandler for BrowserWindow {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let notification_active = self.notification_time
+            .map(|t| t.elapsed().as_millis() < 2000)
+            .unwrap_or(false);
+
         // When a text field is focused, schedule periodic redraws for cursor blinking.
         if self.tabs.active_tab().focused_field.is_some() {
             let tab = self.tabs.active_tab_mut();
@@ -2876,6 +3055,11 @@ impl ApplicationHandler for BrowserWindow {
             // Wake up again in 500ms for the next blink toggle.
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + std::time::Duration::from_millis(500),
+            ));
+        } else if notification_active {
+            // Wake up soon to dismiss the notification.
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + std::time::Duration::from_millis(100),
             ));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
@@ -3119,6 +3303,18 @@ impl ApplicationHandler for BrowserWindow {
                     // Ctrl+R: Reload current page.
                     if key_str == Some("r") && is_ctrl_combo {
                         self.reload();
+                        return;
+                    }
+
+                    // Ctrl+P: Save page as PNG screenshot.
+                    if key_str == Some("p") && is_ctrl_combo {
+                        self.save_screenshot();
+                        return;
+                    }
+
+                    // Ctrl+U: View page source.
+                    if key_str == Some("u") && is_ctrl_combo {
+                        self.view_source();
                         return;
                     }
                 }

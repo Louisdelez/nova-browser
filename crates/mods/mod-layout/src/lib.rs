@@ -1003,10 +1003,63 @@ fn add_node(
             // search forms and other noscript content.
             let force_hidden = matches!(
                 tag.as_str(),
-                "script" | "style" | "template" | "head" | "meta" | "link" | "title"
+                "script" | "style" | "template" | "head" | "meta" | "link" | "title" | "rp"
             );
 
-            let display = if force_hidden {
+            // <dialog> is hidden by default; only shown when `open` attribute is present.
+            let dialog_hidden = tag == "dialog"
+                && !attributes.iter().any(|(k, _)| k == "open");
+
+            // aria-hidden="true" hides the element from rendering.
+            let aria_hidden = attributes
+                .iter()
+                .any(|(k, v)| k == "aria-hidden" && v == "true");
+
+            // <picture> is a transparent container — render its <img> child directly.
+            // Skip <source> children (they are selection hints, not rendered).
+            if tag == "picture" {
+                // Find the <img> child and layout that; skip <source> elements.
+                for child in children {
+                    if let DomNode::Element { tag: ct, .. } = child {
+                        if ct == "img" {
+                            return add_node(taffy, child, available_width, parent_font_size, parent_style_props, viewport, depth + 1);
+                        }
+                    }
+                }
+                // No <img> found — treat as empty block.
+                let ctx = NodeContext {
+                    content: LayoutContent::Block,
+                    style: StyleMap::default(),
+                };
+                return taffy
+                    .new_leaf_with_context(
+                        Style {
+                            display: Display::None,
+                            ..Style::DEFAULT
+                        },
+                        ctx,
+                    )
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+            }
+
+            // <map> and <area> elements are not visually rendered.
+            if matches!(tag.as_str(), "map" | "area") {
+                let ctx = NodeContext {
+                    content: LayoutContent::Block,
+                    style: StyleMap::default(),
+                };
+                return taffy
+                    .new_leaf_with_context(
+                        Style {
+                            display: Display::None,
+                            ..Style::DEFAULT
+                        },
+                        ctx,
+                    )
+                    .map_err(|e| NovaError::LayoutError(format!("Taffy error: {e:?}")));
+            }
+
+            let display = if force_hidden || dialog_hidden || aria_hidden {
                 "none".to_string()
             } else {
                 resolve_display(tag, attributes)
@@ -1340,9 +1393,13 @@ fn add_node(
                 taffy_style.flex_wrap = FlexWrap::Wrap;
             }
 
-            let content_type = match display.as_str() {
-                "inline" | "table-cell" | "table-row" => LayoutContent::Inline,
-                _ => LayoutContent::Block,
+            let content_type = if tag == "dialog" {
+                LayoutContent::Dialog
+            } else {
+                match display.as_str() {
+                    "inline" | "table-cell" | "table-row" => LayoutContent::Inline,
+                    _ => LayoutContent::Block,
+                }
             };
 
             let style_map = StyleMap {
@@ -2007,7 +2064,11 @@ fn flatten_node_recursive(
         }
         DomNode::Element { tag, children, attributes, .. } => {
             // Skip elements that should never produce inline content.
-            if matches!(tag.as_str(), "script" | "style" | "template") {
+            if matches!(tag.as_str(), "script" | "style" | "template" | "rp" | "map" | "area" | "source") {
+                return;
+            }
+            // aria-hidden="true" hides the element from rendering.
+            if attributes.iter().any(|(k, v)| k == "aria-hidden" && v == "true") {
                 return;
             }
             // Check for display: none.
@@ -2020,6 +2081,16 @@ fn flatten_node_recursive(
                 // We'll handle this during line-breaking.
                 items.push(InlineItem::Word {
                     text: "\n".to_string(),
+                    width: 0.0,
+                    style: style_props.to_vec(),
+                });
+                return;
+            }
+            // <wbr> — word break opportunity: zero-width space that allows
+            // the line-breaking algorithm to break here if needed.
+            if tag == "wbr" {
+                items.push(InlineItem::Word {
+                    text: "\u{200B}".to_string(), // zero-width space
                     width: 0.0,
                     style: style_props.to_vec(),
                 });
@@ -5197,15 +5268,17 @@ fn display_for_tag(tag: &str) -> &'static str {
     match tag {
         "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "body" | "html" | "section"
         | "article" | "header" | "footer" | "nav" | "main" | "ul" | "ol" | "li"
-        | "blockquote" | "pre" | "form" | "hr" | "center" => "block",
+        | "blockquote" | "pre" | "form" | "hr" | "center" | "dialog" => "block",
         // Table elements get special display modes for proper layout.
         "table" | "thead" | "tbody" | "tfoot" => "block",
         "tr" => "table-row",
         "td" | "th" => "table-cell",
         "span" | "a" | "em" | "strong" | "b" | "i" | "u" | "code" | "small" | "br" | "img"
         | "input" | "label" | "select" | "button" | "textarea"
-        | "nova-before" | "nova-after" | "video" | "audio" => "inline",
-        "head" | "title" | "meta" | "link" | "style" | "script" => "none",
+        | "nova-before" | "nova-after" | "video" | "audio"
+        | "output" | "time" | "wbr" | "ruby" | "rt" => "inline",
+        "head" | "title" | "meta" | "link" | "style" | "script" | "template"
+        | "rp" | "map" | "area" => "none",
         _ => "block",
     }
 }

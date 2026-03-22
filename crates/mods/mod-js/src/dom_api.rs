@@ -437,6 +437,12 @@ pub struct JsDomTree {
     checked: HashMap<ElementHandle, bool>,
     /// Pending navigation URL set by `window.location.href = url` or `location.assign()`.
     pub pending_navigation: Option<String>,
+    /// URL set by `history.pushState()` — update URL bar without reloading.
+    pub push_state_url: Option<String>,
+    /// URL set by `history.replaceState()` — replace current history entry without reloading.
+    pub replace_state_url: Option<String>,
+    /// The current page URL (set during initialization, updated by pushState/replaceState).
+    pub current_url: String,
 }
 
 impl JsDomTree {
@@ -454,6 +460,9 @@ impl JsDomTree {
             values: HashMap::new(),
             checked: HashMap::new(),
             pending_navigation: None,
+            push_state_url: None,
+            replace_state_url: None,
+            current_url: String::new(),
         };
 
         // Reserve handle 0 for the document root.

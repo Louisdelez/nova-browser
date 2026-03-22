@@ -289,6 +289,26 @@ pub fn register_bridge_functions<'js>(
         })))?;
     }
 
+    // pushState(url) — SPA navigation: update URL without page reload
+    {
+        let t = tree.clone();
+        nova.set("pushState", Func::from(MutFn::new(move |url: String| {
+            let mut tree = t.lock().unwrap();
+            tree.push_state_url = Some(url.clone());
+            tree.current_url = url;
+        })))?;
+    }
+
+    // replaceState(url) — SPA navigation: replace current history entry without reload
+    {
+        let t = tree.clone();
+        nova.set("replaceState", Func::from(MutFn::new(move |url: String| {
+            let mut tree = t.lock().unwrap();
+            tree.replace_state_url = Some(url.clone());
+            tree.current_url = url;
+        })))?;
+    }
+
     // getTagName(handle) -> string
     {
         let t = tree.clone();
@@ -2606,8 +2626,9 @@ pub const JS_DOM_SHIM: &str = r#"
             Object.defineProperty(location, 'href', {
                 get: function() { return __locData.href; },
                 set: function(url) {
-                    __locData.href = url;
-                    __nova.requestNavigation(url);
+                    var resolved = __resolveUrl(url);
+                    __locData.href = resolved;
+                    __nova.requestNavigation(resolved);
                 },
                 configurable: true
             });
@@ -2650,7 +2671,14 @@ pub const JS_DOM_SHIM: &str = r#"
             Object.defineProperty(location, 'hash', {
                 get: function() { return __locData.hash; },
                 set: function(v) {
-                    __locData.hash = v;
+                    var oldHash = __locData.hash;
+                    var oldUrl = __locData.href;
+                    __locData.hash = v.charAt(0) === '#' ? v : '#' + v;
+                    __locData.href = __locData.origin + __locData.pathname + __locData.search + __locData.hash;
+                    // Fire hashchange event if hash actually changed.
+                    if (oldHash !== __locData.hash) {
+                        __fireWindowEvent('hashchange', { oldURL: oldUrl, newURL: __locData.href });
+                    }
                 },
                 configurable: true
             });
@@ -2659,10 +2687,10 @@ pub const JS_DOM_SHIM: &str = r#"
                 configurable: true
             });
             location.assign = function(url) {
-                __nova.requestNavigation(url);
+                __nova.requestNavigation(__resolveUrl(url));
             };
             location.replace = function(url) {
-                __nova.requestNavigation(url);
+                __nova.requestNavigation(__resolveUrl(url));
             };
             location.reload = function() {
                 __nova.requestNavigation(__locData.href);
@@ -2672,33 +2700,149 @@ pub const JS_DOM_SHIM: &str = r#"
         } catch(e) {}
 
         // ── window.history ───────────────────────────────────────────────────
-        var __historyStack = [__currentUrl];
+        var __historyStack = [{ url: __currentUrl, state: null }];
         var __historyIndex = 0;
+
+        // Helper: resolve a possibly-relative URL against the current page URL.
+        function __resolveUrl(url) {
+            if (!url) return __locData.href;
+            // Already absolute
+            if (/^https?:\/\//.test(url)) return url;
+            // Protocol-relative
+            if (url.indexOf('//') === 0) return __locData.protocol + url;
+            // Absolute path
+            if (url.charAt(0) === '/') return __locData.origin + url;
+            // Hash-only
+            if (url.charAt(0) === '#') return __locData.origin + __locData.pathname + __locData.search + url;
+            // Query-only
+            if (url.charAt(0) === '?') return __locData.origin + __locData.pathname + url;
+            // Relative path — resolve against current directory
+            var base = __locData.pathname.substring(0, __locData.pathname.lastIndexOf('/') + 1);
+            return __locData.origin + base + url;
+        }
+
+        // Helper: update __locData from a full URL string.
+        function __updateLocData(fullUrl) {
+            var m = fullUrl.match(/^(https?:)\/\/([^/:]+)(:\d+)?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
+            if (m) {
+                __locData.href = fullUrl;
+                __locData.protocol = m[1] || "";
+                __locData.hostname = m[2] || "";
+                __locData.port = (m[3] || "").replace(":", "");
+                __locData.host = __locData.hostname + (__locData.port ? ":" + __locData.port : "");
+                __locData.pathname = m[4] || "/";
+                __locData.search = m[5] || "";
+                __locData.hash = m[6] || "";
+                __locData.origin = __locData.protocol + "//" + __locData.host;
+            }
+        }
+
+        var __historyState = null;
 
         window.history = {
             get length() { return __historyStack.length; },
-            get state() { return null; },
+            get state() { return __historyState; },
             pushState: function(state, title, url) {
+                var resolvedUrl = __resolveUrl(url);
+                var oldHash = __locData.hash;
                 __historyStack.splice(__historyIndex + 1);
-                __historyStack.push(url || __currentUrl);
+                __historyStack.push({ url: resolvedUrl, state: state });
                 __historyIndex = __historyStack.length - 1;
+                __historyState = state;
+                __updateLocData(resolvedUrl);
+                // Signal to the Rust side that the URL changed via pushState.
+                if (typeof __nova !== 'undefined' && __nova.pushState) {
+                    __nova.pushState(resolvedUrl);
+                }
+                // Fire hashchange if the hash changed.
+                var newHash = __locData.hash;
+                if (oldHash !== newHash) {
+                    __fireWindowEvent('hashchange', { oldURL: __locData.origin + __locData.pathname + __locData.search + oldHash, newURL: resolvedUrl });
+                }
             },
             replaceState: function(state, title, url) {
-                __historyStack[__historyIndex] = url || __currentUrl;
+                var resolvedUrl = __resolveUrl(url);
+                __historyStack[__historyIndex] = { url: resolvedUrl, state: state };
+                __historyState = state;
+                __updateLocData(resolvedUrl);
+                // Signal to the Rust side that the URL changed via replaceState.
+                if (typeof __nova !== 'undefined' && __nova.replaceState) {
+                    __nova.replaceState(resolvedUrl);
+                }
             },
             back: function() {
-                if (__historyIndex > 0) __historyIndex--;
+                if (__historyIndex > 0) {
+                    var oldUrl = __locData.href;
+                    var oldHash = __locData.hash;
+                    __historyIndex--;
+                    var entry = __historyStack[__historyIndex];
+                    var newUrl = (typeof entry === 'object') ? entry.url : entry;
+                    __historyState = (typeof entry === 'object') ? entry.state : null;
+                    __updateLocData(newUrl);
+                    __fireWindowEvent('popstate', { state: __historyState });
+                    if (oldHash !== __locData.hash) {
+                        __fireWindowEvent('hashchange', { oldURL: oldUrl, newURL: newUrl });
+                    }
+                }
             },
             forward: function() {
-                if (__historyIndex < __historyStack.length - 1) __historyIndex++;
+                if (__historyIndex < __historyStack.length - 1) {
+                    var oldUrl = __locData.href;
+                    var oldHash = __locData.hash;
+                    __historyIndex++;
+                    var entry = __historyStack[__historyIndex];
+                    var newUrl = (typeof entry === 'object') ? entry.url : entry;
+                    __historyState = (typeof entry === 'object') ? entry.state : null;
+                    __updateLocData(newUrl);
+                    __fireWindowEvent('popstate', { state: __historyState });
+                    if (oldHash !== __locData.hash) {
+                        __fireWindowEvent('hashchange', { oldURL: oldUrl, newURL: newUrl });
+                    }
+                }
             },
             go: function(delta) {
                 var newIndex = __historyIndex + (delta || 0);
                 if (newIndex >= 0 && newIndex < __historyStack.length) {
+                    var oldUrl = __locData.href;
+                    var oldHash = __locData.hash;
                     __historyIndex = newIndex;
+                    var entry = __historyStack[__historyIndex];
+                    var newUrl = (typeof entry === 'object') ? entry.url : entry;
+                    __historyState = (typeof entry === 'object') ? entry.state : null;
+                    __updateLocData(newUrl);
+                    __fireWindowEvent('popstate', { state: __historyState });
+                    if (oldHash !== __locData.hash) {
+                        __fireWindowEvent('hashchange', { oldURL: oldUrl, newURL: newUrl });
+                    }
                 }
             }
         };
+
+        // ── Event dispatch helpers for popstate / hashchange ─────────────────
+        // These fire both `on*` handlers and `addEventListener` listeners.
+        function __fireWindowEvent(type, eventObj) {
+            eventObj.type = type;
+            eventObj.target = window;
+            eventObj.bubbles = false;
+            eventObj.cancelable = false;
+            eventObj.defaultPrevented = false;
+            eventObj.preventDefault = function() {};
+            eventObj.stopPropagation = function() {};
+            // Fire on* handler.
+            var handler = window['on' + type];
+            if (typeof handler === 'function') {
+                try { handler(eventObj); } catch(e) {}
+            }
+            // Fire addEventListener listeners.
+            if (typeof __windowListeners !== 'undefined') {
+                var cbs = __windowListeners[type];
+                if (cbs) {
+                    for (var i = 0; i < cbs.length; i++) {
+                        try { cbs[i](eventObj); } catch(e) {}
+                    }
+                }
+            }
+        }
 
         // ── window.scrollTo / scrollBy ───────────────────────────────────────
         window.scrollTo = function(x, y) { /* stub */ };

@@ -94,7 +94,7 @@ impl NovaMod for PainterMod {
                 paint_box(&root, &mut ops, &images_map, &canvas_map);
 
                 debug!(op_count = ops.len(), "painting complete");
-                Ok(TypedData::RenderCommands(RenderCommands { ops, fonts: vec![] }))
+                Ok(TypedData::RenderCommands(RenderCommands { ops, fonts: vec![], spa_push_url: None, spa_replace_url: None }))
             }
             other => Err(NovaError::UnsupportedContent(format!(
                 "painter cannot handle request: {other:?}"
@@ -527,6 +527,17 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
             offset_x,
             offset_y,
             blur,
+        });
+    }
+
+    // <dialog> — draw a semi-transparent backdrop behind the dialog box.
+    if matches!(layout_box.content, LayoutContent::Dialog) {
+        ops.push(RenderOp::FillRect {
+            x: 0.0,
+            y: 0.0,
+            width: 100_000.0, // large enough to cover any viewport
+            height: 100_000.0,
+            color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.3 },
         });
     }
 

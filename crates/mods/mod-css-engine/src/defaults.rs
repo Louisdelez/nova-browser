@@ -320,6 +320,39 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
         // Default: no decoration. The cascade adds dotted underline when title is present.
     }
 
+    // <dialog> — modal overlay, hidden by default (display: none unless `open`).
+    if tag == "dialog" {
+        props.push(("position".into(), StyleValue::Keyword("fixed".into())));
+        props.push(("margin-left".into(), StyleValue::Keyword("auto".into())));
+        props.push(("margin-right".into(), StyleValue::Keyword("auto".into())));
+        props.push(("margin-top".into(), StyleValue::Keyword("auto".into())));
+        props.push(("margin-bottom".into(), StyleValue::Keyword("auto".into())));
+        props.push(("border-width".into(), StyleValue::Px(1.0)));
+        props.push(("border-style".into(), StyleValue::Keyword("solid".into())));
+        props.push(("border-color".into(), StyleValue::Str("#000000".into())));
+        props.push(("padding-top".into(), StyleValue::Px(16.0)));
+        props.push(("padding-right".into(), StyleValue::Px(16.0)));
+        props.push(("padding-bottom".into(), StyleValue::Px(16.0)));
+        props.push(("padding-left".into(), StyleValue::Px(16.0)));
+        props.push((
+            "background-color".into(),
+            StyleValue::Color(CssColor {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 1.0,
+            }),
+        ));
+    }
+
+    // <ruby> — inline container for ruby annotations (CJK).
+    // <rt> — annotation text with smaller font.
+    if tag == "rt" {
+        if let Some(existing) = props.iter_mut().find(|(k, _)| k == "font-size") {
+            existing.1 = StyleValue::Px(10.0);
+        }
+    }
+
     // <details> — collapsible content block.
     if tag == "details" {
         props.push(("padding-top".into(), StyleValue::Px(2.0)));
@@ -365,10 +398,11 @@ pub fn display_for_tag(tag: &str) -> &'static str {
         "td" | "th" => "table-cell",
         "span" | "a" | "em" | "strong" | "b" | "i" | "u" | "code" | "small" | "sub" | "sup"
         | "br" | "img" | "input" | "label" | "select" | "textarea" | "button" | "abbr"
-        | "cite" | "dfn" | "kbd" | "mark" | "q" | "s" | "samp" | "time" | "var" | "wbr" => {
+        | "cite" | "dfn" | "kbd" | "mark" | "q" | "s" | "samp" | "time" | "var" | "wbr"
+        | "output" | "ruby" | "rt" => {
             "inline"
         }
-        "head" | "title" | "meta" | "link" | "style" | "script" | "template" => "none",
+        "head" | "title" | "meta" | "link" | "style" | "script" | "template" | "rp" => "none",
         _ => "block",
     }
 }

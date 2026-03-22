@@ -39,6 +39,19 @@ const FONT_FETCH_TIMEOUT: Duration = Duration::from_secs(1);
 /// blocking the initial render.
 const MAX_EXTERNAL_SCRIPTS: usize = 5;
 
+/// Result of executing scripts with a DOM tree.
+///
+/// Contains the (potentially mutated) DOM plus any SPA URL changes
+/// signalled via `history.pushState()` or `history.replaceState()`.
+struct ScriptExecResult {
+    /// The DOM tree after script execution.
+    dom: DomNode,
+    /// URL set by `history.pushState()` — update URL bar without navigation.
+    push_state_url: Option<String>,
+    /// URL set by `history.replaceState()` — replace current history entry.
+    replace_state_url: Option<String>,
+}
+
 /// Extract a redirect URL from `<noscript><meta http-equiv="refresh" content="...">`.
 ///
 /// Many sites (Google, etc.) include a `<noscript>` block with a meta refresh
@@ -236,8 +249,19 @@ impl PipelineEngine {
     ) -> Result<TypedData, NovaError> {
         info!("Pipeline: navigating to '{url}'");
 
-        // Step 1: Fetch
-        let response = self.fetch(url).await?;
+        // Handle about: URLs — these are internal pages that bypass the network.
+        if url.starts_with("about:") {
+            return self.navigate_about_url(url, viewport).await;
+        }
+
+        // Step 1: Fetch (with error page fallback)
+        let response = match self.fetch(url).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!("Pipeline: fetch failed for '{url}': {e}");
+                return self.render_error_page(url, &e.to_string(), viewport).await;
+            }
+        };
         let mime_type = response
             .content_type()
             .unwrap_or("text/html")
@@ -322,14 +346,18 @@ impl PipelineEngine {
         // Step 5: Execute scripts WITH DOM before style computation.
         // This lets JS mutations (createElement, appendChild, innerHTML, etc.)
         // be reflected in the initial render — no re-render pass needed.
+        let mut spa_push_url: Option<String> = None;
+        let mut spa_replace_url: Option<String> = None;
         let final_dom = if let TypedData::Dom(ref node) = dom {
-            if let Some(mutated) = self.execute_scripts_with_dom(
+            if let Some(result) = self.execute_scripts_with_dom(
                 node,
                 &sub_resources.scripts,
                 &sub_resources.inline_scripts,
             ).await {
                 info!("Pipeline: JS modified DOM, using mutated DOM for rendering");
-                TypedData::Dom(mutated)
+                spa_push_url = result.push_state_url;
+                spa_replace_url = result.replace_state_url;
+                TypedData::Dom(result.dom)
             } else {
                 dom.clone()
             }
@@ -410,8 +438,169 @@ impl PipelineEngine {
             }
         }
 
+        // Step 10: Inject SPA URL changes (from history.pushState/replaceState)
+        // into the render commands so the shell can update the URL bar.
+        if spa_push_url.is_some() || spa_replace_url.is_some() {
+            if let TypedData::RenderCommands(ref mut cmds) = render_commands {
+                cmds.spa_push_url = spa_push_url;
+                cmds.spa_replace_url = spa_replace_url;
+            }
+        }
+
         info!("Pipeline: navigation complete");
         Ok(render_commands)
+    }
+
+    /// Handle `about:` URLs — internal browser pages.
+    ///
+    /// Returns rendered content for `about:blank`, `about:version`, and other
+    /// internal pages without making any network requests.
+    async fn navigate_about_url(
+        &self,
+        url: &str,
+        viewport: Viewport,
+    ) -> Result<TypedData, NovaError> {
+        let page_name = url.strip_prefix("about:").unwrap_or("");
+        info!("Pipeline: handling about:{page_name}");
+
+        let html = match page_name {
+            "blank" | "" => {
+                // about:blank — empty white page.
+                String::new()
+            }
+            "version" => {
+                // about:version — browser version info page.
+                build_version_page_html()
+            }
+            other => {
+                // Unknown about: page — show a simple message.
+                format!(
+                    r#"<html><head><title>about:{other}</title>
+<style>body {{ font-family: sans-serif; padding: 40px; color: #333; }}
+h1 {{ color: #666; }}</style></head>
+<body><h1>about:{other}</h1><p>This page does not exist.</p></body></html>"#
+                )
+            }
+        };
+
+        if html.is_empty() {
+            // about:blank — return minimal empty render commands.
+            return Ok(TypedData::RenderCommands(
+                nova_mod_api::RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None },
+            ));
+        }
+
+        // Parse and render the HTML through the pipeline.
+        self.render_html_string(&html, viewport).await
+    }
+
+    /// Render an error page when navigation fails.
+    ///
+    /// Shows a styled "This site can't be reached" page with the error
+    /// details and the URL that failed.
+    async fn render_error_page(
+        &self,
+        url: &str,
+        error: &str,
+        viewport: Viewport,
+    ) -> Result<TypedData, NovaError> {
+        let (error_title, error_detail) = classify_error_str(error);
+        let escaped_url = html_escape(url);
+        let escaped_detail = html_escape(&error_detail);
+
+        let html = format!(
+            r#"<html><head><title>{error_title}</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  margin: 0; padding: 60px 40px; background: #f8f9fa; color: #202124; }}
+.container {{ max-width: 600px; margin: 0 auto; }}
+.icon {{ font-size: 48px; color: #9aa0a6; margin-bottom: 20px; }}
+h1 {{ font-size: 20px; font-weight: normal; color: #202124; margin-bottom: 8px; }}
+.url {{ font-size: 14px; color: #5f6368; word-break: break-all; margin-bottom: 20px; }}
+.detail {{ font-size: 14px; color: #5f6368; line-height: 1.6; margin-bottom: 24px;
+  padding: 16px; background: #fff; border: 1px solid #dadce0; border-radius: 8px; }}
+.actions {{ margin-top: 24px; }}
+.btn {{ display: inline-block; padding: 8px 24px; background: #1a73e8; color: white;
+  border-radius: 4px; text-decoration: none; font-size: 14px; }}
+</style></head>
+<body><div class="container">
+<div class="icon">:(</div>
+<h1>{error_title}</h1>
+<p class="url">{escaped_url}</p>
+<div class="detail">{escaped_detail}</div>
+<div class="actions"><a class="btn" href="{escaped_url}">Reload</a></div>
+</div></body></html>"#
+        );
+
+        // Try to render the error page. If even that fails, return a minimal error.
+        match self.render_html_string(&html, viewport).await {
+            Ok(result) => Ok(result),
+            Err(_) => {
+                // Absolute fallback: empty render commands.
+                Ok(TypedData::RenderCommands(
+                    nova_mod_api::RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None },
+                ))
+            }
+        }
+    }
+
+    /// Render an SSL/TLS certificate error page.
+    ///
+    /// Shows a "Your connection is not private" warning page.
+    pub async fn render_ssl_error_page(
+        &self,
+        url: &str,
+        error_msg: &str,
+        viewport: Viewport,
+    ) -> Result<TypedData, NovaError> {
+        let escaped_url = html_escape(url);
+        let escaped_error = html_escape(error_msg);
+
+        let html = format!(
+            r#"<html><head><title>Privacy error</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  margin: 0; padding: 60px 40px; background: #fff; color: #202124; }}
+.container {{ max-width: 600px; margin: 0 auto; }}
+.shield {{ font-size: 64px; color: #ea4335; margin-bottom: 20px; text-align: center; }}
+h1 {{ font-size: 22px; font-weight: normal; color: #ea4335; }}
+.url {{ font-size: 14px; color: #5f6368; word-break: break-all; margin-bottom: 16px; }}
+.warning {{ font-size: 14px; color: #202124; line-height: 1.6; padding: 16px;
+  background: #fce8e6; border: 1px solid #f5c6cb; border-radius: 8px; margin-bottom: 16px; }}
+.detail {{ font-size: 13px; color: #5f6368; line-height: 1.5; }}
+</style></head>
+<body><div class="container">
+<div class="shield">!</div>
+<h1>Your connection is not private</h1>
+<p class="url">{escaped_url}</p>
+<div class="warning">Attackers might be trying to steal your information from this site
+(for example, passwords, messages, or credit cards).</div>
+<p class="detail">Error: {escaped_error}</p>
+</div></body></html>"#
+        );
+
+        match self.render_html_string(&html, viewport).await {
+            Ok(result) => Ok(result),
+            Err(_) => Ok(TypedData::RenderCommands(
+                nova_mod_api::RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None },
+            )),
+        }
+    }
+
+    /// Render an HTML string through the parse → style → layout → paint pipeline.
+    ///
+    /// Useful for rendering internal pages (about:, error pages, view-source)
+    /// without making any network requests.
+    pub async fn render_html_string(
+        &self,
+        html: &str,
+        viewport: Viewport,
+    ) -> Result<TypedData, NovaError> {
+        let data = bytes::Bytes::from(html.to_string());
+        let dom = self.parse(&data, "text/html").await?;
+        let styles = self.compute_styles_with(&dom, vec![], &viewport).await?;
+        let layout = self.layout(&styles, viewport).await?;
+        self.paint_with_images(&layout, vec![]).await
     }
 
     /// Re-render a DOM tree without re-fetching.
@@ -899,7 +1088,7 @@ impl PipelineEngine {
         dom: &DomNode,
         external_urls: &[String],
         inline_scripts: &[String],
-    ) -> Option<DomNode> {
+    ) -> Option<ScriptExecResult> {
         if external_urls.is_empty() && inline_scripts.is_empty() {
             return None;
         }
@@ -929,6 +1118,8 @@ impl PipelineEngine {
         // Execute all scripts with the DOM, using a shared context_id.
         let mut current_dom = dom.clone();
         let context_id = 1u64;
+        let mut last_push_state_url: Option<String> = None;
+        let mut last_replace_state_url: Option<String> = None;
 
         for (i, source) in scripts.iter().enumerate() {
             if source.trim().is_empty() {
@@ -945,9 +1136,15 @@ impl PipelineEngine {
                 .route(&CapabilityType::ExecJavaScript, request)
                 .await
             {
-                Ok(TypedData::JsResultWithDom { dom, .. }) => {
+                Ok(TypedData::JsResultWithDom { dom, push_state_url, replace_state_url, .. }) => {
                     debug!(script_index = i, "script mutated DOM");
                     current_dom = *dom;
+                    if push_state_url.is_some() {
+                        last_push_state_url = push_state_url;
+                    }
+                    if replace_state_url.is_some() {
+                        last_replace_state_url = replace_state_url;
+                    }
                 }
                 Ok(TypedData::JsResult(_)) => {
                     debug!(script_index = i, "script did not return DOM, keeping current");
@@ -961,7 +1158,11 @@ impl PipelineEngine {
             }
         }
 
-        Some(current_dom)
+        Some(ScriptExecResult {
+            dom: current_dom,
+            push_state_url: last_push_state_url,
+            replace_state_url: last_replace_state_url,
+        })
     }
 
     /// Fetch a single external script, returning None on failure.
@@ -1366,6 +1567,89 @@ fn is_favicon_or_icon(src: &str) -> bool {
     false
 }
 
+/// Build the HTML for the `about:version` page.
+fn build_version_page_html() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        r#"<html><head><title>About NOVA</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  margin: 0; padding: 40px; background: #f8f9fa; color: #202124; }}
+.container {{ max-width: 600px; margin: 0 auto; }}
+h1 {{ font-size: 28px; color: #1a73e8; margin-bottom: 8px; }}
+.version {{ font-size: 16px; color: #5f6368; margin-bottom: 24px; }}
+table {{ border-collapse: collapse; width: 100%; }}
+td {{ padding: 8px 12px; font-size: 14px; border-bottom: 1px solid #e8eaed; }}
+td:first-child {{ font-weight: 500; color: #202124; width: 180px; }}
+td:last-child {{ color: #5f6368; }}
+</style></head>
+<body><div class="container">
+<h1>NOVA Browser</h1>
+<p class="version">Version {version}</p>
+<table>
+<tr><td>Browser</td><td>NOVA</td></tr>
+<tr><td>Version</td><td>{version}</td></tr>
+<tr><td>Architecture</td><td>Micro-kernel + Mods</td></tr>
+<tr><td>Rendering Engine</td><td>Vello + wgpu (GPU) / FreeType (software)</td></tr>
+<tr><td>HTML Parser</td><td>html5ever</td></tr>
+<tr><td>CSS Engine</td><td>cssparser + custom</td></tr>
+<tr><td>Layout Engine</td><td>Custom + Taffy (Flexbox/Grid)</td></tr>
+<tr><td>JavaScript</td><td>QuickJS</td></tr>
+<tr><td>Language</td><td>Rust (Edition 2024)</td></tr>
+</table>
+</div></body></html>"#
+    )
+}
+
+/// Classify an error into a user-friendly title and detail message.
+fn classify_error(error: &NovaError) -> (String, String) {
+    match error {
+        NovaError::DnsError(host) => (
+            "This site can't be reached".into(),
+            format!("{host}'s server IP address could not be found. Check your internet connection and DNS settings."),
+        ),
+        NovaError::NetworkError(msg) => (
+            "This site can't be reached".into(),
+            format!("A network error occurred: {msg}"),
+        ),
+        NovaError::TlsError(msg) => (
+            "Your connection is not private".into(),
+            format!("SSL/TLS certificate error: {msg}"),
+        ),
+        NovaError::RequestTimeout(cap) => (
+            "This site took too long to respond".into(),
+            format!("The request for {cap:?} timed out. The server may be overloaded or your connection is slow."),
+        ),
+        _ => (
+            "This page can't be displayed".into(),
+            format!("{error}"),
+        ),
+    }
+}
+
+/// Classify an error string into a user-friendly title and detail message.
+fn classify_error_str(error: &str) -> (String, String) {
+    let lower = error.to_lowercase();
+    if lower.contains("dns") || lower.contains("resolve") {
+        ("This site can't be reached".into(), error.to_string())
+    } else if lower.contains("tls") || lower.contains("ssl") || lower.contains("certificate") {
+        ("Your connection is not private".into(), error.to_string())
+    } else if lower.contains("timeout") {
+        ("This site took too long to respond".into(), error.to_string())
+    } else {
+        ("This page can't be displayed".into(), error.to_string())
+    }
+}
+
+/// Escape HTML special characters in a string.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1701,5 +1985,38 @@ mod tests {
             }
             _ => panic!("expected document"),
         }
+    }
+
+    #[test]
+    fn html_escape_special_chars() {
+        assert_eq!(html_escape("<script>alert('xss');</script>"),
+            "&lt;script&gt;alert(&#x27;xss&#x27;);&lt;/script&gt;");
+        assert_eq!(html_escape("a & b"), "a &amp; b");
+        assert_eq!(html_escape("\"quoted\""), "&quot;quoted&quot;");
+    }
+
+    #[test]
+    fn classify_dns_error() {
+        let (title, _detail) = classify_error(&NovaError::DnsError("example.com".into()));
+        assert!(title.contains("can't be reached"));
+    }
+
+    #[test]
+    fn classify_tls_error() {
+        let (title, _detail) = classify_error(&NovaError::TlsError("cert expired".into()));
+        assert!(title.contains("not private"));
+    }
+
+    #[test]
+    fn classify_network_error() {
+        let (title, _detail) = classify_error(&NovaError::NetworkError("connection refused".into()));
+        assert!(title.contains("can't be reached"));
+    }
+
+    #[test]
+    fn build_version_page_contains_nova() {
+        let html = build_version_page_html();
+        assert!(html.contains("NOVA Browser"));
+        assert!(html.contains(env!("CARGO_PKG_VERSION")));
     }
 }

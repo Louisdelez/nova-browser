@@ -49,6 +49,16 @@ pub struct RenderCommands {
     /// TTF/OTF file data. The renderer loads these fonts and uses them when a
     /// `DrawText` op references the corresponding `font_family`.
     pub fonts: Vec<(String, Vec<u8>)>,
+    /// URL set by `history.pushState()` during JS execution.
+    ///
+    /// When present, the shell should update the URL bar and push a new
+    /// history entry without triggering a full page navigation.
+    pub spa_push_url: Option<String>,
+    /// URL set by `history.replaceState()` during JS execution.
+    ///
+    /// When present, the shell should update the URL bar and replace the
+    /// current history entry without triggering a full page navigation.
+    pub spa_replace_url: Option<String>,
 }
 
 /// Individual render operations.

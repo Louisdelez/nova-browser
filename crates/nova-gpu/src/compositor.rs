@@ -564,6 +564,8 @@ mod tests {
                 },
             ],
             fonts: vec![],
+            spa_push_url: None,
+            spa_replace_url: None,
         }
     }
 
@@ -773,6 +775,8 @@ mod tests {
                 color: Color::rgb(1.0, 0.0, 0.0),
             }],
             fonts: vec![],
+            spa_push_url: None,
+            spa_replace_url: None,
         };
         tree.update_content(&new_commands);
         assert!(tree.needs_repaint());

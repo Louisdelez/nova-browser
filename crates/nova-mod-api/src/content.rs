@@ -145,6 +145,10 @@ pub enum TypedData {
     JsResultWithDom {
         value: JsValue,
         dom: Box<DomNode>,
+        /// URL set by `history.pushState()` — signals URL bar update without navigation.
+        push_state_url: Option<String>,
+        /// URL set by `history.replaceState()` — signals replacing current history entry.
+        replace_state_url: Option<String>,
     },
 
     /// Console output collected from JS execution.
@@ -360,6 +364,8 @@ pub enum LayoutContent {
     },
     /// A replaced element (video, canvas, etc.).
     Replaced,
+    /// A `<dialog>` element with `open` attribute — modal overlay.
+    Dialog,
 }
 
 // ── Network types ──

@@ -92,6 +92,14 @@ impl HistoryStack {
         &self.entries[self.current_index]
     }
 
+    /// Replace the URL of the current history entry.
+    ///
+    /// Used by `history.replaceState()` to update the current entry
+    /// without adding a new one.
+    pub fn replace_current(&mut self, url: &str) {
+        self.entries[self.current_index].url = url.to_string();
+    }
+
     /// Get a mutable reference to the current history entry.
     ///
     /// Useful for updating the scroll position before navigating away.

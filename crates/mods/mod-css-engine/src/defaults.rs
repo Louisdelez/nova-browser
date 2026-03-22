@@ -161,9 +161,10 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
         _ => {}
     }
 
-    // <blockquote> — left margin indent.
+    // <blockquote> — left and right margin indent.
     if tag == "blockquote" {
         props.push(("margin-left".into(), StyleValue::Px(40.0)));
+        props.push(("margin-right".into(), StyleValue::Px(40.0)));
         props.push(("margin-top".into(), StyleValue::Px(16.0)));
         props.push(("margin-bottom".into(), StyleValue::Px(16.0)));
     }
@@ -172,9 +173,13 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
     if tag == "hr" {
         props.push(("border-top-style".into(), StyleValue::Keyword("solid".into())));
         props.push(("border-top-width".into(), StyleValue::Px(1.0)));
-        props.push(("border-top-color".into(), StyleValue::Str("#ccc".to_string())));
+        props.push(("border-top-color".into(), StyleValue::Color(CssColor {
+            r: 204, g: 204, b: 204, a: 1.0,
+        })));
+        props.push(("height".into(), StyleValue::Px(2.0)));
         props.push(("margin-top".into(), StyleValue::Px(8.0)));
         props.push(("margin-bottom".into(), StyleValue::Px(8.0)));
+        props.push(("overflow".into(), StyleValue::Keyword("hidden".into())));
     }
 
     // Table elements — display modes and defaults.
@@ -201,12 +206,19 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
         _ => {}
     }
 
-    // <sub> and <sup> — smaller font-size.
-    if tag == "sub" || tag == "sup" {
+    // <sub> and <sup> — smaller font-size and vertical-align.
+    if tag == "sub" {
         // Override the generic 16px with a smaller size.
         if let Some(existing) = props.iter_mut().find(|(k, _)| k == "font-size") {
             existing.1 = StyleValue::Px(13.0);
         }
+        props.push(("vertical-align".into(), StyleValue::Keyword("sub".into())));
+    }
+    if tag == "sup" {
+        if let Some(existing) = props.iter_mut().find(|(k, _)| k == "font-size") {
+            existing.1 = StyleValue::Px(13.0);
+        }
+        props.push(("vertical-align".into(), StyleValue::Keyword("super".into())));
     }
 
     // Form elements — default styles for input, select, button, textarea.

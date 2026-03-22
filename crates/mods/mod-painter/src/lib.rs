@@ -2347,13 +2347,30 @@ fn paint_text_input_visual(layout_box: &LayoutBox, info: &FormFieldInfo, ops: &m
     let border_color = Color::rgb(0.6, 0.6, 0.6);
     let font_size = extract_font_size(&layout_box.style);
 
-    // White background.
-    ops.push(RenderOp::FillRect { x, y, width: w, height: h, color: Color::WHITE });
-    // Border.
-    ops.push(RenderOp::FillRect { x, y, width: w, height: 1.0, color: border_color });
-    ops.push(RenderOp::FillRect { x, y: y + h - 1.0, width: w, height: 1.0, color: border_color });
-    ops.push(RenderOp::FillRect { x, y, width: 1.0, height: h, color: border_color });
-    ops.push(RenderOp::FillRect { x: x + w - 1.0, y, width: 1.0, height: h, color: border_color });
+    // Check for border-radius — use rounded rects when present.
+    let radius = extract_border_radius(&layout_box.style, w, h);
+    let has_radius = radius.iter().any(|&r| r > 0.0);
+
+    if has_radius {
+        // Rounded white background.
+        ops.push(RenderOp::FillRoundedRect { x, y, width: w, height: h, color: Color::WHITE, radius });
+        // Rounded border — draw a slightly larger rounded rect behind, then the white fill on top.
+        // Simpler approach: draw 1px border lines clipped to corners via rounded rect overlay.
+        let border_radius = radius;
+        ops.push(RenderOp::FillRoundedRect {
+            x: x - 1.0, y: y - 1.0, width: w + 2.0, height: h + 2.0,
+            color: border_color, radius: [border_radius[0] + 1.0, border_radius[1] + 1.0, border_radius[2] + 1.0, border_radius[3] + 1.0],
+        });
+        ops.push(RenderOp::FillRoundedRect { x, y, width: w, height: h, color: Color::WHITE, radius });
+    } else {
+        // White background.
+        ops.push(RenderOp::FillRect { x, y, width: w, height: h, color: Color::WHITE });
+        // Border.
+        ops.push(RenderOp::FillRect { x, y, width: w, height: 1.0, color: border_color });
+        ops.push(RenderOp::FillRect { x, y: y + h - 1.0, width: w, height: 1.0, color: border_color });
+        ops.push(RenderOp::FillRect { x, y, width: 1.0, height: h, color: border_color });
+        ops.push(RenderOp::FillRect { x: x + w - 1.0, y, width: 1.0, height: h, color: border_color });
+    }
 
     // Text content or placeholder.
     let display_text = if info.value.is_empty() {

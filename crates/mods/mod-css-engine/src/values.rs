@@ -709,6 +709,25 @@ pub fn resolve_em_value(raw: &str, parent_font_size: f32) -> Option<f32> {
     }
 }
 
+/// Resolve a CSS `rem` value to pixels.
+///
+/// `1rem` = root (`<html>`) font-size, which defaults to 16px.
+/// Returns the resolved px value if the input is a `rem` value, or `None`
+/// if the input is not a rem value.
+pub fn resolve_rem_value(raw: &str, root_font_size: f32) -> Option<f32> {
+    let raw = raw.trim();
+    if raw.ends_with("rem") {
+        let num_end = raw.len() - 3;
+        raw[..num_end]
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|n| n * root_font_size)
+    } else {
+        None
+    }
+}
+
 /// Parse a CSS color from a string.
 ///
 /// Supports: named colors, `#hex`, `rgb()`, `rgba()`.

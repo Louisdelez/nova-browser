@@ -4168,6 +4168,25 @@ fn parse_length_percentage_auto_ctx(val: &str, context_px: f32) -> Option<Length
     if let Some(vh) = val.strip_suffix("vh").and_then(|s| s.trim().parse::<f32>().ok()) {
         return Some(LengthPercentageAuto::Percent(vh / 100.0));
     }
+    // `rem` — always resolves against root font-size (16px default).
+    if val.ends_with("rem") {
+        if let Some(n) = val[..val.len() - 3].trim().parse::<f32>().ok() {
+            return Some(LengthPercentageAuto::Length(n * 16.0));
+        }
+    }
+    // `em` — resolves against parent font-size (approximated as 16px here;
+    // the cascade should have already resolved em to px).
+    if val.ends_with("em") {
+        if let Some(n) = val[..val.len() - 2].trim().parse::<f32>().ok() {
+            return Some(LengthPercentageAuto::Length(n * 16.0));
+        }
+    }
+    // `pt` — 1pt = 1.333px.
+    if val.ends_with("pt") {
+        if let Some(n) = val[..val.len() - 2].trim().parse::<f32>().ok() {
+            return Some(LengthPercentageAuto::Length(n * 1.333));
+        }
+    }
     None
 }
 
@@ -4198,6 +4217,24 @@ fn parse_length_percentage_ctx(val: &str, context_px: f32) -> Option<LengthPerce
     }
     if let Some(pct) = val.strip_suffix('%').and_then(|s| s.trim().parse::<f32>().ok()) {
         return Some(LengthPercentage::Percent(pct / 100.0));
+    }
+    // `rem` — always resolves against root font-size (16px default).
+    if val.ends_with("rem") {
+        if let Some(n) = val[..val.len() - 3].trim().parse::<f32>().ok() {
+            return Some(LengthPercentage::Length(n * 16.0));
+        }
+    }
+    // `em` — resolves against parent font-size (approximated as 16px here).
+    if val.ends_with("em") {
+        if let Some(n) = val[..val.len() - 2].trim().parse::<f32>().ok() {
+            return Some(LengthPercentage::Length(n * 16.0));
+        }
+    }
+    // `pt` — 1pt = 1.333px.
+    if val.ends_with("pt") {
+        if let Some(n) = val[..val.len() - 2].trim().parse::<f32>().ok() {
+            return Some(LengthPercentage::Length(n * 1.333));
+        }
     }
     None
 }
@@ -4243,6 +4280,25 @@ fn parse_dimension_with_context(val: &str, context_px: f32) -> Option<Dimension>
     }
     if let Some(vh) = val.strip_suffix("vh").and_then(|s| s.trim().parse::<f32>().ok()) {
         return Some(Dimension::Percent(vh / 100.0));
+    }
+    // `rem` — always resolves against root font-size (16px default).
+    if val.ends_with("rem") {
+        if let Some(n) = val[..val.len() - 3].trim().parse::<f32>().ok() {
+            return Some(Dimension::Length(n * 16.0));
+        }
+    }
+    // `em` — resolves against parent font-size (approximated as 16px here;
+    // the cascade should have already resolved em to px in most cases).
+    if val.ends_with("em") {
+        if let Some(n) = val[..val.len() - 2].trim().parse::<f32>().ok() {
+            return Some(Dimension::Length(n * 16.0));
+        }
+    }
+    // `pt` — 1pt = 1.333px.
+    if val.ends_with("pt") {
+        if let Some(n) = val[..val.len() - 2].trim().parse::<f32>().ok() {
+            return Some(Dimension::Length(n * 1.333));
+        }
     }
     None
 }

@@ -818,15 +818,22 @@ fn compute_element_style_impl(
         expand_shorthand(decl, &mut expanded);
     }
 
-    // 5. Sort by cascade: !important first, then origin, then specificity.
-    // `!important` declarations always beat normal declarations, regardless of
-    // origin or specificity.  Within the same importance level the existing
-    // (origin, specificity) ordering applies.
+    // 5. Sort by cascade: !important declarations beat normal ones.
+    // Per CSS spec, within the important layer the origin order is *reversed*:
+    //   normal:    UA < Author < Inline   (inline wins)
+    //   important: Inline < Author < UA   (UA !important wins)
     // Stable sort preserves source order for equal specificity.
     expanded.sort_by(|a, b| {
         a.important
             .cmp(&b.important)
-            .then(a.origin.cmp(&b.origin))
+            .then_with(|| {
+                if a.important && b.important {
+                    // Reversed origin order for !important declarations.
+                    b.origin.cmp(&a.origin)
+                } else {
+                    a.origin.cmp(&b.origin)
+                }
+            })
             .then(a.specificity.cmp(&b.specificity))
     });
 
@@ -850,26 +857,50 @@ fn compute_element_style_impl(
             "inherit" => {
                 // Look up the property value from the nearest ancestor.
                 let inherited = find_inherited_value(prop, ancestors);
-                *val = inherited.unwrap_or_default();
+                *val = inherited.unwrap_or_else(|| css_initial_value(prop).to_string());
             }
             "initial" => {
-                // Reset to the CSS initial value (remove the property — UA default will apply).
-                *val = String::new();
+                // Reset to the CSS spec initial value for this property.
+                *val = css_initial_value(prop).to_string();
             }
             "unset" => {
                 // For inherited properties, behave like `inherit`; for others, like `initial`.
                 if INHERITED_PROPERTIES.contains(&prop.as_str()) {
                     let inherited = find_inherited_value(prop, ancestors);
-                    *val = inherited.unwrap_or_default();
+                    *val = inherited.unwrap_or_else(|| css_initial_value(prop).to_string());
                 } else {
-                    *val = String::new();
+                    *val = css_initial_value(prop).to_string();
                 }
             }
             _ => {}
         }
     }
-    // Remove properties that were reset to empty (from `initial`).
+    // Remove properties whose initial value is unknown (empty).
     final_props.retain(|(_, v)| !v.is_empty());
+
+    // 6c. Resolve `currentColor` / `currentcolor` keyword.
+    // Per CSS spec, `currentColor` on a color-accepting property resolves to
+    // the element's computed `color` value.  On the `color` property itself,
+    // `currentColor` means `inherit`.
+    let computed_color: Option<String> = final_props
+        .iter()
+        .find(|(p, _)| p == "color")
+        .map(|(_, v)| v.clone());
+    for (prop, val) in &mut final_props {
+        if val.eq_ignore_ascii_case("currentcolor") || val.eq_ignore_ascii_case("currentColor") {
+            if prop == "color" {
+                // On `color` itself, `currentColor` means `inherit`.
+                let inherited = find_inherited_value("color", ancestors);
+                *val = inherited.unwrap_or_else(|| "#000000".to_string());
+            } else if let Some(ref color) = computed_color {
+                *val = color.clone();
+            } else {
+                // Fallback: use inherited color or black.
+                let inherited = find_inherited_value("color", ancestors);
+                *val = inherited.unwrap_or_else(|| "#000000".to_string());
+            }
+        }
+    }
 
     // 7. Resolve CSS custom properties (var()).
     // Collect custom properties (--*) from ancestors and this element.
@@ -994,6 +1025,16 @@ fn compute_element_style_impl(
             if let Some(px) = values::resolve_em_value(val, parent_font_size) {
                 *val = format!("{px}px");
             }
+        }
+    }
+
+    // 7c2. Resolve `rem` units against the root font-size (16px default).
+    // `rem` always resolves against the root `<html>` element's font-size,
+    // not the parent's font-size.
+    let root_font_size: f32 = 16.0;
+    for (_prop, val) in &mut final_props {
+        if let Some(px) = values::resolve_rem_value(val, root_font_size) {
+            *val = format!("{px}px");
         }
     }
 
@@ -1511,12 +1552,134 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
                 important: decl.important,
             });
         }
+        "all" => {
+            // `all` shorthand resets every CSS property (except `direction`
+            // and `unicode-bidi`) to the specified keyword: `initial`,
+            // `inherit`, or `unset`.
+            let keyword = decl.value.trim().to_string();
+            if matches!(keyword.as_str(), "initial" | "inherit" | "unset") {
+                for prop in ALL_SHORTHAND_PROPERTIES {
+                    out.push(CascadedDeclaration {
+                        property: prop.to_string(),
+                        value: keyword.clone(),
+                        specificity: decl.specificity,
+                        origin: decl.origin,
+                        important: decl.important,
+                    });
+                }
+            }
+            // If the value is not a recognized keyword, ignore the declaration.
+        }
         _ => {
             // Not a shorthand; pass through.
             out.push(decl);
         }
     }
 }
+
+/// Properties reset by `all: initial / inherit / unset`.
+///
+/// Excludes `direction` and `unicode-bidi` per the CSS spec.
+static ALL_SHORTHAND_PROPERTIES: &[&str] = &[
+    "color",
+    "background-color",
+    "background-image",
+    "background-repeat",
+    "background-position",
+    "background-size",
+    "background-attachment",
+    "display",
+    "width",
+    "height",
+    "min-width",
+    "min-height",
+    "max-width",
+    "max-height",
+    "margin-top",
+    "margin-right",
+    "margin-bottom",
+    "margin-left",
+    "padding-top",
+    "padding-right",
+    "padding-bottom",
+    "padding-left",
+    "border-top-width",
+    "border-right-width",
+    "border-bottom-width",
+    "border-left-width",
+    "border-top-style",
+    "border-right-style",
+    "border-bottom-style",
+    "border-left-style",
+    "border-top-color",
+    "border-right-color",
+    "border-bottom-color",
+    "border-left-color",
+    "border-radius",
+    "font-size",
+    "font-weight",
+    "font-style",
+    "font-family",
+    "font-variant",
+    "line-height",
+    "letter-spacing",
+    "word-spacing",
+    "text-align",
+    "text-decoration",
+    "text-transform",
+    "text-indent",
+    "text-shadow",
+    "white-space",
+    "visibility",
+    "opacity",
+    "cursor",
+    "position",
+    "top",
+    "right",
+    "bottom",
+    "left",
+    "z-index",
+    "overflow-x",
+    "overflow-y",
+    "float",
+    "clear",
+    "flex-grow",
+    "flex-shrink",
+    "flex-basis",
+    "flex-direction",
+    "flex-wrap",
+    "align-items",
+    "align-content",
+    "justify-content",
+    "justify-items",
+    "order",
+    "gap",
+    "row-gap",
+    "column-gap",
+    "grid-template-columns",
+    "grid-template-rows",
+    "vertical-align",
+    "list-style-type",
+    "list-style-position",
+    "list-style-image",
+    "outline-width",
+    "outline-style",
+    "outline-color",
+    "box-sizing",
+    "table-layout",
+    "border-collapse",
+    "border-spacing",
+    "empty-cells",
+    "caption-side",
+    "word-break",
+    "overflow-wrap",
+    "writing-mode",
+    "transform",
+    "transition",
+    "animation",
+    "box-shadow",
+    "content",
+];
 
 /// Parse and expand a directional border shorthand (`border`, `border-top`, etc.).
 ///
@@ -2460,6 +2623,123 @@ fn find_inherited_value(property: &str, ancestors: &[&DomNode]) -> Option<String
         }
     }
     None
+}
+
+/// Return the CSS specification *initial value* for a property.
+///
+/// These are the values defined by the CSS spec as the default when no
+/// declaration or inheritance applies. They differ from *user-agent defaults*
+/// (which vary per element) — for instance, the initial value of `display`
+/// is `inline`, not `block`.
+fn css_initial_value(property: &str) -> &'static str {
+    match property {
+        // Colors
+        "color" => "#000000",
+        "background-color" => "transparent",
+        "border-top-color" | "border-right-color" | "border-bottom-color"
+        | "border-left-color" | "border-color" => "currentcolor",
+        "outline-color" => "currentcolor",
+        "text-decoration-color" => "currentcolor",
+
+        // Display & visibility
+        "display" => "inline",
+        "visibility" => "visible",
+        "opacity" => "1",
+
+        // Box model
+        "width" | "height" | "min-width" | "min-height" => "auto",
+        "max-width" | "max-height" => "none",
+        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => "0px",
+        "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => "0px",
+        "border-top-width" | "border-right-width" | "border-bottom-width"
+        | "border-left-width" | "border-width" => "medium",
+        "border-top-style" | "border-right-style" | "border-bottom-style"
+        | "border-left-style" | "border-style" => "none",
+        "border-radius" | "border-top-left-radius" | "border-top-right-radius"
+        | "border-bottom-right-radius" | "border-bottom-left-radius" => "0px",
+        "box-sizing" => "content-box",
+
+        // Typography
+        "font-size" => "16px", // medium = ~16px
+        "font-weight" => "normal",
+        "font-style" => "normal",
+        "font-family" => "serif",
+        "font-variant" => "normal",
+        "line-height" => "normal",
+        "letter-spacing" => "normal",
+        "word-spacing" => "normal",
+        "text-align" => "start",
+        "text-decoration" => "none",
+        "text-transform" => "none",
+        "text-indent" => "0px",
+        "text-shadow" => "none",
+        "white-space" => "normal",
+        "word-break" => "normal",
+        "overflow-wrap" | "word-wrap" => "normal",
+
+        // Positioning
+        "position" => "static",
+        "top" | "right" | "bottom" | "left" => "auto",
+        "z-index" => "auto",
+        "float" => "none",
+        "clear" => "none",
+
+        // Flexbox
+        "flex-grow" => "0",
+        "flex-shrink" => "1",
+        "flex-basis" => "auto",
+        "flex-direction" => "row",
+        "flex-wrap" => "nowrap",
+        "align-items" => "stretch",
+        "align-content" => "stretch",
+        "justify-content" => "flex-start",
+        "justify-items" => "legacy",
+        "order" => "0",
+        "gap" | "row-gap" | "column-gap" => "normal",
+
+        // Grid
+        "grid-template-columns" | "grid-template-rows" => "none",
+
+        // Overflow
+        "overflow-x" | "overflow-y" => "visible",
+
+        // Lists
+        "list-style-type" => "disc",
+        "list-style-position" => "outside",
+        "list-style-image" => "none",
+
+        // Table
+        "table-layout" => "auto",
+        "border-collapse" => "separate",
+        "border-spacing" => "0px",
+        "empty-cells" => "show",
+        "caption-side" => "top",
+        "vertical-align" => "baseline",
+
+        // Outline
+        "outline-width" => "medium",
+        "outline-style" => "none",
+
+        // Background
+        "background-image" => "none",
+        "background-repeat" => "repeat",
+        "background-position" => "0% 0%",
+        "background-size" => "auto",
+        "background-attachment" => "scroll",
+
+        // Misc
+        "cursor" => "auto",
+        "direction" => "ltr",
+        "writing-mode" => "horizontal-tb",
+        "transform" => "none",
+        "transition" => "none",
+        "animation" => "none",
+        "box-shadow" => "none",
+        "content" => "normal",
+
+        // Fallback for unknown properties — empty means remove.
+        _ => "",
+    }
 }
 
 fn style_value_to_css(val: &nova_mod_api::content::StyleValue) -> String {

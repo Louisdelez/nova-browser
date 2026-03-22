@@ -225,6 +225,7 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
     match tag {
         "input" => {
             props.push(("display".into(), StyleValue::Keyword("inline-block".into())));
+            props.push(("box-sizing".into(), StyleValue::Keyword("border-box".into())));
             props.push(("border-width".into(), StyleValue::Px(1.0)));
             props.push(("border-style".into(), StyleValue::Keyword("solid".into())));
             props.push(("border-color".into(), StyleValue::Str("#dadce0".into())));
@@ -237,6 +238,7 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
         }
         "button" => {
             props.push(("display".into(), StyleValue::Keyword("inline-block".into())));
+            props.push(("box-sizing".into(), StyleValue::Keyword("border-box".into())));
             props.push(("border-width".into(), StyleValue::Px(1.0)));
             props.push(("border-style".into(), StyleValue::Keyword("solid".into())));
             props.push(("border-color".into(), StyleValue::Str("#dadce0".into())));
@@ -250,6 +252,7 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
         }
         "select" => {
             props.push(("display".into(), StyleValue::Keyword("inline-block".into())));
+            props.push(("box-sizing".into(), StyleValue::Keyword("border-box".into())));
             props.push(("border-width".into(), StyleValue::Px(1.0)));
             props.push(("border-style".into(), StyleValue::Keyword("solid".into())));
             props.push(("border-color".into(), StyleValue::Str("#767676".into())));
@@ -261,6 +264,7 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
         }
         "textarea" => {
             props.push(("display".into(), StyleValue::Keyword("inline-block".into())));
+            props.push(("box-sizing".into(), StyleValue::Keyword("border-box".into())));
             props.push(("border-width".into(), StyleValue::Px(1.0)));
             props.push(("border-style".into(), StyleValue::Keyword("solid".into())));
             props.push(("border-color".into(), StyleValue::Str("#767676".into())));

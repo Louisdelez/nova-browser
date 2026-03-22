@@ -5044,9 +5044,12 @@ fn build_taffy_style(
             let justify_content = lp.justify_content.as_deref()
                 .and_then(map_justify_content);
 
-            // For <html> and <body> with display: flex, ensure they fill the
-            // viewport height so centering has room to work.
-            let is_root_element = tag == "html" || tag == "body";
+            // Only <html> gets min-height: 100vh by default so that
+            // percentage min-height on children resolves correctly and the
+            // background-color paints the full canvas.  <body> should
+            // auto-size to its content; pages that want centering will set
+            // min-height: 100vh explicitly on body via CSS.
+            let is_html_root = tag == "html";
             Style {
                 display: Display::Flex,
                 flex_direction: direction,
@@ -5060,7 +5063,7 @@ fn build_taffy_style(
                 min_size: Size {
                     width: lp.min_width.unwrap_or(Dimension::Auto),
                     height: lp.min_height.unwrap_or(
-                        if is_root_element { Dimension::Length(viewport.height) } else { Dimension::Auto }
+                        if is_html_root { Dimension::Length(viewport.height) } else { Dimension::Auto }
                     ),
                 },
                 max_size: Size {
@@ -5201,9 +5204,9 @@ fn build_taffy_style(
 
         // "block" and everything else: column flex container at full width.
         _ => {
-            // For <html> and <body>, ensure they fill at least the viewport
-            // height so their background-color covers the entire page.
-            let is_root_element = tag == "html" || tag == "body";
+            // Only <html> gets min-height: 100vh so the background-color
+            // covers the entire page.  <body> auto-sizes to its content.
+            let is_root_element = tag == "html";
             // Use Auto width + flex_grow to fill available space (respects margins).
             // Only use Percent(1.0) if no margins and no explicit width.
             // Floated elements always use Auto width by default and don't grow.

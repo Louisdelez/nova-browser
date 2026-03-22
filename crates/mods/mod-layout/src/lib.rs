@@ -1846,13 +1846,11 @@ fn build_children_with_ifc(
             // Block child — process normally, with margin collapsing.
             let node_id = add_node(taffy, &children[i], available_width, parent_font_size, child_parent_props, viewport, depth + 1)?;
 
-            // Margin collapsing: if the previous child was also a block,
-            // reduce the current child's top margin to simulate CSS margin collapse.
-            if let DomNode::Element { attributes, .. } = &children[i] {
-                if !result.is_empty() {
-                    collapse_margin_with_previous(taffy, &result, node_id, attributes);
-                }
-            }
+            // NOTE: Sibling margin collapsing is handled post-Taffy in
+            // `collapse_sibling_margins()` (called from `build_layout_box`).
+            // We no longer adjust Taffy styles pre-layout because flex layout
+            // already accounts for margin spacing, and post-processing the
+            // LayoutBox tree is more accurate and predictable.
 
             result.push(node_id);
             last_was_block = true;
@@ -1882,6 +1880,12 @@ fn inject_list_item_props(parent_style_props: &[(String, StyleValue)], li_index:
     props
 }
 
+/// Pre-Taffy margin collapsing (DEPRECATED — kept for reference).
+///
+/// Superseded by post-Taffy `collapse_sibling_margins()` which is more
+/// accurate. This function adjusted Taffy node styles before layout, but
+/// flex layout already accounts for margins, leading to double-counting.
+#[allow(dead_code)]
 /// Collapse vertical margins between adjacent block children.
 ///
 /// In CSS, adjacent vertical margins collapse: instead of adding both margins,
@@ -3817,12 +3821,104 @@ fn build_layout_box(
         z_index,
     };
 
-    // Post-process: collapse parent-first-child margins.
-    // If this block element has no padding-top and no border-top, its
-    // margin-top should collapse with the first child's margin-top.
+    // Post-process: collapse margins in the LayoutBox tree.
+    //
+    // CSS block flow requires margin collapsing which Taffy's flex layout
+    // doesn't perform. We post-process the tree to:
+    // 1. Collapse adjacent sibling margins (the gap between consecutive
+    //    block children should be max(margin_bottom, margin_top), not the sum).
+    // 2. Collapse parent-first-child margins when no padding/border separates them.
+    collapse_sibling_margins(&mut layout_box);
     collapse_parent_child_margins(&mut layout_box);
 
     layout_box
+}
+
+/// Collapse vertical margins between adjacent block-level siblings.
+///
+/// In CSS block flow, adjacent vertical margins collapse: the space between
+/// two block siblings is `max(prev_margin_bottom, curr_margin_top)` instead
+/// of their sum. Taffy models block containers as flex-column, so it adds
+/// both margins as spacing. This function post-processes the LayoutBox tree
+/// to shift children up by the overlap amount.
+///
+/// For each pair of adjacent block children `(i-1, i)`:
+///   - overlap = margin_bottom[i-1] + margin_top[i] - max(margin_bottom[i-1], margin_top[i])
+///   - Shift child[i] and all subsequent children UP by `overlap`
+///   - Reduce the parent's height by `overlap`
+fn collapse_sibling_margins(parent: &mut LayoutBox) {
+    if parent.children.len() < 2 {
+        return;
+    }
+
+    // Only collapse inside block containers (not inline, not text, etc.).
+    let parent_display = parent
+        .style
+        .properties
+        .iter()
+        .find(|(k, _)| k == "display")
+        .and_then(|(_, v)| match v {
+            StyleValue::Keyword(s) => Some(s.as_str()),
+            _ => None,
+        });
+    // Skip margin collapsing for flex/grid containers — those have their own
+    // spacing rules and CSS spec says margins do not collapse in flex/grid.
+    match parent_display {
+        Some("flex") | Some("inline-flex") | Some("grid") | Some("inline-grid") => return,
+        _ => {}
+    }
+
+    // Accumulate total overlap so we can reduce the parent's height.
+    let mut total_overlap = 0.0_f32;
+
+    for i in 1..parent.children.len() {
+        // Only collapse between block-level children.
+        let prev_is_block = matches!(parent.children[i - 1].content, LayoutContent::Block);
+        let curr_is_block = matches!(parent.children[i].content, LayoutContent::Block);
+
+        if !prev_is_block || !curr_is_block {
+            continue;
+        }
+
+        let prev_margin_bottom = get_margin_value(&parent.children[i - 1].style, "margin-bottom");
+        let curr_margin_top = get_margin_value(&parent.children[i].style, "margin-top");
+
+        if prev_margin_bottom <= 0.0 && curr_margin_top <= 0.0 {
+            continue;
+        }
+
+        let collapsed = prev_margin_bottom.max(curr_margin_top);
+        let overlap = (prev_margin_bottom + curr_margin_top) - collapsed;
+
+        if overlap > 0.5 {
+            // Shift child[i] and all subsequent children up by `overlap`.
+            for j in i..parent.children.len() {
+                parent.children[j].y -= overlap;
+                shift_children_y(&mut parent.children[j], -overlap);
+            }
+            total_overlap += overlap;
+        }
+    }
+
+    // Reduce the parent's height by the total collapsed overlap.
+    if total_overlap > 0.5 {
+        parent.height -= total_overlap;
+    }
+}
+
+/// Extract a margin value (in px) from a StyleMap by property name.
+fn get_margin_value(style: &StyleMap, prop: &str) -> f32 {
+    style
+        .properties
+        .iter()
+        .find(|(k, _)| k == prop)
+        .and_then(|(_, v)| match v {
+            StyleValue::Px(px) => Some(*px),
+            StyleValue::Number(n) => Some(*n),
+            StyleValue::Keyword(s) if s == "0" => Some(0.0),
+            _ => None,
+        })
+        .unwrap_or(0.0)
 }
 
 /// Collapse margins between a parent and its first/last child.
@@ -3838,6 +3934,21 @@ fn collapse_parent_child_margins(parent: &mut LayoutBox) {
         return;
     }
 
+    // Only collapse inside block containers.
+    let parent_display = parent
+        .style
+        .properties
+        .iter()
+        .find(|(k, _)| k == "display")
+        .and_then(|(_, v)| match v {
+            StyleValue::Keyword(s) => Some(s.as_str()),
+            _ => None,
+        });
+    match parent_display {
+        Some("flex") | Some("inline-flex") | Some("grid") | Some("inline-grid") => return,
+        _ => {}
+    }
+
     // Check if the parent has padding-top or border-top that would prevent collapsing.
     let has_padding_top = parent.style.properties.iter().any(|(k, v)| {
         k == "padding-top" && matches!(v, StyleValue::Px(px) if *px > 0.0)
@@ -3851,41 +3962,29 @@ fn collapse_parent_child_margins(parent: &mut LayoutBox) {
         return;
     }
 
+    // Only collapse with the first child if it is block-level.
+    if !matches!(parent.children[0].content, LayoutContent::Block) {
+        return;
+    }
+
     // Get the first child's margin-top.
-    let first_child_margin_top = parent.children[0]
-        .style
-        .properties
-        .iter()
-        .find(|(k, _)| k == "margin-top")
-        .and_then(|(_, v)| match v {
-            StyleValue::Px(px) => Some(*px),
-            _ => None,
-        })
-        .unwrap_or(0.0);
+    let first_child_margin_top = get_margin_value(&parent.children[0].style, "margin-top");
 
     // Get the parent's margin-top.
-    let parent_margin_top = parent
-        .style
-        .properties
-        .iter()
-        .find(|(k, _)| k == "margin-top")
-        .and_then(|(_, v)| match v {
-            StyleValue::Px(px) => Some(*px),
-            _ => None,
-        })
-        .unwrap_or(0.0);
+    let parent_margin_top = get_margin_value(&parent.style, "margin-top");
 
     // Collapse: the effective gap is max(parent_margin_top, child_margin_top),
     // not the sum. The child should be shifted up by the overlap.
     if first_child_margin_top > 0.0 && parent_margin_top > 0.0 {
         let collapsed = parent_margin_top.max(first_child_margin_top);
         let overlap = parent_margin_top + first_child_margin_top - collapsed;
-        if overlap > 0.0 {
+        if overlap > 0.5 {
             // Shift the first child (and all subsequent children) up.
             for child in parent.children.iter_mut() {
                 child.y -= overlap;
                 shift_children_y(child, -overlap);
             }
+            parent.height -= overlap;
         }
     }
 }

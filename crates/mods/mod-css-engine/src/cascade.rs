@@ -1433,8 +1433,8 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
                 important: decl.important,
             });
         }
-        "gap" => {
-            // gap: <row-gap> <column-gap>?
+        "gap" | "grid-gap" => {
+            // gap / grid-gap: <row-gap> <column-gap>?
             let parts: Vec<&str> = decl.value.split_whitespace().collect();
             let row = parts.first().copied().unwrap_or("0");
             let col = parts.get(1).copied().unwrap_or(row);
@@ -1448,6 +1448,64 @@ fn expand_shorthand(decl: CascadedDeclaration, out: &mut Vec<CascadedDeclaration
             out.push(CascadedDeclaration {
                 property: "column-gap".into(),
                 value: col.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+            // Also pass through as `gap` so mod-layout's inline parser picks it up.
+            out.push(CascadedDeclaration {
+                property: "gap".into(),
+                value: decl.value.clone(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        }
+        "grid-row-gap" => {
+            // Legacy alias for row-gap.
+            out.push(CascadedDeclaration {
+                property: "row-gap".into(),
+                value: decl.value,
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        }
+        "grid-column-gap" => {
+            // Legacy alias for column-gap.
+            out.push(CascadedDeclaration {
+                property: "column-gap".into(),
+                value: decl.value,
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+        }
+        "flex-flow" => {
+            // flex-flow: <flex-direction> || <flex-wrap>
+            // Either or both values may appear in any order.
+            let parts: Vec<&str> = decl.value.split_whitespace().collect();
+            let mut direction = "row";
+            let mut wrap = "nowrap";
+            static DIRECTION_KW: &[&str] = &["row", "row-reverse", "column", "column-reverse"];
+            static WRAP_KW: &[&str] = &["nowrap", "wrap", "wrap-reverse"];
+            for part in &parts {
+                if DIRECTION_KW.contains(part) {
+                    direction = part;
+                } else if WRAP_KW.contains(part) {
+                    wrap = part;
+                }
+            }
+            out.push(CascadedDeclaration {
+                property: "flex-direction".into(),
+                value: direction.to_string(),
+                specificity: decl.specificity,
+                origin: decl.origin,
+                important: decl.important,
+            });
+            out.push(CascadedDeclaration {
+                property: "flex-wrap".into(),
+                value: wrap.to_string(),
                 specificity: decl.specificity,
                 origin: decl.origin,
                 important: decl.important,
@@ -2270,6 +2328,9 @@ fn build_pseudo_element_node(
     let pseudo_tag = match pe {
         PseudoElement::Before => "nova-before",
         PseudoElement::After => "nova-after",
+        // ::first-line and ::first-letter are parsed but not yet applied
+        // as generated content — return None so no DOM node is created.
+        PseudoElement::FirstLine | PseudoElement::FirstLetter => return None,
     };
 
     let mut attrs = Vec::new();
@@ -3002,6 +3063,66 @@ mod tests {
     fn columns_shorthand_count() {
         let m = expand("columns", "3");
         assert_eq!(m.get("column-count").map(String::as_str), Some("3"));
+    }
+
+    // ── grid-gap shorthand ─────────────────────────────────────────────────
+
+    #[test]
+    fn grid_gap_expands_to_row_and_col_gap() {
+        let m = expand("grid-gap", "10px 20px");
+        assert_eq!(m.get("row-gap").map(String::as_str), Some("10px"));
+        assert_eq!(m.get("column-gap").map(String::as_str), Some("20px"));
+        // Also emits `gap` for mod-layout.
+        assert_eq!(m.get("gap").map(String::as_str), Some("10px 20px"));
+    }
+
+    #[test]
+    fn grid_gap_single_value() {
+        let m = expand("grid-gap", "15px");
+        assert_eq!(m.get("row-gap").map(String::as_str), Some("15px"));
+        assert_eq!(m.get("column-gap").map(String::as_str), Some("15px"));
+    }
+
+    #[test]
+    fn grid_row_gap_alias() {
+        let m = expand("grid-row-gap", "8px");
+        assert_eq!(m.get("row-gap").map(String::as_str), Some("8px"));
+    }
+
+    #[test]
+    fn grid_column_gap_alias() {
+        let m = expand("grid-column-gap", "12px");
+        assert_eq!(m.get("column-gap").map(String::as_str), Some("12px"));
+    }
+
+    // ── flex-flow shorthand ──────────────────────────────────────────────────
+
+    #[test]
+    fn flex_flow_both_values() {
+        let m = expand("flex-flow", "row wrap");
+        assert_eq!(m.get("flex-direction").map(String::as_str), Some("row"));
+        assert_eq!(m.get("flex-wrap").map(String::as_str), Some("wrap"));
+    }
+
+    #[test]
+    fn flex_flow_direction_only() {
+        let m = expand("flex-flow", "column");
+        assert_eq!(m.get("flex-direction").map(String::as_str), Some("column"));
+        assert_eq!(m.get("flex-wrap").map(String::as_str), Some("nowrap"));
+    }
+
+    #[test]
+    fn flex_flow_wrap_only() {
+        let m = expand("flex-flow", "wrap-reverse");
+        assert_eq!(m.get("flex-direction").map(String::as_str), Some("row"));
+        assert_eq!(m.get("flex-wrap").map(String::as_str), Some("wrap-reverse"));
+    }
+
+    #[test]
+    fn flex_flow_reverse() {
+        let m = expand("flex-flow", "column-reverse wrap");
+        assert_eq!(m.get("flex-direction").map(String::as_str), Some("column-reverse"));
+        assert_eq!(m.get("flex-wrap").map(String::as_str), Some("wrap"));
     }
 
     // ── word-wrap alias ──────────────────────────────────────────────────────

@@ -1477,17 +1477,39 @@ impl Framebuffer {
                     );
                 }
                 RenderOp::BoxShadow {
-                    x, y, width, height, color, offset_x, offset_y, blur: _,
+                    x, y, width, height, color, offset_x, offset_y, blur,
                 } => {
-                    let c = self.apply_opacity(*color);
                     let (tx, ty) = apply_pos(&self.current_transform, *x + *offset_x, *y + *offset_y);
-                    self.fill_rect(
-                        tx,
-                        ty,
-                        *width,
-                        *height,
-                        c,
-                    );
+                    if *blur <= 0.0 {
+                        // No blur — flat shadow.
+                        let c = self.apply_opacity(*color);
+                        self.fill_rect(tx, ty, *width, *height, c);
+                    } else {
+                        // Approximate blur by drawing multiple expanding
+                        // layers with decreasing opacity. Each layer is
+                        // 1px larger on each side.
+                        let layers = (*blur as i32).clamp(1, 20);
+                        let base_alpha = color.a;
+                        for i in (0..layers).rev() {
+                            let expand = i as f32 + 1.0;
+                            let frac = (layers - i) as f32 / (layers as f32 + 1.0);
+                            let layer_alpha = base_alpha * frac / (layers as f32 * 0.5);
+                            let layer_color = Color {
+                                r: color.r,
+                                g: color.g,
+                                b: color.b,
+                                a: layer_alpha.clamp(0.0, base_alpha),
+                            };
+                            let c = self.apply_opacity(layer_color);
+                            self.fill_rect(
+                                tx - expand,
+                                ty - expand,
+                                *width + expand * 2.0,
+                                *height + expand * 2.0,
+                                c,
+                            );
+                        }
+                    }
                 }
                 RenderOp::PushOpacity { opacity } => {
                     self.opacity_stack.push(*opacity);

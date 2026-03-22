@@ -113,11 +113,17 @@ pub enum PseudoClass {
     Host,
 }
 
-/// CSS pseudo-element (e.g. `::before`, `::after`).
+/// CSS pseudo-element (e.g. `::before`, `::after`, `::first-line`, `::first-letter`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PseudoElement {
     Before,
     After,
+    /// `::first-line` — applies styles to the first line of a block element.
+    /// Currently parsed but not applied during layout/paint (no-op).
+    FirstLine,
+    /// `::first-letter` — applies styles to the first letter (drop caps).
+    /// Currently parsed but not applied during layout/paint (no-op).
+    FirstLetter,
 }
 
 /// An `An+B` formula for `:nth-child` / `:nth-of-type` selectors.
@@ -284,14 +290,26 @@ impl Selector {
             return None;
         }
 
-        // Detect and strip pseudo-element suffixes (::before, ::after).
-        // Also handle single-colon legacy syntax (:before, :after).
+        // Detect and strip pseudo-element suffixes (::before, ::after,
+        // ::first-line, ::first-letter). Also handle single-colon legacy syntax.
         let mut pseudo_element = None;
         let selector_str = if let Some(base) = input.strip_suffix("::before") {
             pseudo_element = Some(PseudoElement::Before);
             base
         } else if let Some(base) = input.strip_suffix("::after") {
             pseudo_element = Some(PseudoElement::After);
+            base
+        } else if let Some(base) = input.strip_suffix("::first-line") {
+            pseudo_element = Some(PseudoElement::FirstLine);
+            base
+        } else if let Some(base) = input.strip_suffix("::first-letter") {
+            pseudo_element = Some(PseudoElement::FirstLetter);
+            base
+        } else if let Some(base) = input.strip_suffix(":first-line") {
+            pseudo_element = Some(PseudoElement::FirstLine);
+            base
+        } else if let Some(base) = input.strip_suffix(":first-letter") {
+            pseudo_element = Some(PseudoElement::FirstLetter);
             base
         } else if let Some(base) = input.strip_suffix(":before") {
             pseudo_element = Some(PseudoElement::Before);

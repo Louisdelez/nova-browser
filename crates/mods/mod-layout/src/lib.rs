@@ -1260,6 +1260,28 @@ fn add_node(
             };
             let mut taffy_style = build_taffy_style(&display, tag, attributes, viewport);
 
+            // ── auto-fill / auto-fit column resolution ───────────────
+            // When `grid-template-columns: repeat(auto-fill, minmax(Npx, 1fr))`
+            // was used, compute the number of columns from available width.
+            if display == "grid" {
+                let lp_af = parse_layout_props(attributes, viewport);
+                if let Some(min_px) = lp_af.grid_auto_fill_min_px {
+                    let (_, col_gap) = lp_af.gap.unwrap_or((0.0, 0.0));
+                    // Available space for columns = child_available minus padding.
+                    let pad_l = match lp_af.padding_left { Some(LengthPercentage::Length(v)) => v, _ => 0.0 };
+                    let pad_r = match lp_af.padding_right { Some(LengthPercentage::Length(v)) => v, _ => 0.0 };
+                    let usable = (child_available - pad_l - pad_r).max(0.0);
+                    // N = floor((usable + gap) / (min_px + gap)), at least 1.
+                    let n = ((usable + col_gap) / (min_px + col_gap)).floor().max(1.0) as usize;
+                    use taffy::style_helpers::FromFlex;
+                    let track = TrackSizingFunction::Single(NonRepeatedTrackSizingFunction {
+                        min: MinTrackSizingFunction::Fixed(LengthPercentage::Length(min_px)),
+                        max: MaxTrackSizingFunction::Fraction(1.0),
+                    });
+                    taffy_style.grid_template_columns = vec![track; n];
+                }
+            }
+
             // ── Grid template areas resolution ──────────────────────
             // When this element is a grid container with `grid-template-areas`,
             // resolve each child's `grid-area: <name>` into explicit
@@ -3888,10 +3910,20 @@ struct LayoutProps {
     flex_wrap: Option<String>,
     /// CSS `flex-direction` property.
     flex_direction: Option<String>,
+    /// CSS `align-self` property for flex/grid children.
+    align_self: Option<String>,
+    /// CSS `justify-self` property for grid children.
+    justify_self: Option<String>,
     /// CSS `order` property for flex/grid children.
     order: Option<i32>,
     /// CSS `aspect-ratio` property (width / height).
     aspect_ratio: Option<f32>,
+    /// When `repeat(auto-fill, ...)` or `repeat(auto-fit, ...)` is used for
+    /// `grid-template-columns`, store the minimum track size so we can compute
+    /// the column count at layout time based on available width.
+    grid_auto_fill_min_px: Option<f32>,
+    /// Whether `auto-fit` (collapse empty tracks) was used instead of `auto-fill`.
+    grid_auto_fit: bool,
 }
 
 /// Parse a CSS value into `LengthPercentageAuto`.
@@ -4064,9 +4096,63 @@ fn parse_single_track(s: &str) -> Option<TrackSizingFunction> {
     None
 }
 
+/// Detect `repeat(auto-fill, minmax(Npx, 1fr))` or `repeat(auto-fit, ...)`.
+///
+/// Returns the minimum track size in px if matched, and sets `is_auto_fit`
+/// to `true` when `auto-fit` is used.  Returns `None` for any other pattern.
+fn parse_auto_fill_repeat(val: &str, is_auto_fit: &mut bool) -> Option<f32> {
+    let val = val.trim();
+    // Quick reject — must start with `repeat(`
+    let inner = val.strip_prefix("repeat(")?.strip_suffix(')')?;
+    let comma = inner.find(',')?;
+    let keyword = inner[..comma].trim();
+    match keyword {
+        "auto-fill" => *is_auto_fit = false,
+        "auto-fit" => *is_auto_fit = true,
+        _ => return None,
+    }
+    let track = inner[comma + 1..].trim();
+    // Expect `minmax(Npx, 1fr)` or just `Npx`
+    if let Some(minmax_inner) = track.strip_prefix("minmax(").and_then(|s| s.strip_suffix(')')) {
+        let mc = minmax_inner.find(',')?;
+        let min_str = minmax_inner[..mc].trim();
+        // Accept `Npx` as minimum
+        let px = min_str.strip_suffix("px")?.trim().parse::<f32>().ok()?;
+        Some(px)
+    } else if let Some(px) = track.strip_suffix("px").and_then(|n| n.trim().parse::<f32>().ok()) {
+        Some(px)
+    } else {
+        None
+    }
+}
+
+/// Strip CSS named grid line tokens (`[name]`) from a track list string.
+///
+/// Example: `"[start] 1fr [middle] 2fr [end]"` → `"1fr 2fr"`.
+fn strip_named_grid_lines(val: &str) -> String {
+    let mut result = String::with_capacity(val.len());
+    let mut inside_bracket = false;
+    for ch in val.chars() {
+        match ch {
+            '[' => inside_bracket = true,
+            ']' => {
+                inside_bracket = false;
+                // Add a space to separate tokens that were adjacent to brackets.
+                result.push(' ');
+            }
+            _ if !inside_bracket => result.push(ch),
+            _ => {} // skip chars inside brackets
+        }
+    }
+    result
+}
+
 /// Parse a CSS grid-template track list string such as:
 /// `1fr 2fr`, `repeat(3, 1fr)`, `200px 1fr`, `auto auto`.
 fn parse_track_list(val: &str) -> Option<Vec<TrackSizingFunction>> {
+    // Strip named grid lines like `[start]`, `[middle]` — we only use the
+    // track sizes for now and ignore the names.
+    let val = strip_named_grid_lines(val);
     let val = val.trim();
     if val.is_empty() {
         return None;
@@ -4455,7 +4541,17 @@ fn parse_layout_props(attributes: &[(String, String)], viewport: &Viewport) -> L
 
                 // ── Grid properties ────────────────────────────────────
                 "grid-template-columns" => {
-                    props.grid_template_columns = parse_track_list(val);
+                    // Detect `repeat(auto-fill, minmax(Npx, 1fr))` or
+                    // `repeat(auto-fit, minmax(Npx, 1fr))` — the most common
+                    // responsive grid pattern.  We extract the minimum track
+                    // size so we can compute the column count at layout time.
+                    if let Some(min_px) = parse_auto_fill_repeat(val, &mut props.grid_auto_fit) {
+                        props.grid_auto_fill_min_px = Some(min_px);
+                        // Don't set grid_template_columns yet — it will be
+                        // resolved in build_taffy_style using available width.
+                    } else {
+                        props.grid_template_columns = parse_track_list(val);
+                    }
                 }
                 "grid-template-rows" => {
                     props.grid_template_rows = parse_track_list(val);
@@ -4538,6 +4634,12 @@ fn parse_layout_props(attributes: &[(String, String)], viewport: &Viewport) -> L
                 }
                 "flex-direction" => {
                     props.flex_direction = Some(val.to_string());
+                }
+                "align-self" => {
+                    props.align_self = Some(val.to_string());
+                }
+                "justify-self" => {
+                    props.justify_self = Some(val.to_string());
                 }
 
                 "order" => {
@@ -4726,6 +4828,33 @@ fn map_flex_direction(val: &str) -> FlexDirection {
     }
 }
 
+/// Map a CSS `align-self` value to a Taffy `AlignSelf`.
+fn map_align_self(val: &str) -> Option<AlignSelf> {
+    match val.trim() {
+        "flex-start" | "start" => Some(AlignSelf::FlexStart),
+        "flex-end" | "end" => Some(AlignSelf::FlexEnd),
+        "center" => Some(AlignSelf::Center),
+        "baseline" => Some(AlignSelf::Baseline),
+        "stretch" => Some(AlignSelf::Stretch),
+        "auto" => None,
+        _ => None,
+    }
+}
+
+/// Map a CSS `justify-self` value to a Taffy `AlignSelf` (Taffy uses
+/// `Option<AlignSelf>` for the `justify_self` field on `Style`).
+fn map_justify_self(val: &str) -> Option<AlignSelf> {
+    match val.trim() {
+        "flex-start" | "start" => Some(AlignSelf::FlexStart),
+        "flex-end" | "end" => Some(AlignSelf::FlexEnd),
+        "center" => Some(AlignSelf::Center),
+        "baseline" => Some(AlignSelf::Baseline),
+        "stretch" => Some(AlignSelf::Stretch),
+        "auto" => None,
+        _ => None,
+    }
+}
+
 fn build_taffy_style(
     display: &str,
     tag: &str,
@@ -4891,8 +5020,9 @@ fn build_taffy_style(
                 align_self: if center_via_auto_margin {
                     Some(AlignSelf::Center)
                 } else {
-                    None
+                    lp.align_self.as_deref().and_then(map_align_self)
                 },
+                justify_self: lp.justify_self.as_deref().and_then(map_justify_self),
                 aspect_ratio: lp.aspect_ratio,
                 overflow,
                 box_sizing,
@@ -4951,8 +5081,9 @@ fn build_taffy_style(
                 align_self: if center_via_auto_margin {
                     Some(AlignSelf::Center)
                 } else {
-                    None
+                    lp.align_self.as_deref().and_then(map_align_self)
                 },
+                justify_self: lp.justify_self.as_deref().and_then(map_justify_self),
                 aspect_ratio: lp.aspect_ratio,
                 overflow,
                 box_sizing,
@@ -5804,6 +5935,79 @@ mod tests {
             "gap should be (10px row, 20px col), got {:?}",
             lp.gap
         );
+    }
+
+    #[test]
+    fn auto_fill_repeat_parses() {
+        let attrs = vec![(
+            "data-nova-style".into(),
+            "display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr))".into(),
+        )];
+        let vp = Viewport { width: 800.0, height: 600.0, scale_factor: 1.0 };
+        let lp = parse_layout_props(&attrs, &vp);
+        assert!(
+            (lp.grid_auto_fill_min_px.unwrap() - 250.0).abs() < 0.01,
+            "auto-fill min should be 250px, got {:?}",
+            lp.grid_auto_fill_min_px
+        );
+        assert!(!lp.grid_auto_fit, "should be auto-fill, not auto-fit");
+        // grid_template_columns should be None since auto-fill is deferred.
+        assert!(lp.grid_template_columns.is_none(), "columns should be deferred");
+    }
+
+    #[test]
+    fn auto_fit_repeat_parses() {
+        let mut is_fit = false;
+        let min = parse_auto_fill_repeat("repeat(auto-fit, minmax(200px, 1fr))", &mut is_fit);
+        assert!((min.unwrap() - 200.0).abs() < 0.01);
+        assert!(is_fit, "should be auto-fit");
+    }
+
+    #[test]
+    fn named_grid_lines_stripped() {
+        let tracks = parse_track_list("[start] 1fr [middle] 2fr [end]").unwrap();
+        assert_eq!(tracks.len(), 2, "named lines should be stripped, leaving 2 tracks");
+    }
+
+    #[test]
+    fn align_self_parses() {
+        let attrs = vec![(
+            "data-nova-style".into(),
+            "display: flex; align-self: center".into(),
+        )];
+        let vp = Viewport { width: 800.0, height: 600.0, scale_factor: 1.0 };
+        let lp = parse_layout_props(&attrs, &vp);
+        assert_eq!(lp.align_self.as_deref(), Some("center"));
+    }
+
+    #[test]
+    fn justify_self_parses() {
+        let attrs = vec![(
+            "data-nova-style".into(),
+            "display: grid; justify-self: end".into(),
+        )];
+        let vp = Viewport { width: 800.0, height: 600.0, scale_factor: 1.0 };
+        let lp = parse_layout_props(&attrs, &vp);
+        assert_eq!(lp.justify_self.as_deref(), Some("end"));
+    }
+
+    #[test]
+    fn strip_named_grid_lines_complex() {
+        let result = strip_named_grid_lines("[start] 100px [mid] 1fr [end]");
+        // Should contain "100px" and "1fr" but no brackets.
+        assert!(!result.contains('['));
+        assert!(!result.contains(']'));
+        assert!(result.contains("100px"));
+        assert!(result.contains("1fr"));
+    }
+
+    #[test]
+    fn auto_fill_column_count() {
+        // With 800px available and 250px min, we expect floor((800+0)/(250+0)) = 3 columns.
+        let mut is_fit = false;
+        let min = parse_auto_fill_repeat("repeat(auto-fill, minmax(250px, 1fr))", &mut is_fit).unwrap();
+        let n = ((800.0_f32 + 0.0) / (min + 0.0)).floor().max(1.0) as usize;
+        assert_eq!(n, 3, "800px / 250px min = 3 columns");
     }
 }
 

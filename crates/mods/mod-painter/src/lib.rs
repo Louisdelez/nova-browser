@@ -960,30 +960,31 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
     }
 
     // Paint CSS borders — supports per-side or shorthand borders.
+    // Supports solid, dashed, and dotted border styles.
     let borders = extract_borders_per_side(&layout_box.style);
     let bx = layout_box.x;
     let by = layout_box.y;
     let bw = layout_box.width;
     let bh = layout_box.height;
     // Top border
-    if let Some((w, color)) = borders.top {
+    if let Some((w, color, style)) = borders.top {
         let color = multiply_alpha(color, opacity);
-        ops.push(RenderOp::FillRect { x: bx, y: by, width: bw, height: w, color });
+        emit_border_side(ops, bx, by, bw, w, true, color, style);
     }
     // Bottom border
-    if let Some((w, color)) = borders.bottom {
+    if let Some((w, color, style)) = borders.bottom {
         let color = multiply_alpha(color, opacity);
-        ops.push(RenderOp::FillRect { x: bx, y: by + bh - w, width: bw, height: w, color });
+        emit_border_side(ops, bx, by + bh - w, bw, w, true, color, style);
     }
     // Left border
-    if let Some((w, color)) = borders.left {
+    if let Some((w, color, style)) = borders.left {
         let color = multiply_alpha(color, opacity);
-        ops.push(RenderOp::FillRect { x: bx, y: by, width: w, height: bh, color });
+        emit_border_side(ops, bx, by, w, bh, false, color, style);
     }
     // Right border
-    if let Some((w, color)) = borders.right {
+    if let Some((w, color, style)) = borders.right {
         let color = multiply_alpha(color, opacity);
-        ops.push(RenderOp::FillRect { x: bx + bw - w, y: by, width: w, height: bh, color });
+        emit_border_side(ops, bx + bw - w, by, w, bh, false, color, style);
     }
 
     // Paint CSS outline — similar to border but outside the border box, no layout impact.
@@ -2063,12 +2064,21 @@ fn extract_font_family(style: &nova_mod_api::content::StyleMap) -> Option<String
     None
 }
 
-/// Per-side border info.
+/// The style of a CSS border side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BorderLineStyle {
+    Solid,
+    Dashed,
+    Dotted,
+    Double,
+}
+
+/// Per-side border info: `(width, color, line_style)`.
 struct BorderSides {
-    top: Option<(f32, Color)>,
-    right: Option<(f32, Color)>,
-    bottom: Option<(f32, Color)>,
-    left: Option<(f32, Color)>,
+    top: Option<(f32, Color, BorderLineStyle)>,
+    right: Option<(f32, Color, BorderLineStyle)>,
+    bottom: Option<(f32, Color, BorderLineStyle)>,
+    left: Option<(f32, Color, BorderLineStyle)>,
 }
 
 /// Extract per-side CSS border properties from a style map.
@@ -2106,14 +2116,20 @@ fn extract_borders_per_side(style: &nova_mod_api::content::StyleMap) -> BorderSi
         let _ = (target_width, target_color); // suppress unused
     }
 
-    let make_side = |i: usize| -> Option<(f32, Color)> {
+    let make_side = |i: usize| -> Option<(f32, Color, BorderLineStyle)> {
         let style_val = side_style[i].as_deref().or(sh_style.as_deref()).unwrap_or("none");
         if style_val == "none" || style_val == "hidden" {
             return None;
         }
         let w = side_width[i].or(sh_width).unwrap_or(1.0);
         let c = side_color[i].or(sh_color).unwrap_or(Color::BLACK);
-        if w > 0.0 { Some((w, c)) } else { None }
+        let ls = match style_val {
+            "dashed" => BorderLineStyle::Dashed,
+            "dotted" => BorderLineStyle::Dotted,
+            "double" => BorderLineStyle::Double,
+            _ => BorderLineStyle::Solid,
+        };
+        if w > 0.0 { Some((w, c, ls)) } else { None }
     };
 
     BorderSides {
@@ -2121,6 +2137,75 @@ fn extract_borders_per_side(style: &nova_mod_api::content::StyleMap) -> BorderSi
         right: make_side(1),
         bottom: make_side(2),
         left: make_side(3),
+    }
+}
+
+/// Emit render ops for a single border side with the given style.
+///
+/// For `horizontal == true`, the border runs along the x-axis (top/bottom);
+/// for `horizontal == false`, it runs along the y-axis (left/right).
+/// `rect_w` and `rect_h` are the full rectangle dimensions of the side
+/// (e.g. for a top border: width = element width, height = border thickness).
+fn emit_border_side(
+    ops: &mut Vec<RenderOp>,
+    x: f32, y: f32,
+    rect_w: f32, rect_h: f32,
+    horizontal: bool,
+    color: Color,
+    style: BorderLineStyle,
+) {
+    match style {
+        BorderLineStyle::Solid => {
+            ops.push(RenderOp::FillRect { x, y, width: rect_w, height: rect_h, color });
+        }
+        BorderLineStyle::Dashed => {
+            // Dashed: segments of 3*thickness on, 3*thickness off.
+            let thickness = if horizontal { rect_h } else { rect_w };
+            let seg_len = (thickness * 3.0).max(4.0);
+            let total_len = if horizontal { rect_w } else { rect_h };
+            let mut offset = 0.0;
+            let mut draw = true;
+            while offset < total_len {
+                let len = seg_len.min(total_len - offset);
+                if draw {
+                    if horizontal {
+                        ops.push(RenderOp::FillRect { x: x + offset, y, width: len, height: rect_h, color });
+                    } else {
+                        ops.push(RenderOp::FillRect { x, y: y + offset, width: rect_w, height: len, color });
+                    }
+                }
+                offset += seg_len;
+                draw = !draw;
+            }
+        }
+        BorderLineStyle::Dotted => {
+            // Dotted: square dots spaced by one dot-width apart.
+            let dot_size = if horizontal { rect_h } else { rect_w };
+            let dot_size = dot_size.max(1.0);
+            let total_len = if horizontal { rect_w } else { rect_h };
+            let mut offset = 0.0;
+            while offset < total_len {
+                let len = dot_size.min(total_len - offset);
+                if horizontal {
+                    ops.push(RenderOp::FillRect { x: x + offset, y, width: len, height: rect_h, color });
+                } else {
+                    ops.push(RenderOp::FillRect { x, y: y + offset, width: rect_w, height: len, color });
+                }
+                offset += dot_size * 2.0; // dot + gap
+            }
+        }
+        BorderLineStyle::Double => {
+            // Double: two lines with a gap equal to the line width between them.
+            let thickness = if horizontal { rect_h } else { rect_w };
+            let line_w = (thickness / 3.0).max(1.0);
+            if horizontal {
+                ops.push(RenderOp::FillRect { x, y, width: rect_w, height: line_w, color });
+                ops.push(RenderOp::FillRect { x, y: y + rect_h - line_w, width: rect_w, height: line_w, color });
+            } else {
+                ops.push(RenderOp::FillRect { x, y, width: line_w, height: rect_h, color });
+                ops.push(RenderOp::FillRect { x: x + rect_w - line_w, y, width: line_w, height: rect_h, color });
+            }
+        }
     }
 }
 

@@ -669,13 +669,30 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
             // Draw underline if text-decoration: underline is set.
             if has_text_decoration_underline(&layout_box.style) {
                 let underline_y = layout_box.y + font_size + 2.0;
-                ops.push(RenderOp::FillRect {
-                    x: layout_box.x,
-                    y: underline_y,
-                    width: layout_box.width,
-                    height: 1.0,
-                    color: text_color,
-                });
+                let is_dotted = has_text_decoration_dotted(&layout_box.style);
+                if is_dotted {
+                    // Draw dotted underline: alternating 2px on, 2px off.
+                    let mut dx = 0.0;
+                    while dx < layout_box.width {
+                        let seg_w = (2.0_f32).min(layout_box.width - dx);
+                        ops.push(RenderOp::FillRect {
+                            x: layout_box.x + dx,
+                            y: underline_y,
+                            width: seg_w,
+                            height: 1.0,
+                            color: text_color,
+                        });
+                        dx += 4.0; // 2px drawn + 2px gap
+                    }
+                } else {
+                    ops.push(RenderOp::FillRect {
+                        x: layout_box.x,
+                        y: underline_y,
+                        width: layout_box.width,
+                        height: 1.0,
+                        color: text_color,
+                    });
+                }
             }
         }
     }
@@ -1900,6 +1917,21 @@ fn has_text_decoration_underline(style: &nova_mod_api::content::StyleMap) -> boo
             match value {
                 StyleValue::Keyword(k) | StyleValue::Str(k) => {
                     return k.contains("underline");
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// Check if the style map contains `text-decoration: ... dotted ...`.
+fn has_text_decoration_dotted(style: &nova_mod_api::content::StyleMap) -> bool {
+    for (key, value) in &style.properties {
+        if key == "text-decoration" {
+            match value {
+                StyleValue::Keyword(k) | StyleValue::Str(k) => {
+                    return k.contains("dotted");
                 }
                 _ => {}
             }

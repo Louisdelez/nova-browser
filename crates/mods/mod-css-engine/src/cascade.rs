@@ -1765,6 +1765,10 @@ fn apply_presentational_attributes(
             "nowrap" if matches!(tag, "td" | "th") => {
                 result.push(("white-space".into(), "nowrap".into()));
             }
+            // <abbr title="..."> gets a dotted underline.
+            "title" if tag == "abbr" => {
+                result.push(("text-decoration".into(), "underline dotted".into()));
+            }
             _ => {}
         }
     }

@@ -277,6 +277,60 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
         _ => {}
     }
 
+    // Definition lists: <dl>, <dt>, <dd>.
+    match tag {
+        "dt" => {
+            props.push(("font-weight".into(), StyleValue::Keyword("bold".into())));
+        }
+        "dd" => {
+            props.push(("margin-left".into(), StyleValue::Px(40.0)));
+        }
+        _ => {}
+    }
+
+    // <fieldset> — grouped form section with a border.
+    if tag == "fieldset" {
+        props.push(("border-width".into(), StyleValue::Px(2.0)));
+        props.push(("border-style".into(), StyleValue::Keyword("groove".into())));
+        props.push(("border-color".into(), StyleValue::Str("#c0c0c0".into())));
+        props.push(("padding-top".into(), StyleValue::Px(8.0)));
+        props.push(("padding-right".into(), StyleValue::Px(12.0)));
+        props.push(("padding-bottom".into(), StyleValue::Px(8.0)));
+        props.push(("padding-left".into(), StyleValue::Px(12.0)));
+        props.push(("margin-top".into(), StyleValue::Px(0.0)));
+        props.push(("margin-bottom".into(), StyleValue::Px(0.0)));
+    }
+
+    // <mark> — highlighted text with yellow background.
+    if tag == "mark" {
+        props.push((
+            "background-color".into(),
+            StyleValue::Color(CssColor {
+                r: 255,
+                g: 255,
+                b: 0,
+                a: 1.0,
+            }),
+        ));
+    }
+
+    // <abbr> with title — dotted underline (handled as default for all abbr;
+    // the [title] attribute condition is checked in the cascade).
+    if tag == "abbr" {
+        // Default: no decoration. The cascade adds dotted underline when title is present.
+    }
+
+    // <details> — collapsible content block.
+    if tag == "details" {
+        props.push(("padding-top".into(), StyleValue::Px(2.0)));
+        props.push(("padding-bottom".into(), StyleValue::Px(2.0)));
+    }
+
+    // <summary> — always-visible toggle for <details>.
+    if tag == "summary" {
+        props.push(("cursor".into(), StyleValue::Keyword("pointer".into())));
+    }
+
     // Links.
     if tag == "a" {
         props.push((
@@ -303,8 +357,8 @@ pub fn display_for_tag(tag: &str) -> &'static str {
         "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "body" | "html" | "section"
         | "article" | "header" | "footer" | "nav" | "main" | "ul" | "ol" | "li"
         | "blockquote" | "pre" | "form" | "hr" | "figure" | "figcaption" | "center"
-        | "details" | "summary" | "dialog" | "address" | "fieldset" | "dd" | "dt" | "dl"
-        | "hgroup" | "search" => "block",
+        | "details" | "summary" | "dialog" | "address" | "fieldset" | "legend" | "dd" | "dt"
+        | "dl" | "hgroup" | "search" => "block",
         // Table elements
         "table" | "thead" | "tbody" | "tfoot" => "block",
         "tr" => "table-row",

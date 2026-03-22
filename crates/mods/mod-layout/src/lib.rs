@@ -1066,14 +1066,58 @@ fn add_node(
                 }
             });
 
+            // ── <details> element ────────────────────────────────────
+            // When a <details> element does not have the `open` attribute,
+            // only <summary> children are visible; all others are hidden.
+            // We prepend a disclosure triangle marker to the <summary>.
+            let details_children: Option<Vec<DomNode>> = if tag == "details" {
+                let is_open = attributes.iter().any(|(k, _)| k == "open");
+                let mut filtered: Vec<DomNode> = Vec::new();
+                let mut has_summary = false;
+                for child in children.iter() {
+                    match child {
+                        DomNode::Element { tag: child_tag, attributes: a, children: ch }
+                            if child_tag == "summary" =>
+                        {
+                            has_summary = true;
+                            let triangle = if is_open { "\u{25BE} " } else { "\u{25B8} " };
+                            let mut new_ch = ch.clone();
+                            new_ch.insert(0, DomNode::Text(triangle.to_string()));
+                            filtered.push(DomNode::Element {
+                                tag: child_tag.clone(),
+                                attributes: a.clone(),
+                                children: new_ch,
+                            });
+                        }
+                        _ => {
+                            if is_open {
+                                filtered.push(child.clone());
+                            }
+                        }
+                    }
+                }
+                if !has_summary {
+                    let triangle = if is_open { "\u{25BE} " } else { "\u{25B8} " };
+                    filtered.insert(0, DomNode::Element {
+                        tag: "summary".into(),
+                        attributes: vec![],
+                        children: vec![DomNode::Text(format!("{triangle}Details"))],
+                    });
+                }
+                Some(filtered)
+            } else {
+                None
+            };
+            let children_ref: &[DomNode] = details_children.as_deref().unwrap_or(children);
+
             // ── Inline Formatting Context ──────────────────────────
             // For block containers and table cells, group consecutive
             // inline children into inline formatting contexts so they
             // flow together, wrap across lines, and share baselines.
             let child_ids = if display == "block" || display == "table-cell" {
-                build_children_with_ifc(taffy, children, child_available, font_size, &props, viewport, depth)?
+                build_children_with_ifc(taffy, children_ref, child_available, font_size, &props, viewport, depth)?
             } else {
-                children
+                children_ref
                     .iter()
                     .map(|c| add_node(taffy, c, child_available, font_size, &props, viewport, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?

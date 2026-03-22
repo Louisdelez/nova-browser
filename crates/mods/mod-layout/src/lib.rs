@@ -1803,50 +1803,98 @@ fn flatten_node_recursive(
                 items.push(InlineItem::Image { src, width: w, height: h });
                 return;
             }
-            // Inline form fields: submit/button/reset inputs and <button>.
-            if tag == "input" || tag == "button" {
-                let input_type = if tag == "input" {
-                    attributes.iter()
+            // Inline form fields: all <input> types, <button>, <select>, <textarea>.
+            if matches!(tag.as_str(), "input" | "button" | "select" | "textarea") {
+                let input_type = match tag.as_str() {
+                    "input" => attributes.iter()
                         .find(|(k, _)| k == "type")
                         .map(|(_, v)| v.clone())
-                        .unwrap_or_else(|| "text".to_string())
-                } else {
-                    "button".to_string()
+                        .unwrap_or_else(|| "text".to_string()),
+                    "button" => "button".to_string(),
+                    "select" => "select".to_string(),
+                    "textarea" => "textarea".to_string(),
+                    _ => "text".to_string(),
                 };
-                if matches!(input_type.as_str(), "submit" | "button" | "reset" | "checkbox" | "radio" | "image") {
-                    let label = if matches!(input_type.as_str(), "checkbox" | "radio") {
-                        String::new()
-                    } else if tag == "button" {
-                        let mut text = String::new();
-                        for child in children {
-                            if let DomNode::Text(t) = child { text.push_str(t); }
-                        }
-                        if text.trim().is_empty() { "Button".to_string() } else { text.trim().to_string() }
-                    } else {
-                        attributes.iter()
-                            .find(|(k, _)| k == "value")
-                            .map(|(_, v)| v.clone())
-                            .unwrap_or_else(|| {
-                                input_type.chars().next().unwrap().to_uppercase().to_string() + &input_type[1..]
-                            })
-                    };
-                    let (w, h) = if matches!(input_type.as_str(), "checkbox" | "radio") {
-                        (13.0_f32, 13.0_f32)
-                    } else {
-                        let text_w = if label.is_empty() { 0.0 } else { measure_text_width(&label, font_size) };
-                        let pad = 24.0; // horizontal padding for buttons
-                        (text_w + pad, font_size * LINE_HEIGHT_FACTOR + 6.0)
-                    };
-                    items.push(InlineItem::FormField {
-                        tag: tag.clone(),
-                        input_type,
-                        label,
-                        width: w,
-                        height: h,
-                        style: style_props.to_vec(),
-                    });
+                // Hidden inputs are invisible.
+                if input_type == "hidden" {
                     return;
                 }
+                let label = if matches!(input_type.as_str(), "checkbox" | "radio") {
+                    String::new()
+                } else if tag == "button" {
+                    let mut text = String::new();
+                    for child in children {
+                        if let DomNode::Text(t) = child { text.push_str(t); }
+                    }
+                    if text.trim().is_empty() { "Button".to_string() } else { text.trim().to_string() }
+                } else if tag == "select" {
+                    children.iter().find_map(|c| {
+                        if let DomNode::Element { tag: t, children: cc, .. } = c {
+                            if t == "option" {
+                                return cc.iter().find_map(|c2| {
+                                    if let DomNode::Text(t) = c2 { Some(t.trim().to_string()) } else { None }
+                                });
+                            }
+                        }
+                        None
+                    }).unwrap_or_else(|| "Select".into())
+                } else if tag == "textarea" {
+                    attributes.iter()
+                        .find(|(k, _)| k == "placeholder")
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default()
+                } else if matches!(input_type.as_str(), "submit" | "button" | "reset") {
+                    attributes.iter()
+                        .find(|(k, _)| k == "value")
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| {
+                            input_type.chars().next().unwrap().to_uppercase().to_string() + &input_type[1..]
+                        })
+                } else {
+                    // text/password/email/search/url/tel/number/date etc.
+                    attributes.iter()
+                        .find(|(k, _)| k == "value")
+                        .or_else(|| attributes.iter().find(|(k, _)| k == "placeholder"))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default()
+                };
+                let line_height = font_size * LINE_HEIGHT_FACTOR;
+                let (w, h) = if matches!(input_type.as_str(), "checkbox" | "radio") {
+                    (13.0_f32, 13.0_f32)
+                } else if tag == "textarea" {
+                    let cols: f32 = attributes.iter().find(|(k,_)| k == "cols").and_then(|(_, v)| v.parse().ok()).unwrap_or(20.0);
+                    let rows: f32 = attributes.iter().find(|(k,_)| k == "rows").and_then(|(_, v)| v.parse().ok()).unwrap_or(2.0);
+                    (cols * font_size * 0.6, rows * line_height)
+                } else if matches!(input_type.as_str(), "submit" | "button" | "reset") || tag == "button" {
+                    let text_w = if label.is_empty() { 0.0 } else { measure_text_width(&label, font_size) };
+                    let pad = 24.0; // horizontal padding for buttons
+                    (text_w + pad, line_height + 6.0)
+                } else {
+                    // Text-like inputs and <select>: use size attribute or default min width.
+                    let text_w = if label.is_empty() { 0.0 } else { measure_text_width(&label, font_size) };
+                    let pad = 12.0;
+                    let size_attr_w: Option<f32> = if tag == "input" {
+                        attributes.iter()
+                            .find(|(k, _)| k == "size")
+                            .and_then(|(_, v)| v.parse::<f32>().ok())
+                            .map(|chars| chars * font_size * 0.6)
+                    } else {
+                        None
+                    };
+                    let min_w = if tag == "select" { 40.0 } else { 150.0 };
+                    let default_w = size_attr_w
+                        .unwrap_or((text_w + pad).max(min_w));
+                    (default_w, line_height + 6.0)
+                };
+                items.push(InlineItem::FormField {
+                    tag: tag.clone(),
+                    input_type,
+                    label,
+                    width: w,
+                    height: h,
+                    style: style_props.to_vec(),
+                });
+                return;
             }
 
             // Inherit style from this inline element.

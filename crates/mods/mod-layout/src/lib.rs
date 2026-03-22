@@ -1415,6 +1415,36 @@ fn add_node(
                 taffy_style.flex_wrap = FlexWrap::Wrap;
             }
 
+            // ── text-align on block containers ──────────────────────
+            // When a block container has `text-align: right` (or center),
+            // apply alignment for row-wrap (float) contexts and for
+            // column flex containers with inline children.
+            // In row-wrap mode: `justify-content` controls horizontal
+            // alignment of items on each row.
+            // In column mode: `align-items` controls cross-axis (horizontal)
+            // alignment of block children.
+            let block_text_align = props.iter()
+                .find(|(k, _)| k == "text-align")
+                .and_then(|(_, v)| match v {
+                    StyleValue::Keyword(k) | StyleValue::Str(k) => Some(k.as_str()),
+                    _ => None,
+                });
+            if let Some(ta) = block_text_align {
+                if has_floated_children && display == "block" && column_count.is_none() {
+                    // Row-wrap mode (float container): justify-content works
+                    // on the main (horizontal) axis.
+                    match ta {
+                        "right" | "end" => {
+                            taffy_style.justify_content = Some(JustifyContent::FlexEnd);
+                        }
+                        "center" => {
+                            taffy_style.justify_content = Some(JustifyContent::Center);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             let content_type = if tag == "dialog" {
                 LayoutContent::Dialog
             } else {
@@ -1733,6 +1763,27 @@ fn build_children_with_ifc(
                 i += 1;
             }
             let inline_run = &children[start..i];
+
+            // Skip inline runs that consist only of whitespace text and <br>
+            // elements between block siblings. These inter-block runs should
+            // not produce visible line boxes (which would add unwanted height
+            // and break margin collapsing between adjacent blocks).
+            let is_inter_block_whitespace = inline_run.iter().all(|node| {
+                match node {
+                    DomNode::Text(t) => t.trim().is_empty(),
+                    DomNode::Comment(_) => true,
+                    DomNode::Element { tag, .. } => tag == "br",
+                    _ => true,
+                }
+            });
+            // Only skip if there is a block before AND after (or at end).
+            let has_block_before = !result.is_empty() || start == 0;
+            let has_block_after = i >= children.len() || !is_inline_node(&children[i]);
+            if is_inter_block_whitespace && has_block_before && has_block_after {
+                // Skip — do not emit any line boxes for this run.
+                continue;
+            }
+
             // Flatten the inline run and create line boxes.
             let line_ids = layout_inline_run(
                 taffy, inline_run, available_width, parent_font_size, parent_style_props,

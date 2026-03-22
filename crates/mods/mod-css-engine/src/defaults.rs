@@ -227,23 +227,25 @@ pub fn default_style_for_tag(tag: &str) -> StyleMap {
             props.push(("display".into(), StyleValue::Keyword("inline-block".into())));
             props.push(("border-width".into(), StyleValue::Px(1.0)));
             props.push(("border-style".into(), StyleValue::Keyword("solid".into())));
-            props.push(("border-color".into(), StyleValue::Str("#767676".into())));
-            props.push(("padding-top".into(), StyleValue::Px(2.0)));
-            props.push(("padding-right".into(), StyleValue::Px(4.0)));
-            props.push(("padding-bottom".into(), StyleValue::Px(2.0)));
-            props.push(("padding-left".into(), StyleValue::Px(4.0)));
-            props.push(("background-color".into(), StyleValue::Color(CssColor { r: 255, g: 255, b: 255, a: 1.0 })));
+            props.push(("border-color".into(), StyleValue::Str("#dadce0".into())));
+            props.push(("border-radius".into(), StyleValue::Px(4.0)));
+            props.push(("padding-top".into(), StyleValue::Px(8.0)));
+            props.push(("padding-right".into(), StyleValue::Px(16.0)));
+            props.push(("padding-bottom".into(), StyleValue::Px(8.0)));
+            props.push(("padding-left".into(), StyleValue::Px(16.0)));
+            props.push(("background-color".into(), StyleValue::Color(CssColor { r: 248, g: 249, b: 250, a: 1.0 })));
         }
         "button" => {
             props.push(("display".into(), StyleValue::Keyword("inline-block".into())));
             props.push(("border-width".into(), StyleValue::Px(1.0)));
             props.push(("border-style".into(), StyleValue::Keyword("solid".into())));
-            props.push(("border-color".into(), StyleValue::Str("#767676".into())));
-            props.push(("padding-top".into(), StyleValue::Px(2.0)));
-            props.push(("padding-right".into(), StyleValue::Px(8.0)));
-            props.push(("padding-bottom".into(), StyleValue::Px(2.0)));
-            props.push(("padding-left".into(), StyleValue::Px(8.0)));
-            props.push(("background-color".into(), StyleValue::Color(CssColor { r: 239, g: 239, b: 239, a: 1.0 })));
+            props.push(("border-color".into(), StyleValue::Str("#dadce0".into())));
+            props.push(("border-radius".into(), StyleValue::Px(4.0)));
+            props.push(("padding-top".into(), StyleValue::Px(8.0)));
+            props.push(("padding-right".into(), StyleValue::Px(16.0)));
+            props.push(("padding-bottom".into(), StyleValue::Px(8.0)));
+            props.push(("padding-left".into(), StyleValue::Px(16.0)));
+            props.push(("background-color".into(), StyleValue::Color(CssColor { r: 248, g: 249, b: 250, a: 1.0 })));
             props.push(("text-align".into(), StyleValue::Keyword("center".into())));
         }
         "select" => {

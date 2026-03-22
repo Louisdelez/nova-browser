@@ -2504,14 +2504,17 @@ fn paint_form_field_visual(layout_box: &LayoutBox, info: &FormFieldInfo, ops: &m
         }
 
         "submit" | "button" | "reset" => {
-            let bg_color = Color::rgb(0.93, 0.93, 0.93);
-            let border_color = Color::rgb(0.6, 0.6, 0.6);
-            let radius = [3.0; 4];
+            // Light gray background with subtle border, matching Chrome's
+            // default form button appearance (#f8f9fa bg, #dadce0 border).
+            let bg_color = Color::rgb(0.973, 0.976, 0.98); // #f8f9fa
+            let border_color = Color::rgb(0.855, 0.867, 0.878); // #dadce0
+            let radius = [4.0; 4];
             ops.push(RenderOp::FillRoundedRect { x, y, width: w, height: h, color: bg_color, radius });
-            ops.push(RenderOp::FillRect { x, y, width: w, height: 1.0, color: border_color });
-            ops.push(RenderOp::FillRect { x, y: y + h - 1.0, width: w, height: 1.0, color: border_color });
-            ops.push(RenderOp::FillRect { x, y, width: 1.0, height: h, color: border_color });
-            ops.push(RenderOp::FillRect { x: x + w - 1.0, y, width: 1.0, height: h, color: border_color });
+            // Draw border as four 1px rects with rounded-rect clipping approximation.
+            ops.push(RenderOp::FillRoundedRect { x, y, width: w, height: 1.0, color: border_color, radius: [4.0, 4.0, 0.0, 0.0] });
+            ops.push(RenderOp::FillRoundedRect { x, y: y + h - 1.0, width: w, height: 1.0, color: border_color, radius: [0.0, 0.0, 4.0, 4.0] });
+            ops.push(RenderOp::FillRect { x, y: y + 1.0, width: 1.0, height: h - 2.0, color: border_color });
+            ops.push(RenderOp::FillRect { x: x + w - 1.0, y: y + 1.0, width: 1.0, height: h - 2.0, color: border_color });
             let label = if info.value.is_empty() {
                 match info.field_type.as_str() {
                     "submit" => "Submit",

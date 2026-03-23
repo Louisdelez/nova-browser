@@ -91,10 +91,26 @@ impl NovaMod for PainterMod {
                     .collect();
 
                 let mut ops = Vec::new();
+
+                // CSS spec: body background-color propagates to the canvas.
+                // Detect body/html background and emit a viewport-filling rect
+                // as the very first op so it fills the entire viewport.
+                if let Some(canvas_bg) = extract_canvas_background(&root) {
+                    if canvas_bg.a > 0.0 {
+                        ops.push(RenderOp::FillRect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 100_000.0, // large enough for any viewport
+                            height: 100_000.0,
+                            color: canvas_bg,
+                        });
+                    }
+                }
+
                 paint_box(&root, &mut ops, &images_map, &canvas_map);
 
                 debug!(op_count = ops.len(), "painting complete");
-                Ok(TypedData::RenderCommands(RenderCommands { ops, fonts: vec![], spa_push_url: None, spa_replace_url: None }))
+                Ok(TypedData::RenderCommands(RenderCommands { ops, fonts: vec![], spa_push_url: None, spa_replace_url: None, page_title: None, favicon_url: None }))
             }
             other => Err(NovaError::UnsupportedContent(format!(
                 "painter cannot handle request: {other:?}"
@@ -744,27 +760,36 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
                 let img_height = u32::from_le_bytes([decoded[4], decoded[5], decoded[6], decoded[7]]);
                 let pixels = decoded[8..].to_vec();
 
+                // If the image has no explicit dimensions (nova-natural-size marker),
+                // draw at its natural decoded size instead of the layout placeholder.
+                let use_natural = extract_style_str(&layout_box.style, "nova-natural-size") == "true";
+                let (box_w, box_h) = if use_natural && img_width > 0 && img_height > 0 {
+                    (img_width as f32, img_height as f32)
+                } else {
+                    (layout_box.width, layout_box.height)
+                };
+
                 // Apply object-fit to determine draw dimensions.
                 let (draw_x, draw_y, draw_w, draw_h, needs_clip) = compute_object_fit(
                     &layout_box.style,
                     layout_box.x, layout_box.y,
-                    layout_box.width, layout_box.height,
+                    box_w, box_h,
                     img_width as f32, img_height as f32,
                 );
 
                 // Check for border-radius on images — clip with rounded rect.
-                let img_radius = extract_border_radius(&layout_box.style, layout_box.width, layout_box.height);
+                let img_radius = extract_border_radius(&layout_box.style, box_w, box_h);
                 let has_img_radius = img_radius.iter().any(|&r| r > 0.0);
                 if has_img_radius {
                     ops.push(RenderOp::PushRoundedClip {
                         x: layout_box.x, y: layout_box.y,
-                        width: layout_box.width, height: layout_box.height,
+                        width: box_w, height: box_h,
                         radius: img_radius,
                     });
                 } else if needs_clip {
                     ops.push(RenderOp::PushClip {
                         x: layout_box.x, y: layout_box.y,
-                        width: layout_box.width, height: layout_box.height,
+                        width: box_w, height: box_h,
                     });
                 }
 
@@ -1058,6 +1083,18 @@ fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<S
         ops.push(RenderOp::Anchor {
             id: element_id,
             y: layout_box.y,
+        });
+    }
+
+    // Emit a CursorHint op for elements with CSS `cursor` property.
+    let cursor_prop = extract_style_str(&layout_box.style, "cursor");
+    if !cursor_prop.is_empty() && cursor_prop != "auto" && cursor_prop != "default" {
+        ops.push(RenderOp::CursorHint {
+            x: layout_box.x,
+            y: layout_box.y,
+            width: layout_box.width,
+            height: layout_box.height,
+            cursor: cursor_prop,
         });
     }
 
@@ -1854,6 +1891,50 @@ fn extract_background_color(style: &nova_mod_api::content::StyleMap) -> Color {
         }
     }
     Color::TRANSPARENT
+}
+
+/// Extract the canvas background color per CSS spec.
+///
+/// Per CSS 2.1 Section 14.2, when the `<html>` element has a transparent
+/// background, the `<body>` background propagates to the canvas (viewport).
+/// This function walks the root layout tree to find the html/body background.
+fn extract_canvas_background(root: &LayoutBox) -> Option<Color> {
+    // Check the root element (typically html).
+    let root_tag = extract_style_str(&root.style, "nova-tag");
+
+    if root_tag == "html" {
+        let html_bg = extract_background_color(&root.style);
+        if html_bg.a > 0.0 {
+            return Some(html_bg);
+        }
+        // HTML has no background — check body (first child with nova-tag=body).
+        for child in &root.children {
+            let child_tag = extract_style_str(&child.style, "nova-tag");
+            if child_tag == "body" {
+                let body_bg = extract_background_color(&child.style);
+                if body_bg.a > 0.0 {
+                    return Some(body_bg);
+                }
+            }
+        }
+    } else if root_tag == "body" {
+        let body_bg = extract_background_color(&root.style);
+        if body_bg.a > 0.0 {
+            return Some(body_bg);
+        }
+    } else {
+        // Root is not html or body — check children recursively for body.
+        for child in &root.children {
+            let tag = extract_style_str(&child.style, "nova-tag");
+            if tag == "html" || tag == "body" {
+                if let Some(bg) = extract_canvas_background(child) {
+                    return Some(bg);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Extract the text color from a style map, defaulting to black.

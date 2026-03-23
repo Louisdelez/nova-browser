@@ -92,6 +92,24 @@ impl HitRegion {
     }
 }
 
+/// A region with a custom CSS cursor.
+#[derive(Debug, Clone)]
+pub struct CursorRegion {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// CSS cursor keyword: "pointer", "text", "crosshair", "move", etc.
+    pub cursor: String,
+}
+
+impl CursorRegion {
+    /// Test whether a point (in page coordinates) falls inside this region.
+    fn contains(&self, px: f32, py: f32) -> bool {
+        px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
+    }
+}
+
 /// An interactive form field region on the page.
 #[derive(Debug, Clone)]
 pub struct FormFieldRegion {
@@ -485,6 +503,27 @@ impl BrowserWindow {
             .collect()
     }
 
+    /// Extract cursor hint regions from `RenderOp::CursorHint` entries.
+    fn extract_cursor_regions(commands: &RenderCommands) -> Vec<CursorRegion> {
+        commands
+            .ops
+            .iter()
+            .filter_map(|op| {
+                if let RenderOp::CursorHint { x, y, width, height, cursor } = op {
+                    Some(CursorRegion {
+                        x: *x,
+                        y: *y,
+                        width: *width,
+                        height: *height,
+                        cursor: cursor.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Extract anchor regions from `RenderOp::Anchor` entries in the render commands.
     fn extract_anchor_regions(commands: &RenderCommands) -> Vec<AnchorRegion> {
         commands
@@ -720,7 +759,36 @@ impl BrowserWindow {
                 if over_text_field {
                     w.set_cursor(CursorIcon::Text);
                 } else {
-                    w.set_cursor(CursorIcon::Default);
+                    // Check for CSS cursor regions (e.g. cursor: pointer).
+                    let css_cursor = tab.cursor_regions.iter().rev().find(|r| r.contains(page_x, page_y));
+                    if let Some(region) = css_cursor {
+                        let icon = match region.cursor.as_str() {
+                            "pointer" => CursorIcon::Pointer,
+                            "text" => CursorIcon::Text,
+                            "crosshair" => CursorIcon::Crosshair,
+                            "move" => CursorIcon::Move,
+                            "not-allowed" | "no-drop" => CursorIcon::NotAllowed,
+                            "wait" => CursorIcon::Wait,
+                            "progress" => CursorIcon::Progress,
+                            "help" => CursorIcon::Help,
+                            "grab" => CursorIcon::Grab,
+                            "grabbing" => CursorIcon::Grabbing,
+                            "col-resize" => CursorIcon::ColResize,
+                            "row-resize" => CursorIcon::RowResize,
+                            "n-resize" | "s-resize" | "ns-resize" => CursorIcon::NsResize,
+                            "e-resize" | "w-resize" | "ew-resize" => CursorIcon::EwResize,
+                            "ne-resize" | "sw-resize" | "nesw-resize" => CursorIcon::NeswResize,
+                            "nw-resize" | "se-resize" | "nwse-resize" => CursorIcon::NwseResize,
+                            "zoom-in" => CursorIcon::ZoomIn,
+                            "zoom-out" => CursorIcon::ZoomOut,
+                            "cell" => CursorIcon::Cell,
+                            "none" => CursorIcon::Default, // winit has no hidden cursor
+                            _ => CursorIcon::Default,
+                        };
+                        w.set_cursor(icon);
+                    } else {
+                        w.set_cursor(CursorIcon::Default);
+                    }
                 }
             } else {
                 w.set_cursor(CursorIcon::Default);
@@ -2233,9 +2301,11 @@ impl BrowserWindow {
         match result {
             Ok(TypedData::RenderCommands(cmds)) => {
                 info!("POST navigation successful! {} render ops", cmds.ops.len());
+                let post_page_title = cmds.page_title.clone();
                 let tab = self.tabs.active_tab_mut();
                 tab.hit_regions = Self::extract_hit_regions(&cmds);
                 tab.form_fields = Self::extract_form_fields(&cmds);
+                tab.cursor_regions = Self::extract_cursor_regions(&cmds);
                 tab.focused_field = None;
                 tab.form_cursor_pos = 0;
                 tab.form_selection = None;
@@ -2249,14 +2319,15 @@ impl BrowserWindow {
                 tab.scroll_target_y = 0.0;
                 tab.scroll_target_x = 0.0;
                 tab.url = url.to_string();
-                tab.title = url.to_string();
+                tab.title = post_page_title.clone().unwrap_or_else(|| url.to_string());
 
                 self.url_bar_focused = false;
                 self.url_bar_select_all = false;
                 self.url_bar_text = url.to_string();
                 self.url_bar_cursor = self.url_bar_text.len();
+                let post_win_title = post_page_title.unwrap_or_else(|| self.url_bar_text.clone());
                 if let Some(w) = &self.window {
-                    w.set_title(&format!("NOVA - {}", self.url_bar_text));
+                    w.set_title(&format!("NOVA - {}", post_win_title));
                 }
                 self.apply_autofocus();
                 self.request_redraw();
@@ -2660,7 +2731,7 @@ impl BrowserWindow {
 
     /// Open a new tab and navigate to the given URL.
     fn open_new_tab(&mut self, url: &str) {
-        let commands = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None };
+        let commands = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None, page_title: None, favicon_url: None };
         self.tabs.new_tab(url, commands);
         self.sync_url_bar_from_active_tab();
 
@@ -2770,10 +2841,14 @@ impl BrowserWindow {
                     .or(spa_replace.as_deref())
                     .unwrap_or(url);
 
+                // Extract page title from render commands (falls back to URL).
+                let page_title = cmds.page_title.clone();
+
                 let tab = self.tabs.active_tab_mut();
                 tab.hit_regions = Self::extract_hit_regions(&cmds);
                 tab.form_fields = Self::extract_form_fields(&cmds);
                 tab.anchor_regions = Self::extract_anchor_regions(&cmds);
+                tab.cursor_regions = Self::extract_cursor_regions(&cmds);
                 tab.focused_field = None;
                 tab.form_cursor_pos = 0;
                 tab.form_selection = None;
@@ -2787,7 +2862,7 @@ impl BrowserWindow {
                 tab.scroll_target_y = 0.0;
                 tab.scroll_target_x = 0.0;
                 tab.url = effective_url.to_string();
-                tab.title = effective_url.to_string();
+                tab.title = page_title.clone().unwrap_or_else(|| effective_url.to_string());
 
                 // Push or replace in navigation history depending on SPA mode.
                 if spa_replace.is_some() {
@@ -2801,12 +2876,14 @@ impl BrowserWindow {
                 self.url_bar_text = effective_url.to_string();
                 self.url_bar_cursor = self.url_bar_text.len();
 
-                // Record in persistent history.
-                self.persistent_history.record(effective_url, effective_url);
+                // Record in persistent history with page title.
+                let history_title = page_title.as_deref().unwrap_or(effective_url);
+                self.persistent_history.record(effective_url, history_title);
 
-                // Update window title.
+                // Update window title — use page title if available.
+                let window_title = page_title.unwrap_or_else(|| self.url_bar_text.clone());
                 if let Some(w) = &self.window {
-                    w.set_title(&format!("NOVA - {}", self.url_bar_text));
+                    w.set_title(&format!("NOVA - {}", window_title));
                 }
 
                 // Scroll to anchor if URL has a fragment.
@@ -2879,10 +2956,12 @@ impl BrowserWindow {
         match result {
             Ok(TypedData::RenderCommands(cmds)) => {
                 info!("Navigation successful! {} render ops", cmds.ops.len());
+                let nav_page_title = cmds.page_title.clone();
                 let tab = self.tabs.active_tab_mut();
                 tab.hit_regions = Self::extract_hit_regions(&cmds);
                 tab.form_fields = Self::extract_form_fields(&cmds);
                 tab.anchor_regions = Self::extract_anchor_regions(&cmds);
+                tab.cursor_regions = Self::extract_cursor_regions(&cmds);
                 tab.focused_field = None;
                 tab.form_cursor_pos = 0;
                 tab.form_selection = None;
@@ -2896,17 +2975,19 @@ impl BrowserWindow {
                 tab.scroll_target_y = 0.0;
                 tab.scroll_target_x = 0.0;
                 tab.url = url.to_string();
-                tab.title = url.to_string();
+                tab.title = nav_page_title.clone().unwrap_or_else(|| url.to_string());
 
                 self.url_bar_focused = false;
                 self.url_bar_select_all = false;
                 self.url_bar_text = url.to_string();
                 self.url_bar_cursor = self.url_bar_text.len();
 
-                self.persistent_history.record(url, url);
+                let nav_history_title = nav_page_title.as_deref().unwrap_or(url);
+                self.persistent_history.record(url, nav_history_title);
 
+                let nav_win_title = nav_page_title.unwrap_or_else(|| self.url_bar_text.clone());
                 if let Some(w) = &self.window {
-                    w.set_title(&format!("NOVA - {}", self.url_bar_text));
+                    w.set_title(&format!("NOVA - {}", nav_win_title));
                 }
 
                 self.apply_autofocus();
@@ -3033,6 +3114,7 @@ pre {{ font-family: monospace; font-size: 13px; white-space: pre-wrap; word-wrap
                     tab.hit_regions = Self::extract_hit_regions(&cmds);
                     tab.form_fields = Self::extract_form_fields(&cmds);
                     tab.anchor_regions = Self::extract_anchor_regions(&cmds);
+                    tab.cursor_regions = Self::extract_cursor_regions(&cmds);
                     tab.content_height = Self::compute_content_height(&cmds);
                     tab.content_width = Self::compute_content_width(&cmds);
                     tab.render_commands = cmds;

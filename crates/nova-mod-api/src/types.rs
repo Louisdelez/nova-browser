@@ -59,6 +59,14 @@ pub struct RenderCommands {
     /// When present, the shell should update the URL bar and replace the
     /// current history entry without triggering a full page navigation.
     pub spa_replace_url: Option<String>,
+    /// The page title extracted from `<title>` element.
+    ///
+    /// When present, the shell should use this as the tab title instead of the URL.
+    pub page_title: Option<String>,
+    /// The favicon URL extracted from `<link rel="icon">`.
+    ///
+    /// Stored for future use (favicon rendering in the tab bar).
+    pub favicon_url: Option<String>,
 }
 
 /// Individual render operations.
@@ -246,6 +254,18 @@ pub enum RenderOp {
         id: String,
         /// Y coordinate of the anchor in page coordinates.
         y: f32,
+    },
+    /// A cursor hint for a rectangular region.
+    ///
+    /// Emitted by the painter when an element has a CSS `cursor` property.
+    /// The window uses these to change the mouse cursor on hover.
+    CursorHint {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        /// CSS cursor keyword: "pointer", "text", "crosshair", "move", etc.
+        cursor: String,
     },
     /// Fill a rectangle with rounded corners using an SDF approach.
     ///

@@ -62,11 +62,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Ok(_) => {
             info!("Navigation returned non-RenderCommands, using empty frame");
-            RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None }
+            RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None, page_title: None, favicon_url: None }
         }
         Err(e) => {
             error!("Navigation failed: {e}");
-            RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None }
+            RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None, page_title: None, favicon_url: None }
         }
     };
 

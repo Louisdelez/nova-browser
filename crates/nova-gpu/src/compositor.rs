@@ -566,6 +566,8 @@ mod tests {
             fonts: vec![],
             spa_push_url: None,
             spa_replace_url: None,
+            page_title: None,
+            favicon_url: None,
         }
     }
 
@@ -777,6 +779,8 @@ mod tests {
             fonts: vec![],
             spa_push_url: None,
             spa_replace_url: None,
+            page_title: None,
+            favicon_url: None,
         };
         tree.update_content(&new_commands);
         assert!(tree.needs_repaint());

@@ -300,6 +300,21 @@ impl PipelineEngine {
             _ => SubResources::default(),
         };
 
+        // Step 3b: Extract page title and favicon URL from the DOM.
+        let (page_title, favicon_url) = match &dom {
+            TypedData::Dom(node) => (
+                extract_page_title(node),
+                extract_favicon_url(node, &base_url),
+            ),
+            _ => (None, None),
+        };
+        if let Some(ref title) = page_title {
+            info!("Pipeline: page title = '{title}'");
+        }
+        if let Some(ref fav) = favicon_url {
+            info!("Pipeline: favicon URL = '{fav}'");
+        }
+
         // Step 4: Fetch external stylesheets (in parallel)
         let mut stylesheets = self.fetch_stylesheets_parallel(&sub_resources.stylesheets).await;
         info!(
@@ -447,6 +462,12 @@ impl PipelineEngine {
             }
         }
 
+        // Step 10b: Inject page title and favicon URL.
+        if let TypedData::RenderCommands(ref mut cmds) = render_commands {
+            cmds.page_title = page_title;
+            cmds.favicon_url = favicon_url;
+        }
+
         info!("Pipeline: navigation complete");
         Ok(render_commands)
     }
@@ -486,7 +507,7 @@ h1 {{ color: #666; }}</style></head>
         if html.is_empty() {
             // about:blank — return minimal empty render commands.
             return Ok(TypedData::RenderCommands(
-                nova_mod_api::RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None },
+                nova_mod_api::RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None, page_title: None, favicon_url: None },
             ));
         }
 
@@ -538,7 +559,7 @@ h1 {{ font-size: 20px; font-weight: normal; color: #202124; margin-bottom: 8px; 
             Err(_) => {
                 // Absolute fallback: empty render commands.
                 Ok(TypedData::RenderCommands(
-                    nova_mod_api::RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None },
+                    nova_mod_api::RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None, page_title: None, favicon_url: None },
                 ))
             }
         }
@@ -582,7 +603,7 @@ h1 {{ font-size: 22px; font-weight: normal; color: #ea4335; }}
         match self.render_html_string(&html, viewport).await {
             Ok(result) => Ok(result),
             Err(_) => Ok(TypedData::RenderCommands(
-                nova_mod_api::RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None },
+                nova_mod_api::RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None, page_title: None, favicon_url: None },
             )),
         }
     }
@@ -1536,6 +1557,84 @@ fn extract_css_url_from_value(value: &str) -> Option<String> {
     };
     let url_str = url_str.trim();
     if url_str.is_empty() { None } else { Some(url_str.to_string()) }
+}
+
+/// Extract the page title from the `<title>` element in the DOM.
+///
+/// Walks the DOM tree looking for `<head><title>...</title></head>` and returns
+/// the text content. Returns `None` if no title element is found.
+fn extract_page_title(node: &DomNode) -> Option<String> {
+    match node {
+        DomNode::Element { tag, children, .. } => {
+            if tag.eq_ignore_ascii_case("title") {
+                // Collect all text children.
+                let text: String = children
+                    .iter()
+                    .filter_map(|c| {
+                        if let DomNode::Text(t) = c { Some(t.as_str()) } else { None }
+                    })
+                    .collect();
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+            for child in children {
+                if let Some(title) = extract_page_title(child) {
+                    return Some(title);
+                }
+            }
+            None
+        }
+        DomNode::Document { children } => {
+            for child in children {
+                if let Some(title) = extract_page_title(child) {
+                    return Some(title);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Extract the favicon URL from `<link rel="icon" href="...">` in the DOM.
+///
+/// Looks for `<link>` elements with `rel="icon"`, `rel="shortcut icon"`, or
+/// `rel="apple-touch-icon"` and returns the resolved `href` URL.
+fn extract_favicon_url(node: &DomNode, base_url: &Option<Url>) -> Option<String> {
+    match node {
+        DomNode::Element { tag, attributes, children, .. } => {
+            if tag.eq_ignore_ascii_case("link") {
+                let rel = attributes
+                    .iter()
+                    .find(|(k, _)| k == "rel")
+                    .map(|(_, v)| v.to_lowercase());
+                if matches!(rel.as_deref(), Some("icon") | Some("shortcut icon") | Some("apple-touch-icon")) {
+                    if let Some((_, href)) = attributes.iter().find(|(k, _)| k == "href") {
+                        if !href.is_empty() {
+                            return Some(resolve_url(href, base_url));
+                        }
+                    }
+                }
+            }
+            for child in children {
+                if let Some(url) = extract_favicon_url(child, base_url) {
+                    return Some(url);
+                }
+            }
+            None
+        }
+        DomNode::Document { children } => {
+            for child in children {
+                if let Some(url) = extract_favicon_url(child, base_url) {
+                    return Some(url);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Check if an image source looks like a favicon or small icon that does not

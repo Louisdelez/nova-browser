@@ -858,6 +858,13 @@ fn add_node(
                 // data-nova-style, including percentages like `width:100%`).
                 let img_lp = parse_layout_props(attributes, viewport);
 
+                // Check if the image has explicit HTML width/height attributes.
+                let has_attr_w = attributes.iter().any(|(k, v)| k == "width" && v.parse::<f32>().is_ok());
+                let has_attr_h = attributes.iter().any(|(k, v)| k == "height" && v.parse::<f32>().is_ok());
+                let has_css_w = img_lp.width.is_some();
+                let has_css_h = img_lp.height.is_some();
+                let has_explicit_size = has_attr_w || has_attr_h || has_css_w || has_css_h;
+
                 // Fall back to HTML width/height attributes, then defaults.
                 let attr_w: f32 = attributes
                     .iter()
@@ -873,9 +880,19 @@ fn add_node(
                 let w_dim = img_lp.width.unwrap_or(Dimension::Length(attr_w.min(available_width)));
                 let h_dim = img_lp.height.unwrap_or(Dimension::Length(attr_h));
 
+                // Mark images without explicit dimensions so the painter can
+                // use the decoded image's natural size instead of the placeholder.
+                let mut img_style = StyleMap::default();
+                if !has_explicit_size {
+                    img_style.properties.push((
+                        "nova-natural-size".into(),
+                        StyleValue::Keyword("true".into()),
+                    ));
+                }
+
                 let ctx = NodeContext {
                     content: LayoutContent::Image { src, alt },
-                    style: StyleMap::default(),
+                    style: img_style,
                 };
                 return taffy
                     .new_leaf_with_context(
@@ -1173,6 +1190,12 @@ fn add_node(
                         }
                     }
                 }
+            }
+
+            // Propagate the tag name for body/html so the painter can
+            // implement CSS canvas background propagation.
+            if tag == "body" || tag == "html" {
+                props.push(("nova-tag".into(), StyleValue::Str(tag.to_string())));
             }
 
             // Propagate the href attribute for <a> elements so the painter

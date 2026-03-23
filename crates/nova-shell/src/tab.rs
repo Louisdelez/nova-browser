@@ -8,7 +8,7 @@ use std::time::Instant;
 use nova_mod_api::RenderCommands;
 
 use crate::history::HistoryStack;
-use crate::window::{AnchorRegion, FormFieldRegion, HitRegion};
+use crate::window::{AnchorRegion, CursorRegion, FormFieldRegion, HitRegion};
 
 /// A single browser tab.
 pub struct Tab {
@@ -34,6 +34,8 @@ pub struct Tab {
     pub form_fields: Vec<FormFieldRegion>,
     /// Anchor regions for #section scrolling.
     pub anchor_regions: Vec<AnchorRegion>,
+    /// Regions with custom CSS cursor properties.
+    pub cursor_regions: Vec<CursorRegion>,
     /// Navigation history for this tab.
     pub history: HistoryStack,
 
@@ -109,6 +111,7 @@ impl Tab {
             hit_regions: Vec::new(),
             form_fields: Vec::new(),
             anchor_regions: Vec::new(),
+            cursor_regions: Vec::new(),
             history: HistoryStack::new(url),
             focused_field: None,
             form_cursor_pos: 0,
@@ -239,7 +242,7 @@ mod tests {
     use super::*;
 
     fn make_tab(url: &str) -> Tab {
-        Tab::new(0, url, RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None })
+        Tab::new(0, url, RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None, page_title: None, favicon_url: None })
     }
 
     #[test]
@@ -252,7 +255,7 @@ mod tests {
     #[test]
     fn new_tab_becomes_active() {
         let mut mgr = TabManager::new(make_tab("http://a.com"));
-        let commands = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None };
+        let commands = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None, page_title: None, favicon_url: None };
         mgr.new_tab("http://b.com", commands);
         assert_eq!(mgr.tab_count(), 2);
         assert_eq!(mgr.active_tab().url, "http://b.com");
@@ -262,7 +265,7 @@ mod tests {
     #[test]
     fn switch_tabs() {
         let mut mgr = TabManager::new(make_tab("http://a.com"));
-        let commands = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None };
+        let commands = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None, page_title: None, favicon_url: None };
         mgr.new_tab("http://b.com", commands);
 
         mgr.switch_to(0);
@@ -279,8 +282,8 @@ mod tests {
     #[test]
     fn close_tab_adjusts_active() {
         let mut mgr = TabManager::new(make_tab("http://a.com"));
-        let c1 = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None };
-        let c2 = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None };
+        let c1 = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None, page_title: None, favicon_url: None };
+        let c2 = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None, page_title: None, favicon_url: None };
         mgr.new_tab("http://b.com", c1);
         mgr.new_tab("http://c.com", c2);
 
@@ -302,7 +305,7 @@ mod tests {
     #[test]
     fn close_active_tab_selects_previous() {
         let mut mgr = TabManager::new(make_tab("http://a.com"));
-        let c1 = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None };
+        let c1 = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None, page_title: None, favicon_url: None };
         mgr.new_tab("http://b.com", c1);
 
         // Active is b.com (index 1). Close it.
@@ -314,8 +317,8 @@ mod tests {
     #[test]
     fn next_and_prev_tab_cycle() {
         let mut mgr = TabManager::new(make_tab("http://a.com"));
-        let c1 = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None };
-        let c2 = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None };
+        let c1 = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None, page_title: None, favicon_url: None };
+        let c2 = RenderCommands { ops: vec![], fonts: vec![], spa_push_url: None, spa_replace_url: None, page_title: None, favicon_url: None };
         mgr.new_tab("http://b.com", c1);
         mgr.new_tab("http://c.com", c2);
 

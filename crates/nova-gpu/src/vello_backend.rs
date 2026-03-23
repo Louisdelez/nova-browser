@@ -486,7 +486,8 @@ impl VelloBackend {
                 | RenderOp::FixedEnd
                 | RenderOp::Link { .. }
                 | RenderOp::FormField { .. }
-                | RenderOp::Anchor { .. } => {}
+                | RenderOp::Anchor { .. }
+                | RenderOp::CursorHint { .. } => {}
             }
         }
 

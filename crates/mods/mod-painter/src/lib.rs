@@ -398,8 +398,36 @@ fn extract_nova_offset(style: &nova_mod_api::content::StyleMap, prop: &str) -> O
 
 /// Recursively paint a layout box into render operations.
 fn paint_box(layout_box: &LayoutBox, ops: &mut Vec<RenderOp>, images: &HashMap<String, Vec<u8>>, canvas_map: &HashMap<String, (u32, u32, Vec<u8>)>) {
-    // Skip zero-sized boxes (display: none, comments, etc.).
+    // Skip zero-sized boxes (display: none, comments, etc.),
+    // but still emit FormField ops for hidden inputs so they participate
+    // in form submission.
     if layout_box.width <= 0.0 && layout_box.height <= 0.0 {
+        if let Some(info) = extract_form_field(&layout_box.style) {
+            if info.field_type == "hidden" {
+                ops.push(RenderOp::FormField {
+                    x: 0.0, y: 0.0, width: 0.0, height: 0.0,
+                    value: info.value,
+                    field_type: info.field_type,
+                    name: info.name,
+                    form_action: info.form_action,
+                    form_method: info.form_method,
+                    form_enctype: info.form_enctype,
+                    placeholder: String::new(),
+                    checked: false,
+                    required: false,
+                    options: vec![],
+                    pattern: String::new(),
+                    min: String::new(),
+                    max: String::new(),
+                    maxlength: None,
+                    minlength: None,
+                    autofocus: false,
+                    tabindex: None,
+                    title: String::new(),
+                    pointer_events_none: true,
+                });
+            }
+        }
         return;
     }
 

@@ -17,6 +17,35 @@ pub enum Orientation {
     Landscape,
 }
 
+/// Hover capability.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HoverCapability {
+    /// Device supports hover (e.g. mouse).
+    Hover,
+    /// Device does not support hover (e.g. touchscreen).
+    None,
+}
+
+/// Pointer precision.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PointerPrecision {
+    /// Precise pointer (e.g. mouse).
+    Fine,
+    /// Imprecise pointer (e.g. finger on touchscreen).
+    Coarse,
+    /// No pointer device.
+    None,
+}
+
+/// Reduced-motion preference.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReducedMotion {
+    /// User prefers reduced motion.
+    Reduce,
+    /// No preference (default).
+    NoPreference,
+}
+
 /// A single media query condition.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MediaCondition {
@@ -32,6 +61,12 @@ pub enum MediaCondition {
     Orientation(Orientation),
     /// `(prefers-color-scheme: light|dark)`.
     PrefersColorScheme(String),
+    /// `(hover: hover|none)`.
+    Hover(HoverCapability),
+    /// `(pointer: fine|coarse|none)`.
+    Pointer(PointerPrecision),
+    /// `(prefers-reduced-motion: reduce|no-preference)`.
+    PrefersReducedMotion(ReducedMotion),
     /// `screen` media type — always matches for a screen browser.
     Screen,
     /// `print` media type — never matches for a screen browser.
@@ -84,6 +119,18 @@ pub fn evaluate_media_query(
             MediaCondition::PrefersColorScheme(scheme) => {
                 // Default to light mode for now.
                 scheme == "light"
+            }
+            MediaCondition::Hover(cap) => {
+                // Desktop browser: we have hover capability (mouse).
+                *cap == HoverCapability::Hover
+            }
+            MediaCondition::Pointer(prec) => {
+                // Desktop browser: fine pointer (mouse).
+                *prec == PointerPrecision::Fine
+            }
+            MediaCondition::PrefersReducedMotion(pref) => {
+                // Default: no-preference.
+                *pref == ReducedMotion::NoPreference
             }
             MediaCondition::Screen => true,
             MediaCondition::Print => false,
@@ -234,6 +281,31 @@ fn parse_feature_expression(expr: &str) -> Option<MediaCondition> {
                 value.to_ascii_lowercase(),
             ))
         }
+        "hover" => {
+            let cap = match value.to_ascii_lowercase().as_str() {
+                "hover" => HoverCapability::Hover,
+                "none" => HoverCapability::None,
+                _ => return None,
+            };
+            Some(MediaCondition::Hover(cap))
+        }
+        "pointer" => {
+            let prec = match value.to_ascii_lowercase().as_str() {
+                "fine" => PointerPrecision::Fine,
+                "coarse" => PointerPrecision::Coarse,
+                "none" => PointerPrecision::None,
+                _ => return None,
+            };
+            Some(MediaCondition::Pointer(prec))
+        }
+        "prefers-reduced-motion" => {
+            let pref = match value.to_ascii_lowercase().as_str() {
+                "reduce" => ReducedMotion::Reduce,
+                "no-preference" => ReducedMotion::NoPreference,
+                _ => return None,
+            };
+            Some(MediaCondition::PrefersReducedMotion(pref))
+        }
         _ => {
             debug!(name = name.as_str(), "unknown media feature");
             None
@@ -370,5 +442,98 @@ mod tests {
         let q = parse_media_query("(min-width: 48em)");
         assert!(evaluate_media_query(&q, 800.0, 600.0));
         assert!(!evaluate_media_query(&q, 700.0, 600.0));
+    }
+
+    // ── Hover / Pointer / Reduced-motion tests ──────────────────────────
+
+    #[test]
+    fn media_query_hover_hover_matches() {
+        let q = parse_media_query("(hover: hover)");
+        assert!(evaluate_media_query(&q, 1280.0, 720.0));
+    }
+
+    #[test]
+    fn media_query_hover_none_does_not_match() {
+        let q = parse_media_query("(hover: none)");
+        assert!(!evaluate_media_query(&q, 1280.0, 720.0));
+    }
+
+    #[test]
+    fn media_query_pointer_fine_matches() {
+        let q = parse_media_query("(pointer: fine)");
+        assert!(evaluate_media_query(&q, 1280.0, 720.0));
+    }
+
+    #[test]
+    fn media_query_pointer_coarse_does_not_match() {
+        let q = parse_media_query("(pointer: coarse)");
+        assert!(!evaluate_media_query(&q, 1280.0, 720.0));
+    }
+
+    #[test]
+    fn media_query_pointer_none_does_not_match() {
+        let q = parse_media_query("(pointer: none)");
+        assert!(!evaluate_media_query(&q, 1280.0, 720.0));
+    }
+
+    #[test]
+    fn media_query_prefers_reduced_motion_reduce() {
+        let q = parse_media_query("(prefers-reduced-motion: reduce)");
+        // Default is no-preference, so reduce should NOT match.
+        assert!(!evaluate_media_query(&q, 1280.0, 720.0));
+    }
+
+    #[test]
+    fn media_query_prefers_reduced_motion_no_preference() {
+        let q = parse_media_query("(prefers-reduced-motion: no-preference)");
+        // Default is no-preference, so this should match.
+        assert!(evaluate_media_query(&q, 1280.0, 720.0));
+    }
+
+    // ── Comprehensive responsive layout tests ───────────────────────────
+
+    #[test]
+    fn media_query_1280_viewport_scenarios() {
+        // Rules inside @media (max-width: 768px) should NOT apply (1280 > 768).
+        let q = parse_media_query("(max-width: 768px)");
+        assert!(!evaluate_media_query(&q, 1280.0, 720.0));
+
+        // Rules inside @media (min-width: 1024px) should apply (1280 >= 1024).
+        let q = parse_media_query("(min-width: 1024px)");
+        assert!(evaluate_media_query(&q, 1280.0, 720.0));
+
+        // Rules inside @media (max-width: 1440px) should apply (1280 <= 1440).
+        let q = parse_media_query("(max-width: 1440px)");
+        assert!(evaluate_media_query(&q, 1280.0, 720.0));
+    }
+
+    #[test]
+    fn media_query_screen_and_width_range() {
+        // screen and (min-width: 768px) and (max-width: 1200px)
+        let q = parse_media_query("screen and (min-width: 768px) and (max-width: 1200px)");
+        assert!(evaluate_media_query(&q, 900.0, 600.0));
+        assert!(!evaluate_media_query(&q, 1280.0, 720.0));
+        assert!(!evaluate_media_query(&q, 500.0, 400.0));
+    }
+
+    #[test]
+    fn media_query_landscape_at_1280x720() {
+        let q = parse_media_query("(orientation: landscape)");
+        assert!(evaluate_media_query(&q, 1280.0, 720.0));
+    }
+
+    #[test]
+    fn media_query_portrait_at_1280x720() {
+        let q = parse_media_query("(orientation: portrait)");
+        assert!(!evaluate_media_query(&q, 1280.0, 720.0));
+    }
+
+    #[test]
+    fn media_query_combined_hover_and_pointer() {
+        let q = parse_media_query("(hover: hover) and (pointer: fine)");
+        assert!(evaluate_media_query(&q, 1280.0, 720.0));
+
+        let q = parse_media_query("(hover: none) and (pointer: coarse)");
+        assert!(!evaluate_media_query(&q, 1280.0, 720.0));
     }
 }

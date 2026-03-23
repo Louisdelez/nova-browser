@@ -1647,8 +1647,11 @@ impl BrowserWindow {
 
         match &event.logical_key {
             Key::Named(NamedKey::Enter) => {
-                let url = self.url_bar_text.clone();
+                let raw = self.url_bar_text.trim().to_string();
+                let url = normalize_url_or_search(&raw);
                 info!("URL bar: navigating to {url}");
+                self.url_bar_text = url.clone();
+                self.url_bar_cursor = self.url_bar_text.len();
                 self.navigate_in_place(&url);
                 return false;
             }
@@ -3871,6 +3874,38 @@ fn url_encode(s: &str) -> String {
         }
     }
     result
+}
+
+/// Normalize user input from the URL bar into a navigable URL.
+///
+/// If the input looks like a URL (contains "://" or "." with no spaces,
+/// or is an `about:` / `file:` / `data:` URL), treat it as a URL
+/// (prepending `https://` if no scheme is present).
+/// Otherwise, treat it as a search query and navigate to Google Search.
+fn normalize_url_or_search(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Already has a scheme.
+    if trimmed.contains("://") || trimmed.starts_with("about:") || trimmed.starts_with("data:") || trimmed.starts_with("file:") {
+        return trimmed.to_string();
+    }
+
+    // Looks like a domain (contains a dot, no spaces).
+    if trimmed.contains('.') && !trimmed.contains(' ') {
+        return format!("https://{trimmed}");
+    }
+
+    // Localhost with optional port.
+    if trimmed.starts_with("localhost") && !trimmed.contains(' ') {
+        return format!("http://{trimmed}");
+    }
+
+    // Otherwise, treat as a search query.
+    let encoded = url_encode(trimmed);
+    format!("https://www.google.com/search?q={encoded}")
 }
 
 /// WGSL shader for blitting a texture to a fullscreen quad.

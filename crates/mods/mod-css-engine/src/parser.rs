@@ -69,15 +69,33 @@ struct MediaQuery {
     min_width: Option<f32>,
     /// Maximum viewport width (inclusive) in px.
     max_width: Option<f32>,
+    /// Minimum viewport height (inclusive) in px.
+    min_height: Option<f32>,
+    /// Maximum viewport height (inclusive) in px.
+    max_height: Option<f32>,
     /// If `true`, the query always evaluates to `false` (e.g. `print`).
     never: bool,
     /// Expected color scheme: Some("dark"), Some("light"), or None (no preference).
     prefers_color_scheme: Option<String>,
+    /// Expected orientation: Some("portrait") or Some("landscape"), or None.
+    orientation: Option<String>,
+    /// Expected hover capability: Some("hover") or Some("none"), or None.
+    hover: Option<String>,
+    /// Expected pointer precision: Some("fine"), Some("coarse"), or Some("none"), or None.
+    pointer: Option<String>,
+    /// Expected reduced-motion preference: Some("reduce") or Some("no-preference"), or None.
+    prefers_reduced_motion: Option<String>,
 }
 
+/// Default viewport height used when only viewport_width is available.
+///
+/// Many call sites only pass viewport_width; this constant provides a
+/// reasonable fallback for height-based media queries.
+const DEFAULT_VIEWPORT_HEIGHT: f32 = 720.0;
+
 impl MediaQuery {
-    /// Evaluate this query against a viewport width.
-    fn evaluate(&self, viewport_width: f32) -> bool {
+    /// Evaluate this query against a viewport width and height.
+    fn evaluate_full(&self, viewport_width: f32, viewport_height: f32) -> bool {
         if self.never {
             return false;
         }
@@ -88,6 +106,47 @@ impl MediaQuery {
         }
         if let Some(max) = self.max_width {
             if viewport_width > max {
+                return false;
+            }
+        }
+        if let Some(min) = self.min_height {
+            if viewport_height < min {
+                return false;
+            }
+        }
+        if let Some(max) = self.max_height {
+            if viewport_height > max {
+                return false;
+            }
+        }
+        if let Some(ref orient) = self.orientation {
+            let actual = if viewport_height >= viewport_width {
+                "portrait"
+            } else {
+                "landscape"
+            };
+            if orient != actual {
+                return false;
+            }
+        }
+        if let Some(ref hover_val) = self.hover {
+            // Desktop browser: we have hover capability.
+            let actual = "hover";
+            if hover_val != actual {
+                return false;
+            }
+        }
+        if let Some(ref pointer_val) = self.pointer {
+            // Desktop browser: fine pointer (mouse).
+            let actual = "fine";
+            if pointer_val != actual {
+                return false;
+            }
+        }
+        if let Some(ref motion_val) = self.prefers_reduced_motion {
+            // Default: no-preference (user has not requested reduced motion).
+            let actual = "no-preference";
+            if motion_val != actual {
                 return false;
             }
         }
@@ -121,23 +180,43 @@ impl MediaQuery {
         }
         true
     }
+
+    /// Evaluate this query against a viewport width (using default height).
+    fn evaluate(&self, viewport_width: f32) -> bool {
+        self.evaluate_full(viewport_width, DEFAULT_VIEWPORT_HEIGHT)
+    }
 }
 
 /// Parse a simple media query string into a `MediaQuery`.
 ///
-/// Supports: `screen`, `all`, `print`, `not print`,
-/// `(min-width: Npx)`, `(max-width: Npx)`,
+/// Supports: `screen`, `all`, `print`, `not print`, `only screen`,
+/// `(min-width: Npx)`, `(max-width: Npx)`, `(min-height: Npx)`,
+/// `(max-height: Npx)`, `(orientation: portrait|landscape)`,
+/// `(hover: hover|none)`, `(pointer: fine|coarse|none)`,
+/// `(prefers-reduced-motion: reduce|no-preference)`,
+/// `(prefers-color-scheme: light|dark)`,
 /// `screen and (max-width: Npx)`, and combinations with `and`.
 fn parse_media_query(query: &str) -> MediaQuery {
-    let query = query.trim();
+    let mut query = query.trim();
+
+    // Strip `only` prefix (no semantic effect in modern CSS).
+    if let Some(rest) = query.strip_prefix("only ").or_else(|| query.strip_prefix("only\t")) {
+        query = rest.trim();
+    }
 
     // `print` medium — never matches in a screen browser.
     if query.eq_ignore_ascii_case("print") {
         return MediaQuery {
             min_width: None,
             max_width: None,
+            min_height: None,
+            max_height: None,
             never: true,
             prefers_color_scheme: None,
+            orientation: None,
+            hover: None,
+            pointer: None,
+            prefers_reduced_motion: None,
         };
     }
 
@@ -146,16 +225,28 @@ fn parse_media_query(query: &str) -> MediaQuery {
         return MediaQuery {
             min_width: None,
             max_width: None,
+            min_height: None,
+            max_height: None,
             never: false,
             prefers_color_scheme: None,
+            orientation: None,
+            hover: None,
+            pointer: None,
+            prefers_reduced_motion: None,
         };
     }
 
     let mut mq = MediaQuery {
         min_width: None,
         max_width: None,
+        min_height: None,
+        max_height: None,
         never: false,
         prefers_color_scheme: None,
+        orientation: None,
+        hover: None,
+        pointer: None,
+        prefers_reduced_motion: None,
     };
 
     // Split by `and` and parse each condition.
@@ -169,7 +260,7 @@ fn parse_media_query(query: &str) -> MediaQuery {
             continue;
         }
 
-        // Try to parse `(min-width: Npx)` or `(max-width: Npx)`.
+        // Try to parse feature expressions.
         let inner = part.trim_start_matches('(').trim_end_matches(')').trim();
         if let Some(val_str) = inner.strip_prefix("min-width:").or(inner.strip_prefix("min-width :")) {
             if let Some(px) = parse_px_value(val_str.trim()) {
@@ -178,6 +269,34 @@ fn parse_media_query(query: &str) -> MediaQuery {
         } else if let Some(val_str) = inner.strip_prefix("max-width:").or(inner.strip_prefix("max-width :")) {
             if let Some(px) = parse_px_value(val_str.trim()) {
                 mq.max_width = Some(px);
+            }
+        } else if let Some(val_str) = inner.strip_prefix("min-height:").or(inner.strip_prefix("min-height :")) {
+            if let Some(px) = parse_px_value(val_str.trim()) {
+                mq.min_height = Some(px);
+            }
+        } else if let Some(val_str) = inner.strip_prefix("max-height:").or(inner.strip_prefix("max-height :")) {
+            if let Some(px) = parse_px_value(val_str.trim()) {
+                mq.max_height = Some(px);
+            }
+        } else if let Some(val_str) = inner.strip_prefix("orientation:").or(inner.strip_prefix("orientation :")) {
+            let orient = val_str.trim().to_lowercase();
+            if orient == "portrait" || orient == "landscape" {
+                mq.orientation = Some(orient);
+            }
+        } else if let Some(val_str) = inner.strip_prefix("hover:").or(inner.strip_prefix("hover :")) {
+            let hover_val = val_str.trim().to_lowercase();
+            if hover_val == "hover" || hover_val == "none" {
+                mq.hover = Some(hover_val);
+            }
+        } else if let Some(val_str) = inner.strip_prefix("pointer:").or(inner.strip_prefix("pointer :")) {
+            let pointer_val = val_str.trim().to_lowercase();
+            if pointer_val == "fine" || pointer_val == "coarse" || pointer_val == "none" {
+                mq.pointer = Some(pointer_val);
+            }
+        } else if let Some(val_str) = inner.strip_prefix("prefers-reduced-motion:").or(inner.strip_prefix("prefers-reduced-motion :")) {
+            let motion_val = val_str.trim().to_lowercase();
+            if motion_val == "reduce" || motion_val == "no-preference" {
+                mq.prefers_reduced_motion = Some(motion_val);
             }
         } else if let Some(val_str) = inner.strip_prefix("prefers-color-scheme:").or(inner.strip_prefix("prefers-color-scheme :")) {
             let scheme = val_str.trim().to_lowercase();
@@ -1055,5 +1174,155 @@ mod tests {
         "#;
         let rules = parse_stylesheet(css, TEST_VP);
         assert_eq!(rules.len(), 2, "both properties supported, block should be included");
+    }
+
+    // ── Responsive layout: orientation, hover, pointer, reduced-motion ──
+
+    #[test]
+    fn media_orientation_landscape_at_wide_viewport() {
+        let css = r#"
+            body { color: black; }
+            @media (orientation: landscape) {
+                .landscape-only { display: block; }
+            }
+        "#;
+        // 1280x720 is landscape → should include the rule.
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 2, "landscape should match at 1280x720");
+    }
+
+    #[test]
+    fn media_orientation_portrait_at_wide_viewport() {
+        let css = r#"
+            body { color: black; }
+            @media (orientation: portrait) {
+                .portrait-only { display: block; }
+            }
+        "#;
+        // 1280x720 is landscape → portrait should NOT match.
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 1, "portrait should not match at 1280x720");
+    }
+
+    #[test]
+    fn media_hover_hover_matches() {
+        let css = r#"
+            body { color: black; }
+            @media (hover: hover) {
+                .hoverable { text-decoration: underline; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 2, "hover: hover should match desktop browser");
+    }
+
+    #[test]
+    fn media_hover_none_skipped() {
+        let css = r#"
+            body { color: black; }
+            @media (hover: none) {
+                .touch-only { font-size: 20px; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 1, "hover: none should not match desktop browser");
+    }
+
+    #[test]
+    fn media_pointer_fine_matches() {
+        let css = r#"
+            body { color: black; }
+            @media (pointer: fine) {
+                .mouse-target { padding: 4px; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 2, "pointer: fine should match desktop browser");
+    }
+
+    #[test]
+    fn media_pointer_coarse_skipped() {
+        let css = r#"
+            body { color: black; }
+            @media (pointer: coarse) {
+                .touch-target { padding: 16px; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 1, "pointer: coarse should not match desktop browser");
+    }
+
+    #[test]
+    fn media_prefers_reduced_motion_reduce_skipped() {
+        let css = r#"
+            body { color: black; }
+            @media (prefers-reduced-motion: reduce) {
+                * { animation: none !important; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 1, "reduce should not match (default is no-preference)");
+    }
+
+    #[test]
+    fn media_prefers_reduced_motion_no_preference_matches() {
+        let css = r#"
+            body { color: black; }
+            @media (prefers-reduced-motion: no-preference) {
+                .animated { transition: all 0.3s; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 2, "no-preference should match default");
+    }
+
+    #[test]
+    fn media_only_screen_prefix() {
+        let css = r#"
+            body { color: black; }
+            @media only screen and (min-width: 768px) {
+                .wide { display: flex; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 2, "only screen should be treated same as screen");
+    }
+
+    #[test]
+    fn media_screen_and_hover_and_min_width() {
+        let css = r#"
+            body { color: black; }
+            @media screen and (hover: hover) and (min-width: 768px) {
+                .desktop-nav { display: flex; }
+            }
+        "#;
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 2, "screen + hover + min-width should all match");
+    }
+
+    #[test]
+    fn media_min_height_matches() {
+        let css = r#"
+            body { color: black; }
+            @media (min-height: 600px) {
+                .tall { display: block; }
+            }
+        "#;
+        // Default viewport height is 720, so min-height: 600 should match.
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 2, "min-height: 600 should match at 720px height");
+    }
+
+    #[test]
+    fn media_max_height_skipped() {
+        let css = r#"
+            body { color: black; }
+            @media (max-height: 400px) {
+                .short { font-size: 12px; }
+            }
+        "#;
+        // Default viewport height is 720, so max-height: 400 should NOT match.
+        let rules = parse_stylesheet(css, TEST_VP);
+        assert_eq!(rules.len(), 1, "max-height: 400 should not match at 720px height");
     }
 }

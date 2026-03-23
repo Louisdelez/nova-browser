@@ -526,9 +526,27 @@ fn add_node(
                     .map(|(_, v)| v.as_str())
                     .unwrap_or("text");
                 if input_type_early == "hidden" {
+                    // Hidden inputs need form field props so they're included
+                    // in form submission, even though they're not visible.
+                    let mut hidden_props = Vec::new();
+                    hidden_props.push(("nova-form-type".into(), StyleValue::Str("hidden".into())));
+                    if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "name") {
+                        hidden_props.push(("nova-form-name".into(), StyleValue::Str(v.clone())));
+                    }
+                    if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "value") {
+                        hidden_props.push(("nova-form-value".into(), StyleValue::Str(v.clone())));
+                    } else {
+                        hidden_props.push(("nova-form-value".into(), StyleValue::Str(String::new())));
+                    }
+                    // Inherit form action/method/enctype from parent <form>.
+                    for (k, v) in parent_style_props {
+                        if matches!(k.as_str(), "nova-form-action" | "nova-form-method" | "nova-form-enctype") {
+                            hidden_props.push((k.clone(), v.clone()));
+                        }
+                    }
                     let ctx = NodeContext {
                         content: LayoutContent::Block,
-                        style: StyleMap::default(),
+                        style: StyleMap { properties: hidden_props },
                     };
                     return taffy
                         .new_leaf(Style { display: Display::None, ..Style::DEFAULT })
@@ -720,6 +738,36 @@ fn add_node(
                 }
                 if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "title") {
                     props.push(("nova-form-title".into(), StyleValue::Str(v.clone())));
+                }
+                // Forward checked, required, pattern, min, max, maxlength, minlength.
+                if attributes.iter().any(|(k, _)| k == "checked") {
+                    props.push(("nova-form-checked".into(), StyleValue::Str("true".into())));
+                }
+                if attributes.iter().any(|(k, _)| k == "required") {
+                    props.push(("nova-form-required".into(), StyleValue::Str("true".into())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "pattern") {
+                    props.push(("nova-form-pattern".into(), StyleValue::Str(v.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "min") {
+                    props.push(("nova-form-min".into(), StyleValue::Str(v.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "max") {
+                    props.push(("nova-form-max".into(), StyleValue::Str(v.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "maxlength") {
+                    props.push(("nova-form-maxlength".into(), StyleValue::Str(v.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "minlength") {
+                    props.push(("nova-form-minlength".into(), StyleValue::Str(v.clone())));
+                }
+                // Inherit form action/method/enctype from parent <form>.
+                for (k, v) in parent_style_props {
+                    if matches!(k.as_str(), "nova-form-action" | "nova-form-method" | "nova-form-enctype")
+                        && !props.iter().any(|(pk, _)| pk == k)
+                    {
+                        props.push((k.clone(), v.clone()));
+                    }
                 }
 
                 let ctx = NodeContext {
@@ -1158,6 +1206,34 @@ fn add_node(
                     {
                         props.push((k.clone(), v.clone()));
                     }
+                }
+            }
+
+            // Propagate form action/method/enctype from <form> to child fields.
+            if tag == "form" {
+                let action = attributes.iter()
+                    .find(|(k, _)| k == "action")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                let method = attributes.iter()
+                    .find(|(k, _)| k == "method")
+                    .map(|(_, v)| v.to_lowercase())
+                    .unwrap_or_else(|| "get".to_string());
+                let enctype = attributes.iter()
+                    .find(|(k, _)| k == "enctype")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| "application/x-www-form-urlencoded".to_string());
+                props.push(("nova-form-action".into(), StyleValue::Str(action)));
+                props.push(("nova-form-method".into(), StyleValue::Str(method)));
+                props.push(("nova-form-enctype".into(), StyleValue::Str(enctype)));
+            }
+
+            // Inherit form action/method/enctype from parent (for nested elements inside <form>).
+            for (k, v) in parent_style_props {
+                if matches!(k.as_str(), "nova-form-action" | "nova-form-method" | "nova-form-enctype")
+                    && !props.iter().any(|(pk, _)| pk == k)
+                {
+                    props.push((k.clone(), v.clone()));
                 }
             }
 
@@ -2293,6 +2369,30 @@ fn flatten_node_recursive(
                 if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "placeholder") {
                     field_style.push(("nova-form-placeholder".into(), StyleValue::Str(v.clone())));
                 }
+                // Forward checked, required, pattern, min, max, maxlength, minlength.
+                if attributes.iter().any(|(k, _)| k == "checked") {
+                    field_style.push(("nova-form-checked".into(), StyleValue::Str("true".into())));
+                }
+                if attributes.iter().any(|(k, _)| k == "required") {
+                    field_style.push(("nova-form-required".into(), StyleValue::Str("true".into())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "pattern") {
+                    field_style.push(("nova-form-pattern".into(), StyleValue::Str(v.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "min") {
+                    field_style.push(("nova-form-min".into(), StyleValue::Str(v.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "max") {
+                    field_style.push(("nova-form-max".into(), StyleValue::Str(v.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "maxlength") {
+                    field_style.push(("nova-form-maxlength".into(), StyleValue::Str(v.clone())));
+                }
+                if let Some((_, v)) = attributes.iter().find(|(k, _)| k == "minlength") {
+                    field_style.push(("nova-form-minlength".into(), StyleValue::Str(v.clone())));
+                }
+                // form action/method/enctype are already inherited through style_props
+                // from the parent <form> element (propagated via add_inline_items).
                 items.push(InlineItem::FormField {
                     tag: tag.clone(),
                     input_type,

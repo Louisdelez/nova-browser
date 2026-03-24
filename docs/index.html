@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NOVA Browser - A Modern Web Browser Built in Rust</title>
+    <meta name="description" content="NOVA is a from-scratch web browser built in Rust with a micro-kernel architecture. 57,000+ lines of code, 746 tests, 170+ CSS properties.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg: #0a0a0f;
+            --bg-card: #12121a;
+            --bg-card-hover: #1a1a28;
+            --accent: #6366f1;
+            --accent-light: #818cf8;
+            --accent-glow: rgba(99, 102, 241, 0.15);
+            --text: #e2e8f0;
+            --text-dim: #94a3b8;
+            --text-bright: #f8fafc;
+            --border: #1e293b;
+            --rust: #e57324;
+            --green: #22c55e;
+            --blue: #3b82f6;
+            --purple: #a855f7;
+            --pink: #ec4899;
+        }
+
+        html { scroll-behavior: smooth; }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.7;
+            overflow-x: hidden;
+        }
+
+        /* ── Glow background ── */
+        .glow-bg {
+            position: fixed;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(circle at 30% 20%, rgba(99, 102, 241, 0.08) 0%, transparent 50%),
+                        radial-gradient(circle at 70% 60%, rgba(168, 85, 247, 0.06) 0%, transparent 50%),
+                        radial-gradient(circle at 50% 80%, rgba(236, 72, 153, 0.04) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        /* ── Navigation ── */
+        nav {
+            position: fixed;
+            top: 0;
+            width: 100%;
+            z-index: 100;
+            padding: 16px 0;
+            backdrop-filter: blur(20px);
+            background: rgba(10, 10, 15, 0.8);
+            border-bottom: 1px solid var(--border);
+        }
+
+        nav .container {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .logo {
+            font-size: 1.5rem;
+            font-weight: 800;
+            letter-spacing: -0.5px;
+            background: linear-gradient(135deg, var(--accent-light), var(--purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        nav a {
+            color: var(--text-dim);
+            text-decoration: none;
+            font-size: 0.9rem;
+            font-weight: 500;
+            transition: color 0.2s;
+            margin-left: 32px;
+        }
+
+        nav a:hover { color: var(--text-bright); }
+
+        .nav-links { display: flex; align-items: center; }
+
+        .btn-github {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 20px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            text-decoration: none;
+            font-size: 0.85rem;
+            font-weight: 500;
+            transition: all 0.2s;
+            margin-left: 32px;
+        }
+
+        .btn-github:hover {
+            background: var(--bg-card-hover);
+            border-color: var(--accent);
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 24px;
+        }
+
+        /* ── Hero ── */
+        .hero {
+            padding: 180px 0 120px;
+            text-align: center;
+            position: relative;
+        }
+
+        .hero-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 16px;
+            background: var(--accent-glow);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            border-radius: 50px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            color: var(--accent-light);
+            margin-bottom: 32px;
+        }
+
+        .hero-badge .dot {
+            width: 6px;
+            height: 6px;
+            background: var(--green);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        h1 {
+            font-size: clamp(3rem, 7vw, 5.5rem);
+            font-weight: 900;
+            line-height: 1.05;
+            letter-spacing: -2px;
+            margin-bottom: 24px;
+        }
+
+        h1 span {
+            background: linear-gradient(135deg, var(--text-bright) 0%, var(--accent-light) 50%, var(--purple) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .hero-sub {
+            font-size: 1.25rem;
+            color: var(--text-dim);
+            max-width: 600px;
+            margin: 0 auto 48px;
+            line-height: 1.8;
+        }
+
+        .hero-actions {
+            display: flex;
+            gap: 16px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .btn-primary {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 14px 32px;
+            background: linear-gradient(135deg, var(--accent), var(--purple));
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-size: 1rem;
+            font-weight: 600;
+            text-decoration: none;
+            transition: all 0.3s;
+            cursor: pointer;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 30px rgba(99, 102, 241, 0.4);
+        }
+
+        .btn-secondary {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 14px 32px;
+            background: var(--bg-card);
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            font-size: 1rem;
+            font-weight: 600;
+            text-decoration: none;
+            transition: all 0.3s;
+        }
+
+        .btn-secondary:hover {
+            background: var(--bg-card-hover);
+            border-color: var(--accent);
+            transform: translateY(-2px);
+        }
+
+        /* ── Stats ── */
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 24px;
+            padding: 80px 0;
+        }
+
+        .stat {
+            text-align: center;
+            padding: 32px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            transition: all 0.3s;
+        }
+
+        .stat:hover {
+            border-color: var(--accent);
+            transform: translateY(-4px);
+            box-shadow: 0 8px 30px var(--accent-glow);
+        }
+
+        .stat-number {
+            font-size: 2.5rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, var(--accent-light), var(--purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 8px;
+        }
+
+        .stat-label {
+            font-size: 0.9rem;
+            color: var(--text-dim);
+            font-weight: 500;
+        }
+
+        /* ── Code block ── */
+        .code-section {
+            padding: 60px 0;
+            text-align: center;
+        }
+
+        .code-block {
+            display: inline-block;
+            text-align: left;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 24px 32px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.95rem;
+            max-width: 600px;
+            width: 100%;
+        }
+
+        .code-block .prompt { color: var(--green); }
+        .code-block .cmd { color: var(--text-bright); }
+        .code-block .comment { color: var(--text-dim); }
+        .code-block .url { color: var(--accent-light); }
+
+        /* ── Features ── */
+        .features {
+            padding: 100px 0;
+        }
+
+        .section-title {
+            font-size: 2.5rem;
+            font-weight: 800;
+            text-align: center;
+            margin-bottom: 16px;
+            letter-spacing: -1px;
+        }
+
+        .section-sub {
+            text-align: center;
+            color: var(--text-dim);
+            font-size: 1.1rem;
+            margin-bottom: 64px;
+            max-width: 600px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 24px;
+        }
+
+        .feature-card {
+            padding: 32px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            transition: all 0.3s;
+        }
+
+        .feature-card:hover {
+            border-color: var(--accent);
+            transform: translateY(-4px);
+            box-shadow: 0 8px 30px var(--accent-glow);
+        }
+
+        .feature-icon {
+            width: 48px;
+            height: 48px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            margin-bottom: 20px;
+        }
+
+        .fi-rust { background: rgba(229, 115, 36, 0.15); }
+        .fi-css { background: rgba(59, 130, 246, 0.15); }
+        .fi-js { background: rgba(234, 179, 8, 0.15); }
+        .fi-gpu { background: rgba(168, 85, 247, 0.15); }
+        .fi-net { background: rgba(34, 197, 94, 0.15); }
+        .fi-shell { background: rgba(236, 72, 153, 0.15); }
+
+        .feature-card h3 {
+            font-size: 1.15rem;
+            font-weight: 700;
+            margin-bottom: 12px;
+            color: var(--text-bright);
+        }
+
+        .feature-card p {
+            font-size: 0.9rem;
+            color: var(--text-dim);
+            line-height: 1.7;
+        }
+
+        /* ── Architecture ── */
+        .architecture {
+            padding: 100px 0;
+        }
+
+        .arch-diagram {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 48px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            overflow-x: auto;
+            line-height: 1.6;
+        }
+
+        .arch-diagram .folder { color: var(--accent-light); }
+        .arch-diagram .desc { color: var(--text-dim); }
+
+        /* ── Tech Stack ── */
+        .tech-stack {
+            padding: 100px 0;
+        }
+
+        .tech-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 16px;
+        }
+
+        .tech-item {
+            padding: 20px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            text-align: center;
+            transition: all 0.3s;
+        }
+
+        .tech-item:hover {
+            border-color: var(--accent);
+            transform: translateY(-2px);
+        }
+
+        .tech-item .tech-name {
+            font-weight: 700;
+            font-size: 1rem;
+            margin-bottom: 4px;
+            color: var(--text-bright);
+        }
+
+        .tech-item .tech-desc {
+            font-size: 0.8rem;
+            color: var(--text-dim);
+        }
+
+        /* ── Shortcuts ── */
+        .shortcuts {
+            padding: 100px 0;
+        }
+
+        .shortcut-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 12px;
+        }
+
+        .shortcut-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 20px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+        }
+
+        .shortcut-row kbd {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            color: var(--accent-light);
+        }
+
+        .shortcut-row span {
+            font-size: 0.85rem;
+            color: var(--text-dim);
+        }
+
+        /* ── CTA ── */
+        .cta {
+            padding: 120px 0;
+            text-align: center;
+        }
+
+        .cta h2 {
+            font-size: 3rem;
+            font-weight: 900;
+            margin-bottom: 16px;
+            letter-spacing: -1px;
+        }
+
+        .cta p {
+            color: var(--text-dim);
+            font-size: 1.1rem;
+            margin-bottom: 40px;
+        }
+
+        /* ── Footer ── */
+        footer {
+            padding: 40px 0;
+            border-top: 1px solid var(--border);
+            text-align: center;
+            color: var(--text-dim);
+            font-size: 0.85rem;
+        }
+
+        footer a {
+            color: var(--accent-light);
+            text-decoration: none;
+        }
+
+        /* ── Responsive ── */
+        @media (max-width: 768px) {
+            .stats { grid-template-columns: repeat(2, 1fr); }
+            .feature-grid { grid-template-columns: 1fr; }
+            .nav-links a:not(.btn-github) { display: none; }
+            h1 { font-size: 2.5rem; letter-spacing: -1px; }
+            .hero { padding: 140px 0 80px; }
+        }
+
+        @media (max-width: 480px) {
+            .stats { grid-template-columns: 1fr; }
+            .hero-actions { flex-direction: column; align-items: center; }
+        }
+    </style>
+</head>
+<body>
+    <div class="glow-bg"></div>
+
+    <nav>
+        <div class="container">
+            <div class="logo">NOVA</div>
+            <div class="nav-links">
+                <a href="#features">Features</a>
+                <a href="#architecture">Architecture</a>
+                <a href="#tech">Tech Stack</a>
+                <a href="#shortcuts">Shortcuts</a>
+                <a href="https://github.com/Louisdelez/nova-browser" class="btn-github">
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+                    GitHub
+                </a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Hero -->
+    <section class="hero">
+        <div class="container">
+            <div class="hero-badge">
+                <span class="dot"></span>
+                Built with Rust &mdash; Edition 2024
+            </div>
+            <h1><span>The Browser<br>Built From Scratch</span></h1>
+            <p class="hero-sub">
+                NOVA is a from-scratch web browser with a micro-kernel architecture.
+                Every pixel rendered by our own engine. 57,000 lines of Rust.
+            </p>
+            <div class="hero-actions">
+                <a href="https://github.com/Louisdelez/nova-browser" class="btn-primary">
+                    <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+                    View on GitHub
+                </a>
+                <a href="#features" class="btn-secondary">Explore Features</a>
+            </div>
+        </div>
+    </section>
+
+    <!-- Stats -->
+    <section>
+        <div class="container">
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-number">57k+</div>
+                    <div class="stat-label">Lines of Rust</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-number">746</div>
+                    <div class="stat-label">Tests Passing</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-number">170+</div>
+                    <div class="stat-label">CSS Properties</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-number">15</div>
+                    <div class="stat-label">Crates</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Quick Start -->
+    <section class="code-section">
+        <div class="container">
+            <div class="code-block">
+                <span class="comment"># Clone and build</span><br>
+                <span class="prompt">$</span> <span class="cmd">git clone https://github.com/Louisdelez/nova-browser.git</span><br>
+                <span class="prompt">$</span> <span class="cmd">cd nova-browser && cargo build</span><br><br>
+                <span class="comment"># Run the browser</span><br>
+                <span class="prompt">$</span> <span class="cmd">cargo run -p nova-shell -- <span class="url">"https://www.google.com"</span></span>
+            </div>
+        </div>
+    </section>
+
+    <!-- Features -->
+    <section class="features" id="features">
+        <div class="container">
+            <h2 class="section-title">Built Different</h2>
+            <p class="section-sub">Every component built from scratch in Rust. No Chromium, no WebKit, no Gecko.</p>
+            <div class="feature-grid">
+                <div class="feature-card">
+                    <div class="feature-icon fi-rust">&#x1F980;</div>
+                    <h3>Pure Rust</h3>
+                    <p>57,000+ lines of safe Rust code. Zero unsafe blocks. Memory safety guaranteed at compile time. Edition 2024.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon fi-css">&#x1F3A8;</div>
+                    <h3>170+ CSS Properties</h3>
+                    <p>Flexbox, Grid, table layout, transforms, animations, transitions, variables, gradients, shadows, and more.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon fi-js">&#x26A1;</div>
+                    <h3>JavaScript Engine</h3>
+                    <p>QuickJS runtime with full DOM API, Canvas 2D, Shadow DOM, WebSocket, XHR, and 50+ Web API stubs.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon fi-gpu">&#x1F680;</div>
+                    <h3>GPU Rendering</h3>
+                    <p>Vello + wgpu for GPU-accelerated rendering. Automatic fallback to FreeType software renderer.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon fi-net">&#x1F310;</div>
+                    <h3>Full Networking</h3>
+                    <p>HTTPS/TLS, cookies, HTTP cache, WebSocket, HSTS, CORS, CSP. Gzip decompression and redirect following.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon fi-shell">&#x1F4BB;</div>
+                    <h3>Complete Browser Shell</h3>
+                    <p>Multi-tab, DevTools, bookmarks, history, find in page, zoom, clipboard, smooth scrolling, keyboard shortcuts.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Architecture -->
+    <section class="architecture" id="architecture">
+        <div class="container">
+            <h2 class="section-title">Micro-Kernel Architecture</h2>
+            <p class="section-sub">The core knows nothing about web standards. All functionality is provided by dynamically-loaded mods.</p>
+            <div class="arch-diagram">
+<span class="folder">nova-browser/</span>
+<span class="desc">                          # Workspace root</span>
+├── <span class="folder">nova-core/</span>
+<span class="desc">              # Micro-kernel: loads mods, routes IPC</span>
+├── <span class="folder">nova-mod-api/</span>
+<span class="desc">           # Trait definitions + TypedData</span>
+├── <span class="folder">nova-gpu/</span>
+<span class="desc">               # Vello + wgpu compositor</span>
+├── <span class="folder">nova-pipeline/</span>
+<span class="desc">          # URL → pixels orchestration</span>
+├── <span class="folder">nova-shell/</span>
+<span class="desc">             # iced UI: tabs, URL bar, DevTools</span>
+└── <span class="folder">mods/</span>
+    ├── <span class="folder">mod-network/</span>
+<span class="desc">        # HTTP, cookies, cache, WebSocket</span>
+    ├── <span class="folder">mod-html-parser/</span>
+<span class="desc">    # html5ever</span>
+    ├── <span class="folder">mod-css-engine/</span>
+<span class="desc">     # CSS cascade, variables, animations</span>
+    ├── <span class="folder">mod-layout/</span>
+<span class="desc">         # Taffy flex/grid + table + IFC</span>
+    ├── <span class="folder">mod-painter/</span>
+<span class="desc">        # Layout → RenderOps</span>
+    ├── <span class="folder">mod-js/</span>
+<span class="desc">             # QuickJS, DOM API, Canvas 2D</span>
+    └── <span class="folder">mod-image/</span>
+<span class="desc">          # PNG, JPEG, WebP, GIF, SVG</span>
+            </div>
+        </div>
+    </section>
+
+    <!-- Tech Stack -->
+    <section class="tech-stack" id="tech">
+        <div class="container">
+            <h2 class="section-title">Tech Stack</h2>
+            <p class="section-sub">Best-in-class Rust libraries for each component.</p>
+            <div class="tech-grid">
+                <div class="tech-item">
+                    <div class="tech-name">Rust 2024</div>
+                    <div class="tech-desc">Language</div>
+                </div>
+                <div class="tech-item">
+                    <div class="tech-name">Vello + wgpu</div>
+                    <div class="tech-desc">GPU Rendering</div>
+                </div>
+                <div class="tech-item">
+                    <div class="tech-name">html5ever</div>
+                    <div class="tech-desc">HTML Parser</div>
+                </div>
+                <div class="tech-item">
+                    <div class="tech-name">cssparser</div>
+                    <div class="tech-desc">CSS Parsing</div>
+                </div>
+                <div class="tech-item">
+                    <div class="tech-name">Taffy</div>
+                    <div class="tech-desc">Flexbox / Grid</div>
+                </div>
+                <div class="tech-item">
+                    <div class="tech-name">QuickJS</div>
+                    <div class="tech-desc">JavaScript</div>
+                </div>
+                <div class="tech-item">
+                    <div class="tech-name">FreeType</div>
+                    <div class="tech-desc">Text Rendering</div>
+                </div>
+                <div class="tech-item">
+                    <div class="tech-name">rustybuzz</div>
+                    <div class="tech-desc">Text Shaping</div>
+                </div>
+                <div class="tech-item">
+                    <div class="tech-name">rustls</div>
+                    <div class="tech-desc">TLS</div>
+                </div>
+                <div class="tech-item">
+                    <div class="tech-name">tokio</div>
+                    <div class="tech-desc">Async Runtime</div>
+                </div>
+                <div class="tech-item">
+                    <div class="tech-name">iced</div>
+                    <div class="tech-desc">UI Shell</div>
+                </div>
+                <div class="tech-item">
+                    <div class="tech-name">resvg</div>
+                    <div class="tech-desc">SVG Rendering</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Shortcuts -->
+    <section class="shortcuts" id="shortcuts">
+        <div class="container">
+            <h2 class="section-title">Keyboard Shortcuts</h2>
+            <p class="section-sub">Navigate like a pro.</p>
+            <div class="shortcut-grid">
+                <div class="shortcut-row"><kbd>Ctrl+T</kbd> <span>New tab</span></div>
+                <div class="shortcut-row"><kbd>Ctrl+W</kbd> <span>Close tab</span></div>
+                <div class="shortcut-row"><kbd>Ctrl+Tab</kbd> <span>Next tab</span></div>
+                <div class="shortcut-row"><kbd>Ctrl+L</kbd> <span>Focus URL bar</span></div>
+                <div class="shortcut-row"><kbd>Alt+Left</kbd> <span>Back</span></div>
+                <div class="shortcut-row"><kbd>Alt+Right</kbd> <span>Forward</span></div>
+                <div class="shortcut-row"><kbd>F5</kbd> <span>Reload</span></div>
+                <div class="shortcut-row"><kbd>Ctrl+F</kbd> <span>Find in page</span></div>
+                <div class="shortcut-row"><kbd>F12</kbd> <span>DevTools</span></div>
+                <div class="shortcut-row"><kbd>Ctrl+D</kbd> <span>Bookmark</span></div>
+                <div class="shortcut-row"><kbd>Ctrl+U</kbd> <span>View source</span></div>
+                <div class="shortcut-row"><kbd>Ctrl+P</kbd> <span>Screenshot</span></div>
+            </div>
+        </div>
+    </section>
+
+    <!-- CTA -->
+    <section class="cta">
+        <div class="container">
+            <h2>Ready to explore?</h2>
+            <p>Clone the repo and build NOVA in minutes.</p>
+            <a href="https://github.com/Louisdelez/nova-browser" class="btn-primary">
+                <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+                Get Started on GitHub
+            </a>
+        </div>
+    </section>
+
+    <footer>
+        <div class="container">
+            <p>NOVA Browser &mdash; Built from scratch in Rust by <a href="https://github.com/Louisdelez">Louis Delez</a></p>
+        </div>
+    </footer>
+</body>
+</html>
